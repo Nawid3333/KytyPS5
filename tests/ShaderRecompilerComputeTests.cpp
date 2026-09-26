@@ -23770,7 +23770,7 @@ TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
   return test;
 }
 
-TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
+TestCase BufferStoreFormatXRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -23781,10 +23781,10 @@ TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferStoreFormatXChecksOnlyTransferredComponent";
+  test.name = "BufferStoreFormatXRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xaaaaaaaau};
+  test.expected = test.initial;
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
@@ -23817,7 +23817,7 @@ TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
   return test;
 }
 
-TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
+TestCase BufferStoreFormatXyRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -23829,10 +23829,10 @@ TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferStoreFormatXyChecksOnlyTransferredComponents";
+  test.name = "BufferStoreFormatXyRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
+  test.expected = test.initial;
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
@@ -24144,6 +24144,60 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   test.user_data = MakeStructuredStorageBufferData(2, 64, false, 11);
   test.has_user_data = true;
   test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwPackedUnormSkinningVectors() {
+  using O = ShaderOpcode;
+
+  // The captured skinning dispatch stores a compressed quaternion with W = 1.
+  constexpr std::array<float, 12> values = {
+      0.25f, 0.5f, 0.75f, 1.0f,
+      -1.0f, 0.0f, 2.0f, 1.0f,
+      0.5f, 0.5f, 0.5f, 0.5f};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 3; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component,
+                        std::bit_cast<u32>(values[record * 4 + component]));
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwPackedUnormSkinningVectors";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(4, 0xdeadbeefu);
+  test.expected = {0xeff80100u, 0xfff00000u, 0xa0080200u, 0xdeadbeefu};
+  test.user_data = MakeStructuredStorageBufferData(
+      4, 3, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXZeroFillsPackedRecord() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, std::bit_cast<u32>(0.5f));
+  AppendVMovU32(&code, 20, 4);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXZeroFillsPackedRecord";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0xffffffffu, 0x33333333u};
+  test.expected = {0x11111111u, 0x00000200u, 0x33333333u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 12, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   return test;
 }
 
@@ -29090,9 +29144,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
   AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
-  AddCase(BufferStoreFormatXChecksOnlyTransferredComponent);
+  AddCase(BufferStoreFormatXRejectsPartialRecord);
   AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);
-  AddCase(BufferStoreFormatXyChecksOnlyTransferredComponents);
+  AddCase(BufferStoreFormatXyRejectsPartialRecord);
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
@@ -29103,6 +29157,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwPackedUnormSkinningVectors);
+  AddCase(BufferStoreFormatXZeroFillsPackedRecord);
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
@@ -33836,15 +33892,19 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcCmpxOrderedCapturedExecMask());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreFormatXyzwPackedUnormSkinningVectors());
+    RunCase(&vulkan, BufferStoreFormatXZeroFillsPackedRecord());
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
     RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
     RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
     RunCase(&vulkan, BufferStoreFormatXyResource88UintWritesBytes());
     RunCase(&vulkan, BufferStoreFormatXyzwDropsPartialRecord());
-    RunCase(&vulkan, BufferStoreFormatXChecksOnlyTransferredComponent());
+    RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
+    RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
     return 0;
   }
