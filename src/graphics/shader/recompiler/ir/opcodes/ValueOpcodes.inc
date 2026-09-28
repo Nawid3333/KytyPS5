@@ -4,6 +4,7 @@ VALUE_OPCODE(Identity, Opaque, Opaque)
 VALUE_OPCODE(Void, Void)
 VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
+VALUE_OPCODE(ConditionRef, U1, U1)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
@@ -274,8 +275,8 @@ VALUE_OPCODE(SharedAtomicUMax32, U32, U32, U32, U1)
 VALUE_OPCODE(SharedAtomicAnd32, U32, U32, U32, U1)
 VALUE_OPCODE(SharedAtomicOr32, U32, U32, U32, U1)
 VALUE_OPCODE(SharedAtomicXor32, U32, U32, U32, U1)
-VALUE_OPCODE(DataAppend, U32, U32, U1, U32, U32)
-VALUE_OPCODE(DataConsume, U32, U32, U1, U32, U32)
+VALUE_OPCODE(DataAppend, U32, U32, U1)
+VALUE_OPCODE(DataConsume, U32, U32, U1)
 VALUE_OPCODE(SwizzleU32, U32, U32, U32, U1)
 
 VALUE_OPCODE(ImageQueryDimensions, U32x4, ImageResource, ImageAddress)
