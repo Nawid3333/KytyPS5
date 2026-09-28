@@ -208,8 +208,8 @@ struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
-  static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
-  static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
+  static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 44);
+  static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -6169,7 +6169,11 @@ public:
                   !texture_cache.GetImage(fault_a_image).IsTracked() &&
                   !texture_cache.GetImage(fault_b_image).IsTracked() &&
                   texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
-                  texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty(),
+                  texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty() &&
+                  texture_cache.IsRegionGpuModified(base + 0x8000,
+                                                    sizeof(fault_a)) &&
+                  texture_cache.IsRegionGpuModified(base + 0x8010,
+                                                    sizeof(fault_b)),
               "a byte-disjoint CPU write discarded authoritative images");
       const auto retracked_a = texture_cache.FindImage(fault_a_desc);
       const auto retracked_b = texture_cache.FindImage(fault_b_desc);
@@ -7288,12 +7292,16 @@ public:
               "failed to create the overlapping dirty Buffer owner");
       exact_buffer.first->Fill(exact_buffer.second, sizeof(uint32_t),
                                dirty_sibling_value);
+      texture_cache.InvalidateMemoryFromGPU(base + exact_image_offset,
+                                            sizeof(uint32_t));
       Libs::Graphics::Buffer exact_download(
           m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
           base + exact_image_offset, AllFlags, sizeof(uint32_t));
       Require(name, "overlapping buffer ownership rejection",
               !texture_cache.FindImageFromRange(base + exact_image_offset,
                                                 sizeof(uint32_t)) &&
+                  !TextureCacheTestAccess::TryDownload(texture_cache,
+                                                       exact_image) &&
                   !BufferCacheTestAccess::SynchronizeBufferFromImage(
                       resources.GetBufferCache(), exact_download,
                       base + exact_image_offset, sizeof(uint32_t)),
@@ -7342,17 +7350,31 @@ public:
       Require(name, "GPU image range validity",
               texture_cache.FindImageFromRange(
                   gc_image_desc_a.info.data.address,
-                  gc_image_desc_a.info.data.size) == gc_images[0],
+                  gc_image_desc_a.info.data.size) == gc_images[0] &&
+                  texture_cache.IsRegionGpuModified(
+                      gc_image_desc_a.info.data.address,
+                      gc_image_desc_a.info.data.size),
               "FindImageFromRange rejected a clean GPU-current image");
-      texture_cache.GetImage(gc_images[0])
-          .InvalidateCpuWrite(gc_image_desc_a.info.data.address,
-                              gc_image_desc_a.info.data.size);
+      auto &gc_native = texture_cache.GetImage(gc_images[0]);
+      texture_cache.InvalidateMemory(gc_image_desc_a.info.data.address,
+                                     gc_image_desc_a.info.data.size);
       Require(
           name, "CPU-dirty image range validity",
           !texture_cache.FindImageFromRange(gc_image_desc_a.info.data.address,
-                                            gc_image_desc_a.info.data.size),
-          "FindImageFromRange accepted CPU-dirty native contents");
+                                            gc_image_desc_a.info.data.size) &&
+              !TextureCacheTestAccess::TryDownload(texture_cache, gc_images[0]) &&
+              !texture_cache.IsRegionGpuModified(
+                  gc_image_desc_a.info.data.address,
+                  gc_image_desc_a.info.data.size) &&
+              gc_native.IsDefinitelyCpuDirty() && gc_native.IsGpuModified() &&
+              !gc_native.IsTracked(),
+          "CPU writes did not supersede native contents while retaining GPU history");
       texture_cache.MarkGpuWritten(gc_images[0]);
+      Require(name, "GPU image reacquisition",
+              texture_cache.IsRegionGpuModified(
+                  gc_image_desc_a.info.data.address,
+                  gc_image_desc_a.info.data.size),
+              "a new GPU write did not reclaim image authority");
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::WriteBacking(base + gc_image_offsets[index],
                                               &gc_stale_values[index],
@@ -7440,11 +7462,33 @@ public:
       TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
       const auto submit_readback_image =
           texture_cache.FindImage(submit_readback_desc);
+      auto submit_buffer = resources.GetBufferCache().ObtainBuffer(
+          submit_readback_desc.info.data.address,
+          submit_readback_desc.info.data.size, true);
+      Require(name, "linear submit dirty buffer allocation",
+              submit_buffer.first != nullptr,
+              "failed to create the older GPU Buffer contents");
+      submit_buffer.first->Fill(submit_buffer.second, sizeof(uint32_t),
+                                submit_readback_stale);
+      texture_cache.InvalidateMemoryFromGPU(
+          submit_readback_desc.info.data.address,
+          submit_readback_desc.info.data.size);
+      (void)texture_cache.FindTexture(submit_readback_image,
+                                      submit_readback_desc);
       Require(name, "linear submit image clear",
               texture_cache.ClearImageFromBuffer(
                   command, submit_readback_desc.info.data.address,
                   submit_readback_desc.info.data.size, submit_readback_value),
               "failed to create GPU-current linear storage contents");
+      Require(name, "older buffer permits current image readback",
+              resources.GetBufferCache().HasGpuDirtyBytes(
+                  submit_readback_desc.info.data.address,
+                  submit_readback_desc.info.data.size) &&
+                  texture_cache.FindImageFromRange(
+                      submit_readback_desc.info.data.address,
+                      submit_readback_desc.info.data.size) ==
+                      submit_readback_image,
+              "historical GPU Buffer dirtiness rejected newer image contents");
       TextureCacheTestAccess::TrackDownload(texture_cache,
                                             submit_readback_image);
       Libs::LibKernel::Memory::WriteBacking(
@@ -13694,7 +13738,7 @@ public:
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
         auto address = buffer.device_address + backing - page_offset;
-        auto page = guest_base >> BufferCache::CACHING_PAGEBITS;
+        auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
                            (page + mapped) * sizeof(vk::DeviceAddress),
@@ -16709,6 +16753,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_DOT2C_F32_F16:
   case Opcode::V_CVT_F64_I32:
   case Opcode::V_CVT_F32_F64:
+  case Opcode::V_CVT_F64_F32:
+  case Opcode::V_CVT_F64_U32:
   case Opcode::V_RCP_F64:
   case Opcode::V_MUL_F64:
   case Opcode::V_FMA_F64:
@@ -22122,6 +22168,83 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
   return test;
 }
 
+TestCase VectorF64WideningConversions() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorF64WideningConversions";
+  const auto store_pair = [&](u32 reg, uint64_t bits) {
+    AppendStoreVgpr(&test.code, reg, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, reg + 1,
+                    static_cast<u32>(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(), {static_cast<u32>(bits),
+                                               static_cast<u32>(bits >> 32)});
+  };
+  for (const u32 bits :
+       {0u, 0x80000000u, 0x3f800001u, 0xbf800001u, 0x00800000u, 0x7f7fffffu,
+        0xff7fffffu, 0x7f800000u, 0xff800000u, 1u, 0x80000001u}) {
+    AppendSMovLiteral(&test.code, 8, bits);
+    test.code.push_back(0x7e002008u);
+    const auto source = (bits & 0x7f800000u) == 0 ? bits & 0x80000000u : bits;
+    store_pair(0, std::bit_cast<uint64_t>(
+                      static_cast<double>(std::bit_cast<float>(source))));
+  }
+  for (const u32 bits : {0x7fc12345u, 0x7f812345u}) {
+    AppendSMovLiteral(&test.code, 8, bits);
+    test.code.push_back(0x7e002008u);
+    AppendVMovLiteral(&test.code, 3, 0x7ff80000u);
+    test.code.push_back(EncodeVop2(0x1b, 1, Vgpr(3), 1));
+    AppendStoreVgpr(&test.code, 1, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(0x7ff80000u);
+  }
+  AppendVMovLiteral(&test.code, 1, std::bit_cast<u32>(-3.5f));
+  AppendVop3(&test.code, 0x190, 1, Vgpr(1), 0, 0, 1, 0, false, 0, 1);
+  store_pair(1, std::bit_cast<uint64_t>(-3.5));
+  for (const u32 value :
+       {0u, 1u, 16777217u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+    AppendVMovLiteral(&test.code, 1, value);
+    test.code.push_back(EncodeVop1(0x16, 1, Vgpr(1)));
+    store_pair(1, std::bit_cast<uint64_t>(static_cast<double>(value)));
+  }
+  AppendSMovLiteral(&test.code, 8, 0xffffffffu);
+  AppendVop3(&test.code, 0x196, 1, 8u, 0);
+  store_pair(1, std::bit_cast<uint64_t>(4294967295.0));
+  test.code.push_back(EncodeSop1(0x04, 12, 126));
+  test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  test.code.push_back(EncodeVop1(0x10, 1, InlineU32(0)));
+  test.code.push_back(EncodeVop1(0x16, 1, InlineU32(0)));
+  test.code.push_back(EncodeSop1(0x04, 126, 12));
+  store_pair(1, std::bit_cast<uint64_t>(4294967295.0));
+  AppendEnd(&test.code);
+  test.opcodes = {O::S_MOV_B32,          O::S_MOV_B64,     O::V_MOV_B32,
+                  O::V_AND_B32,          O::V_CVT_F64_F32, O::V_CVT_F64_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpFConvert",
+                         "OpConvertUToF"};
+
+  std::vector<u32> vertex_code;
+  AppendSMovLiteral(&vertex_code, 8, std::bit_cast<u32>(2.0f));
+  vertex_code.insert(vertex_code.end(),
+                     {0x7e002008u, 0x7e005f00u, 0x7e401f00u});
+  vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+  vertex_code.push_back(EncodeExp1(32, 32, 32, 32));
+  AppendEnd(&vertex_code);
+  ShaderVertexInputInfo vertex{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Vertex;
+  options.input_info.vertex = &vertex;
+  auto translated = ShaderRecompiler::TranslateProgram(vertex_code, options);
+  auto result =
+      ShaderRecompiler::CompileProgram(std::move(translated), options, {});
+  ValidateSpirv(test.name, result.spirv);
+  Require(test.name, "captured vertex conversion chain",
+          result.ir_dump.find("ConvertF64F32") != std::string::npos &&
+              result.ir_dump.find("FPRecip64") != std::string::npos &&
+              result.ir_dump.find("ConvertF32F64") != std::string::npos,
+          "vertex compilation lost the captured widening/reciprocal/narrowing "
+          "sequence");
+  return test;
+}
+
 TestCase VectorF64ModesModifiersAndExec() {
   using O = ShaderOpcode;
   TestCase test;
@@ -25878,6 +26001,11 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   using O = ShaderOpcode;
 
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t ExtendedBase = Libs::LibKernel::Memory::kExtendedMemoryBase + GuestBase;
+  static_assert(BufferCache::PageIndex(ExtendedBase) ==
+                ((Libs::Graphics::LOWER_ADDRESS_SIZE + GuestBase) >> BufferCache::CACHING_PAGEBITS));
+  static_assert(BufferCache::GuestAddress(BufferCache::PageIndex(ExtendedBase) <<
+                                        BufferCache::CACHING_PAGEBITS) == ExtendedBase);
   std::vector<u32> code;
   AppendVMovLiteral(&code, 20, static_cast<u32>(GuestBase + 4u));
   AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
@@ -25888,17 +26016,22 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   AppendVMovLiteral(&code, 21, static_cast<u32>((GuestBase >> 32u) + 1u));
   code.push_back(EncodeFlat0(0x0c, 0, 0));
   code.push_back(EncodeFlat1(2, 0x7d, 0, 20));
+  AppendVMovLiteral(&code, 20, static_cast<u32>(ExtendedBase + 4u));
+  AppendVMovLiteral(&code, 21, static_cast<u32>(ExtendedBase >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 0, 0));
+  code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
   AppendStoreVgpr(&code, 0, 0);
   AppendStoreVgpr(&code, 1, 1);
   AppendStoreVgpr(&code, 2, 2);
+  AppendStoreVgpr(&code, 3, 3);
   AppendEnd(&code);
 
   TestCase test;
   test.name = "FlatVirtualAddressRebasesGuestAllocation";
   test.code = std::move(code);
   test.initial = {0xfeedfaceu, 0xcafebabeu, 0, 0x12345678u};
-  test.expected = {0x12345678u, 0x12345678u, 0};
-  test.bda_mappings = {{GuestBase, 8}};
+  test.expected = {0x12345678u, 0x12345678u, 0, 0xcafebabeu};
+  test.bda_mappings = {{GuestBase, 8}, {ExtendedBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -29876,6 +30009,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorRcpIflagF32IntegerReciprocal);
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorF64ModesModifiersAndExec);
+  AddCase(VectorF64WideningConversions);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
   AddCase(VectorCompareF32ExposureGuard);
   for (const auto mode : {0xc0u, 0xe0u}) {
@@ -35395,7 +35529,9 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
+#endif
   vulkan.CheckUnifiedTextureCacheFlow();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);

@@ -865,7 +865,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.memory_info                = program.memory_info;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
-	plan.has_address_writes         = program.has_address_writes;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
@@ -924,16 +923,24 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
+	bool masked_image = false;
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
 		if (source == nullptr || !source->indirect_image.has_value()) {
 			continue;
 		}
 		plan.requires_specialization_memory = true;
+		masked_image |= !source->indirect_image->selector_mask.IsEmpty();
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 		                   plan.clean_flat_slots, source->indirect_image->selector_mask);
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
+	}
+	if (masked_image) {
+		plan.resource_tracking_complete &= !program.has_address_writes &&
+		    !std::ranges::any_of(plan.info.images, &ImageResource::written);
+		plan.capture_specialization_reads =
+		    std::ranges::any_of(plan.info.buffers, &BufferResource::written);
 	}
 	return plan;
 }
@@ -944,18 +951,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
-	const bool masked_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
-		const auto* source = Source(program, image.source);
-		return source != nullptr && source->indirect_image.has_value() &&
-		       !source->indirect_image->selector_mask.IsEmpty();
-	});
-	if (masked_image &&
-	    (program.has_address_writes ||
-	     std::ranges::any_of(program.info.images, &ImageResource::written))) {
-		return false;
-	}
-	const bool capture_reads = masked_image &&
-	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
+	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = program.specialization_reads;
 	ReadCapture capture {runtime, reads};
 	SrtRuntime observed = runtime;

@@ -549,7 +549,7 @@ struct ResourcePlan {
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
-	bool                                has_address_writes = false;
+	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
@@ -588,6 +588,7 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

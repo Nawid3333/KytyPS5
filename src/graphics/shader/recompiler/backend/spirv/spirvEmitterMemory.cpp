@@ -975,7 +975,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantDeviceAddress(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed = Select(state, type, extended,
+	                           Binary(state, spv::OpISub, type, address,
+	                                  ConstantDeviceAddress(state,
+	                                      LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                           address);
+	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
