@@ -2565,13 +2565,20 @@ public:
                     release_label <= Sync::ReadReferenceClock(),
                 "clock write with writeback and interrupt lost its data");
 
-        auto immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
-        Pm4Execution immediate_execution;
-        const auto immediate_tick = gpu_scheduler.CurrentTick();
-        const auto immediate_result =
-            processor->Process(immediate_execution, immediate);
-        const bool immediate_split_once =
-            gpu_scheduler.CurrentTick() == immediate_tick + 1;
+        for (const auto interrupt : {0u, 3u, 1u, 2u}) {
+          release_label = 0;
+          auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
+          Pm4Execution immediate_execution;
+          const auto immediate_tick = gpu_scheduler.CurrentTick();
+          const auto immediate_result =
+              processor->Process(immediate_execution, immediate);
+          Require("GpuCommandLane", "32-bit release boundary",
+                  immediate_result == Pm4ProcessResult::Complete &&
+                      gpu_scheduler.CurrentTick() ==
+                          immediate_tick + (interrupt == 1 || interrupt == 2) &&
+                      release_label == (interrupt == 1 ? 0 : 0x11223344u),
+                  "label-only release submitted work or interrupt release lost its boundary");
+        }
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
@@ -2597,8 +2604,7 @@ public:
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
         release_mem_submission_counts =
-            immediate_result == Pm4ProcessResult::Complete &&
-            immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
+            gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
             interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
@@ -3672,6 +3678,35 @@ public:
         DestroyBuffer(&readback);
         return value;
       };
+
+      constexpr uint64_t stream_pages = base + 0x18000;
+      constexpr uint64_t stream_address = stream_pages + 0x4000 - sizeof(uint32_t);
+      const std::array<uint32_t, 2> stream_values{0x13579bdfu, 0x2468ace0u};
+      std::memcpy(reinterpret_cast<void *>(stream_address), stream_values.data(),
+                  sizeof(stream_values));
+      Require(name, "GPU-readable stream source",
+              Libs::LibKernel::Memory::KernelMprotect(
+                  reinterpret_cast<void *>(stream_pages), 0x8000, 0x10) == 0 &&
+                  cache.IsRegionCpuModified(stream_address, sizeof(stream_values)) &&
+                  !cache.IsRegionGpuModified(stream_address, sizeof(stream_values)),
+              "cross-page stream source is not CPU-dirty and GPU-clean");
+      const auto stream_tick = scheduler.CurrentTick();
+      const auto [streamed, streamed_offset] =
+          cache.ObtainBuffer(stream_address, sizeof(stream_values), false);
+      Require(name, "cross-page read-only stream upload",
+              streamed == &cache.GetUtilityBuffer(MemoryUsage::Stream) &&
+                  scheduler.CurrentTick() == stream_tick &&
+                  std::memcmp(streamed->Mapped().data() + streamed_offset,
+                              stream_values.data(), sizeof(stream_values)) == 0,
+              "GPU-readable guest bytes were not streamed without submission");
+      Require(name, "stream source protection restore",
+              Libs::LibKernel::Memory::KernelMprotect(
+                  reinterpret_cast<void *>(stream_pages), 0x8000, 0x3) == 0,
+              "stream source protection was not restored");
+      Require(name, "streamed GPU bytes",
+              ReadNativeValue(*streamed, streamed_offset) == stream_values[0] &&
+                  ReadNativeValue(*streamed, streamed_offset + sizeof(uint32_t)) == stream_values[1],
+              "stream commit did not publish both cross-page words to the GPU");
 
       constexpr uint64_t large_copy_source_offset = 0x40000;
       constexpr uint64_t large_copy_destination_offset = 0x80000;
@@ -14056,9 +14091,7 @@ public:
     vertex.resources_num = 2;
     vertex.buffers_num = 1;
     vertex.buffers[0].stride = 6 * sizeof(float);
-    vertex.buffers[0].attr_num = 2;
-    vertex.buffers[0].attr_indices[1] = 1;
-    vertex.buffers[0].attr_offsets[1] = 2 * sizeof(float);
+    vertex.resources[1].UpdateAddress48(2 * sizeof(float));
     for (uint32_t i = 0; i < 2; i++) {
       const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
                           : packed_vertex_color ? Prospero::BufferFormat::k11_11_10Float
