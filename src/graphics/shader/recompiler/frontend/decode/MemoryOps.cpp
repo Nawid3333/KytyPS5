@@ -61,6 +61,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
 };
 
@@ -91,7 +92,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
-    {0x0bu, Opcode::DS_XOR_B32, 1, 32},          {0x0du, Opcode::DS_WRITE_B32, 1, 32},
+    {0x0bu, Opcode::DS_XOR_B32, 1, 32},          {0x0cu, Opcode::DS_MSKOR_B32, 1, 32},
+    {0x0du, Opcode::DS_WRITE_B32, 1, 32},
     {0x0eu, Opcode::DS_WRITE2_B32, 2, 32},       {0x0fu, Opcode::DS_WRITE2ST64_B32, 2, 32},
     {0x12u, Opcode::DS_MIN_F32, 1, 32},          {0x13u, Opcode::DS_MAX_F32, 1, 32},
     {0x1eu, Opcode::DS_WRITE_B8, 1, 8},          {0x1fu, Opcode::DS_WRITE_B16, 1, 16},
@@ -106,7 +108,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
-    {0x4au, Opcode::DS_OR_B64, 2, 32},
+    {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
@@ -115,7 +117,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
     {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
-    {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
+    {0xb2u, Opcode::DS_PERMUTE_B32, 1, 32},     {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
 };
@@ -168,6 +170,7 @@ bool IsDsWriteOpcode(Opcode opcode) {
 bool IsDsAtomicOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_ADD_U32:
+		case Opcode::DS_ADD_U64:
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
@@ -190,6 +193,7 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_WRXCHG_RTN_B32: return true;
 		default: return false;
 	}
@@ -201,8 +205,10 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32: return 3u;
+		case Opcode::DS_PERMUTE_B32:
 		case Opcode::DS_BPERMUTE_B32: return 2u;
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
@@ -405,7 +411,8 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
 	}
 	if (inst.gds &&
-	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_BPERMUTE_B32 ||
+	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_PERMUTE_B32 ||
+	     inst.opcode == Opcode::DS_BPERMUTE_B32 ||
 	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
