@@ -1965,6 +1965,23 @@ void TestDisabledDebugBranches() {
   }
 }
 
+void TestNewShaderRecompilerDecoderBranchTargetOutOfBounds() {
+  using namespace ShaderRecompiler;
+  // DecodeProgram records direct-branch targets to find the real S_ENDPGM. Targets outside the
+  // code must not be recorded: a backward s_branch at pc 0 wraps branch_target below zero, and
+  // a forward one can point far past the end. CFG construction reports both as invalid.
+  for (const auto& [simm, target] : {std::pair {0xfffcu, 0xfffffff4u}, std::pair {0x7fffu, 0x00020000u}}) {
+    const std::array shader = {EncodeSopp(0x02, simm), EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    Check(decoded.instructions.size() == 2u &&
+              decoded.instructions.front().opcode == Decoder::Opcode::S_BRANCH &&
+              decoded.instructions.front().branch_target == target &&
+              decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+          "out-of-bounds branch target changed decoding");
+  }
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -14876,6 +14893,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
+  TestNewShaderRecompilerDecoderBranchTargetOutOfBounds();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

@@ -417,10 +417,12 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
-			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+			if (target_index < code.size()) {
+				if (branch_targets.empty()) {
+					branch_targets.resize(code.size());
+				}
+				branch_targets[target_index] = true;
 			}
-			branch_targets[target_index] = true;
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
