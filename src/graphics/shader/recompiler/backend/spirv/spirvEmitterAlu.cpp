@@ -30,6 +30,28 @@ uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_va
 	return Unary(state, not_equal ? spv::OpAny : spv::OpAll, TypeBool(state), compare);
 }
 
+uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	const auto bits_type = TypeU64(state);
+	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
+	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
+	const auto ordered = Binary(state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
+	                            TypeBool(state), lhs, rhs);
+	auto result = Select(state, TypeF64(state), ordered, lhs, rhs);
+
+	// Equal values have identical bits except signed zero: min chooses -0, max chooses +0.
+	const auto equal = Binary(state, spv::OpFOrdEqual, TypeBool(state), lhs, rhs);
+	const auto equal_bits = Binary(state, max_value ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
+	                               bits_type, lhs_bits, rhs_bits);
+	result = Select(state, TypeF64(state), equal,
+	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
+
+	// Non-IEEE mode selects the other operand for NaN, including rhs when both are NaN.
+	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
+	                lhs, result);
+	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
+	              rhs, result);
+}
+
 uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
                           spv::Op high_compare, spv::Op low_compare) {
 	const auto lhs         = ExtractPair(state, lhs_value);
@@ -291,9 +313,25 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 	return EmitF32ToU32(state, arg0, false);
 }
 
-uint32_t EmitConvertF32S32(EmitterState& state, uint32_t arg0) {
-	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
-	return EmitNative<spv::OpConvertSToF, IR::Type::F32>(state, signed_value);
+uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
+	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
+	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
+	    state, Unary(state, spv::OpBitcast, TypeU64(state), arg0), 1u);
+	const auto exponent = EmitAndConstant(state, source, 0x7ff00000u);
+	const auto overflow =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           EmitCompareU32Constant(state, spv::OpUGreaterThan, exponent, 0x47e00000u),
+	           EmitCompareU32Constant(state, spv::OpULessThan, exponent, 0x7ff00000u));
+	const auto clamped = EmitOrU32(state, EmitAndConstant(state, source, 0x80000000u),
+	                               ConstantU32(state, 0x7f7fffffu));
+	return EmitFlushF32DenormToSignedZero(
+	    state, Select(state, TypeF32(state), overflow,
+	                  Unary(state, spv::OpBitcast, TypeF32(state), clamped), converted));
+}
+
+uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
+	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
 
 uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value arg1) {
@@ -428,6 +466,18 @@ uint32_t EmitUGreaterThan64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThan);
 }
 
+uint32_t EmitSLessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return CompareOrdered64(state, arg0, arg1, spv::OpSLessThan, spv::OpULessThanEqual);
+}
+
+uint32_t EmitULessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return CompareOrdered64(state, arg0, arg1, spv::OpULessThan, spv::OpULessThanEqual);
+}
+
+uint32_t EmitUGreaterThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThanEqual);
+}
+
 uint32_t EmitFPIsNan32(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpFUnordNotEqual, IR::Type::U1>(state, arg0, arg0);
 }
@@ -438,6 +488,14 @@ uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, false);
+}
+
+uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, true);
 }
 
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
@@ -451,6 +509,11 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+}
+
+uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
+	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
+	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
 }
 
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {

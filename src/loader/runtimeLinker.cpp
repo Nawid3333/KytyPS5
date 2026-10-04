@@ -13,12 +13,13 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
-#include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -126,19 +127,13 @@ struct StubbedImportRecord {
 	std::string program;
 };
 
-// The structure will be passed via the stack
-// since the size of an object is larger than 16 bytes
-struct RelocateHandlerStack {
-	uint64_t stack[3];
-};
-
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 
-static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
+static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id);
 
 static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 	auto* ptr     = reinterpret_cast<uint64_t*>(vaddr);
@@ -148,7 +143,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 }
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t thunk_size = 165;
+	constexpr uint64_t thunk_size = 34;
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
 	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
@@ -164,105 +159,18 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	                                        g_unresolved_stub_thunk_offset);
 	g_unresolved_stub_thunk_offset += thunk_size;
 
-	const auto target = reinterpret_cast<uint64_t>(ResolveImportStubWithId);
-	uint8_t    bytes[thunk_size] {};
-	size_t     i      = 0;
-	const auto emit   = [&](uint8_t b) { bytes[i++] = b; };
-	const auto emit64 = [&](uint64_t v) {
-		std::memcpy(bytes + i, &v, sizeof(v));
-		i += sizeof(v);
+	uint8_t bytes[thunk_size] = {
+	    0x48, 0x83, 0xec, 0x08,               // sub rsp, 8
+	    0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0, // mov rdi, record_id
+	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, UnresolvedImportStub
+	    0xff, 0xd0,                           // call rax
+	    0x48, 0x83, 0xc4, 0x08,               // add rsp, 8
+	    0x0f, 0x57, 0xc0,                     // xorps xmm0, xmm0
+	    0xc3,                                 // ret
 	};
-	const auto emit32 = [&](uint32_t v) {
-		std::memcpy(bytes + i, &v, sizeof(v));
-		i += sizeof(v);
-	};
-	const auto save_xmm = [&](uint8_t reg, uint8_t offset) {
-		emit(0xf3);
-		emit(0x0f);
-		emit(0x7f);
-		if (offset == 0) {
-			emit(static_cast<uint8_t>(0x04u | (reg << 3u)));
-			emit(0x24);
-		} else {
-			emit(static_cast<uint8_t>(0x44u | (reg << 3u)));
-			emit(0x24);
-			emit(offset);
-		}
-	};
-	const auto load_xmm = [&](uint8_t reg, uint8_t offset) {
-		emit(0xf3);
-		emit(0x0f);
-		emit(0x6f);
-		if (offset == 0) {
-			emit(static_cast<uint8_t>(0x04u | (reg << 3u)));
-			emit(0x24);
-		} else {
-			emit(static_cast<uint8_t>(0x44u | (reg << 3u)));
-			emit(0x24);
-			emit(offset);
-		}
-	};
-
-	emit(0x50); // push rax; preserve AL for variadic SysV calls
-	emit(0x57); // push rdi
-	emit(0x56); // push rsi
-	emit(0x52); // push rdx
-	emit(0x51); // push rcx
-	emit(0x41);
-	emit(0x50); // push r8
-	emit(0x41);
-	emit(0x51); // push r9
-	emit(0x48);
-	emit(0x81);
-	emit(0xec);
-	emit32(0x80); // sub rsp, 0x80
-	for (uint8_t reg = 0; reg < 8; reg++) {
-		save_xmm(reg, static_cast<uint8_t>(reg * 0x10u));
-	}
-	emit(0x48);
-	emit(0xbf);
-	emit64(record_id); // mov rdi, record_id
-	emit(0x48);
-	emit(0xb8);
-	emit64(target); // mov rax, ResolveImportStubWithId
-	emit(0xff);
-	emit(0xd0); // call rax
-	emit(0x49);
-	emit(0x89);
-	emit(0xc3); // mov r11, rax
-	for (uint8_t reg = 0; reg < 8; reg++) {
-		load_xmm(reg, static_cast<uint8_t>(reg * 0x10u));
-	}
-	emit(0x48);
-	emit(0x81);
-	emit(0xc4);
-	emit32(0x80); // add rsp, 0x80
-	emit(0x41);
-	emit(0x59); // pop r9
-	emit(0x41);
-	emit(0x58); // pop r8
-	emit(0x59); // pop rcx
-	emit(0x5a); // pop rdx
-	emit(0x5e); // pop rsi
-	emit(0x5f); // pop rdi
-	emit(0x58); // pop rax
-	emit(0x4d);
-	emit(0x85);
-	emit(0xdb); // test r11, r11
-	emit(0x74);
-	emit(0x03); // jz +3
-	emit(0x41);
-	emit(0xff);
-	emit(0xe3); // jmp r11
-	// Match the integer fallback for floating-point return values.
-	emit(0x0f);
-	emit(0x57);
-	emit(0xc0); // xorps xmm0, xmm0
-	emit(0x31);
-	emit(0xc0); // xor eax, eax
-	emit(0xc3); // ret
-
-	EXIT_NOT_IMPLEMENTED(i != thunk_size);
+	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
+	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
+	std::memcpy(bytes + 16, &target, sizeof(target));
 	std::memcpy(code, bytes, sizeof(bytes));
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
 	return reinterpret_cast<uint64_t>(code);
@@ -270,15 +178,8 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
-	const auto program_name = program != nullptr ? Common::PathToString(program->file_name) : "";
-
-	for (auto& record: g_stubbed_imports) {
+	for (const auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
-			record.index   = index;
-			record.name    = ri.name;
-			record.type    = ri.type;
-			record.bind    = ri.bind;
-			record.program = program_name;
 			return record.thunk_vaddr;
 		}
 	}
@@ -289,7 +190,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	record.name        = ri.name;
 	record.type        = ri.type;
 	record.bind        = ri.bind;
-	record.program     = program_name;
+	record.program     = Common::PathToString(program->file_name);
 	g_stubbed_imports.push_back(record);
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
@@ -297,31 +198,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	return thunk;
 }
 
-static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
-	if (record_id < g_stubbed_imports.size()) {
-		auto& record = g_stubbed_imports[record_id];
-		auto  nid    = record.name;
-		auto  pos    = nid.find('[');
-		if (pos != std::string::npos) {
-			nid.resize(pos);
-		}
-
-		SymbolRecord resolved {};
-		if (!nid.empty() &&
-		    Common::Singleton<RuntimeLinker>::Instance()->ResolveLoadedSymbolByNid(nid, record.type,
-		                                                                           &resolved) &&
-		    resolved.vaddr != 0 && resolved.vaddr != record.thunk_vaddr) {
-			LOGF("Late-resolved import: %s -> %s [0x%016" PRIx64 "]\n", record.name.c_str(),
-			     resolved.name.c_str(), resolved.vaddr);
-
-			if (record.patch_vaddr != 0) {
-				PatchGuestMemory64(record.patch_vaddr, resolved.vaddr);
-			}
-
-			return resolved.vaddr;
-		}
-	}
-
+static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -932,14 +809,8 @@ static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) 
 static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
-	// KYTY_PROFILER_BLOCK("1");
-
 	RelocationInfo ret;
 	// SymbolRecord   sr {};
-
-	// KYTY_PROFILER_END_BLOCK;
-
-	// KYTY_PROFILER_BLOCK("2");
 
 	auto         type    = r->GetType();
 	auto         symbol  = r->GetSymbol();
@@ -949,10 +820,6 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	ret.base_vaddr       = program->base_vaddr;
 	ret.vaddr            = ret.base_vaddr + r->r_offset;
 	ret.bind_self        = false;
-
-	// KYTY_PROFILER_END_BLOCK;
-
-	// KYTY_PROFILER_BLOCK("3");
 
 	switch (type) {
 		case R_X86_64_GLOB_DAT:
@@ -1002,140 +869,59 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 		default: EXIT("unknown type: %d\n", (int)type);
 	}
 
-	// KYTY_PROFILER_END_BLOCK;
-
 	return ret;
 }
 
-static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table,
-                           bool imports_only, std::vector<std::string>* unresolved) {
+static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
-	auto ri = GetRelocationInfo(r, program);
-
-	if (imports_only &&
-	    (ri.bind_self || (ri.bind != BindType::Global && ri.bind != BindType::Weak))) {
-		return;
-	}
-
-	[[maybe_unused]] bool patched        = false;
-	bool                  stubbed_import = false;
-	bool                  stubbed_func   = false;
-
-	// KYTY_PROFILER_BLOCK("patch");
-
-	if (ri.resolved) {
-		patched = PatchGuestMemory64(ri.vaddr, ri.value);
-	} else {
-		uint64_t value = 0;
-		bool     weak  = (ri.bind == BindType::Weak || !program->fail_if_global_not_resolved);
-		if (ri.type == SymbolType::Object && weak) {
+	const auto ri      = GetRelocationInfo(r, program);
+	auto       value   = ri.value;
+	bool       stubbed = false;
+	if (!ri.resolved) {
+		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
+		if (!weak) {
+			LOGF("Stubbed: %s\n",
+			     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
+			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
+			                 ri.dbg_name).c_str());
+		}
+		if (ri.type == SymbolType::Object) {
 			value = g_invalid_memory;
-		} else if (ri.type == SymbolType::Func && jmprela_table && weak) {
-			value          = RegisterStubbedImport(index, program, ri);
-			stubbed_import = true;
-			stubbed_func   = true;
-		} else if (ri.type == SymbolType::Func && !jmprela_table && weak) {
-			value        = RegisterStubbedImport(index, program, ri);
-			stubbed_func = true;
-		} else if (ri.type == SymbolType::NoType && weak) {
-			value = RuntimeLinker::ReadFromElf(program, ri.vaddr) + ri.base_vaddr;
-		}
-
-		if (value != 0) {
-			patched = PatchGuestMemory64(ri.vaddr, value);
 		} else {
-			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
-			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
-
-			if (unresolved != nullptr) {
-				unresolved->push_back(dbg_str);
-			} else {
-				EXIT("Can't resolve: %s\n", dbg_str.c_str());
-			}
-
-			if (ri.type == SymbolType::Object) {
-				value = g_invalid_memory;
-			} else if (ri.type == SymbolType::Func || ri.type == SymbolType::NoType) {
-				value        = RegisterStubbedImport(index, program, ri);
-				stubbed_func = true;
-				if (jmprela_table) {
-					stubbed_import = true;
-				}
-			}
-
-			if (value != 0) {
-				patched = PatchGuestMemory64(ri.vaddr, value);
-			}
+			value   = RegisterStubbedImport(index, program, ri);
+			stubbed = true;
 		}
 	}
 
-	// KYTY_PROFILER_END_BLOCK;
-
-	if (patched && stubbed_import) {
-		const auto thunk = RegisterStubbedImport(index, program, ri);
-		LOGF("Relocate: unresolved PLT import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
+	const bool patched = PatchGuestMemory64(ri.vaddr, value);
+	if (patched && stubbed) {
+		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
-		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
-	} else if (patched && stubbed_func) {
-		const auto thunk = RegisterStubbedImport(index, program, ri);
-		LOGF("Relocate: unresolved non-PLT function patched to stub [%u] [%016" PRIx64
-		     "] <- %016" PRIx64 ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
-		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
+		     jmprela_table ? "PLT" : "non-PLT", index, ri.vaddr, value, ri.name.c_str(),
+		     magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
+		     Common::PathToString(program->file_name).c_str());
 	}
 
-	if (program->dbg_print_reloc) {
-		if (patched && !ri.bind_self &&
-		    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
-		     ri.type == SymbolType::TlsModule)) {
-			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
-			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
-
-			LOGF("Relocate: %s\n", dbg_str.c_str());
-		}
+	if (program->dbg_print_reloc && patched && !ri.bind_self &&
+	    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
+	     ri.type == SymbolType::TlsModule)) {
+		LOGF("Relocate: %s\n",
+		     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
+		                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
+		                 ri.dbg_name).c_str());
 	}
+	return ri.resolved;
 }
 
-static void RelocateRecords(Elf64_Rela* records, uint64_t size, Program* program,
-                            bool jmprela_table, bool imports_only,
-                            std::vector<std::string>* unresolved) {
-	KYTY_PROFILER_FUNCTION();
-
-	uint32_t index = 0;
-	for (auto* r = records;
-	     reinterpret_cast<uint8_t*>(r) < reinterpret_cast<uint8_t*>(records) + size; r++, index++) {
-		RelocateRecord(index, r, program, jmprela_table, imports_only, unresolved);
+static void ForEachRelocation(Program* program, auto&& func) {
+	const auto& info = *program->dynamic_info;
+	for (uint32_t i = 0; i < info.rela_table_total_size / sizeof(Elf64_Rela); ++i) {
+		func(info.rela_table + i, i, false);
 	}
-}
-
-__attribute__((naked)) static KYTY_SYSV_ABI void RelocateHandlerReturnStub() {
-	asm volatile("addq $8, %rsp\n\t"
-	             "retq\n");
-}
-
-static KYTY_SYSV_ABI uint64_t RelocateHandler(RelocateHandlerStack s) {
-	auto*       stack     = s.stack;
-	auto*       program   = reinterpret_cast<Program*>(stack[-1]);
-	auto        rel_index = stack[0];
-	std::string name      = "<unknown function>";
-
-	if (program != nullptr && program->dynamic_info != nullptr &&
-	    program->dynamic_info->jmprela_table != nullptr) {
-		auto ri = GetRelocationInfo(program->dynamic_info->jmprela_table + rel_index, program);
-
-		name = ri.name.c_str();
+	for (uint32_t i = 0; i < info.jmprela_table_size / sizeof(Elf64_Rela); ++i) {
+		func(info.jmprela_table + i, i, true);
 	}
-
-	// Restore return address (for stack trace)
-	stack[-1] = reinterpret_cast<uint64_t>(RelocateHandlerReturnStub);
-
-	LOGF("=== Stubbed function, returning OK ===\n[%d]\t%s\n", Common::Thread::GetThreadIdUnique(),
-	     name.c_str());
-	return 0;
 }
 
 static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
@@ -1314,8 +1100,6 @@ void RuntimeLinker::RelocateAll() {
 	for (auto* p: m_programs) {
 		Relocate(p);
 	}
-
-	m_relocated = true;
 }
 
 void RuntimeLinker::RelocateProgram(Program* program) {
@@ -1335,17 +1119,52 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 	Common::LockGuard lock(m_mutex);
 
-	if (auto it = std::find(m_programs.begin(), m_programs.end(), program);
-	    it != m_programs.end()) {
-		DeleteProgram(*it);
-		m_programs.erase(it);
-	} else {
-		EXIT("program not found");
-	}
+	auto it = std::find(m_programs.begin(), m_programs.end(), program);
+	EXIT_IF(it == m_programs.end());
+	m_programs.erase(it);
 
-	if (m_relocated) {
-		RelocateAll();
+	for (auto* importer: m_programs) {
+		const auto& info = *importer->dynamic_info;
+		const auto rela_count =
+		    static_cast<uint32_t>(info.rela_table_total_size / sizeof(Elf64_Rela));
+		ForEachRelocation(importer, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
+			const auto bit_index = (jmprela ? rela_count : 0) + index;
+			auto&      bits      = importer->rela_bits[bit_index >> 3u];
+			const auto mask      = 1u << (bit_index & 7u);
+			const auto type      = r->GetType();
+			if ((bits & mask) == 0 || (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT &&
+			                           type != R_X86_64_JUMP_SLOT)) {
+				return;
+			}
+			const auto& symbol = info.symbol_table[r->GetSymbol()];
+			if (symbol.GetBind() != STB_GLOBAL && symbol.GetBind() != STB_WEAK) {
+				return;
+			}
+			const auto value =
+			    *reinterpret_cast<const uint64_t*>(importer->base_vaddr + r->r_offset);
+			const auto address = value - (type == R_X86_64_64 ? r->r_addend : 0);
+			if (address < program->base_vaddr ||
+			    address >= program->base_vaddr + program->mapped_size) {
+				return;
+			}
+			SymbolType symbol_type;
+			switch (symbol.GetType()) {
+				case STT_NOTYPE: symbol_type = SymbolType::NoType; break;
+				case STT_FUNC: symbol_type = SymbolType::Func; break;
+				case STT_OBJECT: symbol_type = SymbolType::Object; break;
+				default: return;
+			}
+			const std::string name = info.str_table + symbol.st_name;
+			if (program->export_symbols->FindByNid(name.substr(0, name.find('#')), symbol_type,
+			                                       address) != nullptr) {
+				bits &= ~mask;
+				if (RelocateRecord(index, r, importer, jmprela)) {
+					bits |= mask;
+				}
+			}
+		});
 	}
+	DeleteProgram(program);
 }
 
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
@@ -1446,7 +1265,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
-	PreloadAdjacentPrograms();
+	// The runtime automatically loads libc; other PRXs are requested by the application.
+	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
+	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1455,7 +1276,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
-	StartAllModules();
+	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
+		StartModule(libc, 0, nullptr, nullptr);
+	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1499,7 +1322,6 @@ void RuntimeLinker::Clear() {
 	g_tls_cached_main_tcb     = nullptr;
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
-	m_relocated = false;
 }
 
 void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* program,
@@ -1559,10 +1381,20 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec == nullptr) {
-				if (auto* p = FindProgram(*m, *l); p != nullptr && p->export_symbols != nullptr) {
+				for (auto* p: m_programs) {
+					const auto& libs = p->dynamic_info->export_libs;
+					const auto& modules = p->dynamic_info->export_modules;
+					if (p->export_symbols == nullptr ||
+					    std::find(libs.begin(), libs.end(), *l) == libs.end() ||
+					    std::find(modules.begin(), modules.end(), *m) == modules.end()) {
+						continue;
+					}
 					rec = p->export_symbols->Find(sr);
-					if (bind_self != nullptr) {
-						*bind_self = (p == program);
+					if (rec != nullptr) {
+						if (bind_self != nullptr) {
+							*bind_self = (p == program);
+						}
+						break;
 					}
 				}
 			}
@@ -1575,7 +1407,6 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec != nullptr) {
-				//*out_vaddr = rec->vaddr;
 				*out_info = *rec;
 			} else {
 				out_info->vaddr    = 0;
@@ -1596,33 +1427,6 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		out_info->name     = name;
 		out_info->dbg_name = "";
 	}
-}
-
-bool RuntimeLinker::ResolveLoadedSymbolByNid(const std::string& nid, SymbolType type,
-                                             SymbolRecord* out_info) {
-	KYTY_PROFILER_FUNCTION();
-
-	Common::LockGuard lock(m_mutex);
-
-	EXIT_IF(out_info == nullptr);
-
-	for (auto* p: m_programs) {
-		if (p != nullptr && p->export_symbols != nullptr) {
-			if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
-				*out_info = *rec;
-				return true;
-			}
-		}
-	}
-
-	if (m_symbols != nullptr) {
-		if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
-			*out_info = *rec;
-			return true;
-		}
-	}
-
-	return false;
 }
 
 uint64_t RuntimeLinker::ReadFromElf(Program* program, uint64_t vaddr) {
@@ -1727,84 +1531,6 @@ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	}
 }
 
-static std::string GetProgramModuleName(const Program* program) {
-	EXIT_IF(program == nullptr);
-
-	if (program->dynamic_info != nullptr && program->dynamic_info->so_name != nullptr &&
-	    program->dynamic_info->so_name[0] != '\0') {
-		return std::string(program->dynamic_info->so_name);
-	}
-
-	return Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name));
-}
-
-static bool ModuleStartDependenciesSatisfied(const Program*               program,
-                                             const std::vector<Program*>& programs,
-                                             const std::vector<Program*>& started) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->dynamic_info == nullptr);
-
-	for (const auto* needed: program->dynamic_info->needed) {
-		if (needed == nullptr || needed[0] == '\0') {
-			continue;
-		}
-
-		const auto needed_name = std::string(needed);
-
-		for (auto* dependency: programs) {
-			if (dependency == nullptr || dependency == program || dependency->elf == nullptr ||
-			    !dependency->elf->IsShared()) {
-				continue;
-			}
-
-			const auto dependency_name = GetProgramModuleName(dependency);
-			if (Common::EqualNoCase(dependency_name, needed_name) ||
-			    Common::EqualNoCase(Common::FilenameWithoutDirectory(
-			                            Common::PathToGenericString(dependency->file_name)),
-			                        needed_name)) {
-				if (std::find(started.begin(), started.end(), dependency) == started.end()) {
-					return false;
-				}
-				break;
-			}
-		}
-	}
-
-	return true;
-}
-
-void RuntimeLinker::StartAllModules() {
-	Common::LockGuard lock(m_mutex);
-
-	std::vector<Program*> started;
-
-	for (;;) {
-		bool progressed = false;
-
-		for (auto* p: m_programs) {
-			if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-			    std::find(started.begin(), started.end(), p) == started.end() &&
-			    ModuleStartDependenciesSatisfied(p, m_programs, started)) {
-				StartModule(p, 0, nullptr, nullptr);
-				started.push_back(p);
-				progressed = true;
-			}
-		}
-
-		if (!progressed) {
-			break;
-		}
-	}
-
-	for (auto* p: m_programs) {
-		if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-		    std::find(started.begin(), started.end(), p) == started.end()) {
-			StartModule(p, 0, nullptr, nullptr);
-			started.push_back(p);
-		}
-	}
-}
-
 void RuntimeLinker::StopAllModules() {
 	Common::LockGuard lock(m_mutex);
 
@@ -1812,75 +1538,6 @@ void RuntimeLinker::StopAllModules() {
 		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
 			StopModule(p, 0, nullptr, nullptr);
 		}
-	}
-}
-
-static bool IsAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower.ends_with(".prx") || lower.ends_with(".sprx");
-}
-
-static bool SkipAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower == "eboot.bin" || lower == "libkernel.prx" || lower == "libkernel_sys.prx";
-}
-
-void RuntimeLinker::PreloadAdjacentPrograms() {
-	if (m_programs.empty()) {
-		return;
-	}
-
-	std::vector<std::filesystem::path> module_paths;
-
-	auto is_loaded = [this](const std::filesystem::path& path) {
-		auto fixed_path = Common::FixFilenameSlash(Common::PathToGenericString(path));
-		for (auto* program: m_programs) {
-			if (Common::EqualNoCase(
-			        Common::FixFilenameSlash(Common::PathToGenericString(program->file_name)),
-			        fixed_path)) {
-				return true;
-			}
-		}
-		return false;
-	};
-
-	auto add_path = [&module_paths, &is_loaded](const std::filesystem::path& path) {
-		if (is_loaded(path)) {
-			return;
-		}
-		for (const auto& p: module_paths) {
-			if (Common::EqualNoCase(Common::PathToGenericString(p),
-			                        Common::PathToGenericString(path))) {
-				return;
-			}
-		}
-		module_paths.push_back(path);
-	};
-
-	auto add_dir = [&add_path](const std::filesystem::path& dir) {
-		if (!Common::File::IsDirectoryExisting(dir)) {
-			return;
-		}
-		for (const auto& entry: Common::File::GetDirEntries(dir)) {
-			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
-			    !SkipAdjacentModuleFile(entry.name)) {
-				add_path(dir / entry.name);
-			}
-		}
-	};
-
-	auto root = m_programs.at(0)->file_name.parent_path();
-	if (root.empty()) {
-		return;
-	}
-
-	add_dir(root);
-	add_dir(root / "sce_module");
-	add_dir(root / "sce_modules");
-
-	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
-		program->fail_if_global_not_resolved = false;
 	}
 }
 
@@ -2013,38 +1670,39 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-	const bool emulate_rsqrt = Config::AmdCpuEnabled();
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
-	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (use_red_zone_protection) {
-		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += RED_ZONE_TRAMPOLINE_SIZE;
-	}
+#if !defined(__APPLE__)
+	const bool emulate_amd = Config::AmdCpuEnabled();
+#else
+	const bool emulate_amd = false;
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+#else
+	const bool protect_memory_faults = false;
+#endif
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+
+	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	if (patch_guest_instructions) {
+		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
+		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (use_red_zone_protection) {
-		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
-		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
-		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
-		                           program->base_size_aligned,
-		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
-		                           program->red_zone_trampoline_size);
+	if (patch_guest_instructions) {
+		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
+		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
+		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
-#endif
 	if (!is_shared) {
-		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		program->tls.handler_vaddr += program->red_zone_trampoline_size;
-#endif
+		program->tls.handler_vaddr =
+		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
@@ -2064,10 +1722,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uint64_t                                   eh_frame_header_addr = 0;
 	uint64_t                                   eh_frame_header_size = 0;
-#endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
@@ -2126,52 +1782,68 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection && phdr[i].p_type == PT_GNU_EH_FRAME) {
+		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
 			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
 			eh_frame_header_size = phdr[i].p_memsz;
 		}
-#endif
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::vector<uintptr_t> function_starts;
-	if (use_red_zone_protection) {
-		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                 &function_starts)) {
-			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
-			     Common::PathToString(program->file_name).c_str());
+	if (patch_guest_instructions) {
+		std::vector<uintptr_t> function_starts;
+		const bool             have_function_starts =
+		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
+		                                &function_starts) &&
+		    !function_starts.empty();
+		const auto module_name = Common::PathToString(program->file_name.filename());
+		if (!have_function_starts) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
+			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                module_name));
 		}
-	}
-#endif
-	for (const auto& [segment_addr, segment_size]: executable_segments) {
-		uint64_t reciprocal_sqrt_count = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection) {
-			const auto result =
-			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
-			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
-			     result.red_zone_function_count, result.memory_instruction_count,
-			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
-			     result.stack_dependent_memory_instruction_count,
-			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
-			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+		GuestInstructionPatchResult totals {};
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_amd);
+			totals.reciprocal_sqrt += result.reciprocal_sqrt;
+			totals.extrq += result.extrq;
+			totals.insertq += result.insertq;
+			totals.rdpid += result.rdpid;
+			totals.clwb += result.clwb;
+			if (protect_memory_faults) {
+				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+				     module_name.c_str(),
+				     result.function_count, result.red_zone_function_count,
+				     result.memory_instruction_count, result.patched_memory_instruction_count,
+				     result.short_memory_instruction_count,
+				     result.stack_dependent_memory_instruction_count,
+				     result.control_flow_memory_instruction_count,
+				     result.unrelocatable_memory_instruction_count);
+			}
 		}
-#else
-		if (emulate_rsqrt) {
-			reciprocal_sqrt_count =
-			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
-			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
-		}
-#endif
-		if (reciprocal_sqrt_count != 0) {
-			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+		if (emulate_amd && have_function_starts) {
+			InstructionPatchCounts combined {};
+			std::string            details;
+			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
+			                                  {"EXTRQ", totals.extrq},
+			                                  {"INSERTQ", totals.insertq},
+			                                  {"RDPID", totals.rdpid},
+			                                  {"CLWB", totals.clwb}}) {
+				combined += counts;
+				if (!details.empty()) details += "; ";
+				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
+				                       counts.trapped, counts.Skipped());
+			}
+			const auto  found   = combined.found;
+			const auto  skipped = combined.Skipped();
+			const char* status  = found == 0         ? "no matching instructions"
+			                      : skipped == found ? "not patched"
+			                      : skipped != 0     ? "partially patched"
+			                                         : "patched";
+			Log::WriteToConsoleAndLog(
+			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
 
@@ -2200,18 +1872,11 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (program->red_zone_trampoline_size != 0) {
-			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
+		if (program->instruction_trampoline_size != 0) {
+			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
 		}
-#endif
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
-	}
-
-	if (program->custom_call_plt_vaddr != 0 || program->custom_call_plt_num != 0) {
-		const auto size = Jit::CallPlt::GetSize(program->custom_call_plt_num);
-		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(program->custom_call_plt_vaddr, size));
 	}
 }
 
@@ -2255,10 +1920,6 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &program->dynamic_info->fini_array_size, DT_FINI_ARRAYSZ);
 	GetDynValue(elf, &program->dynamic_info->preinit_array_size, DT_PREINIT_ARRAYSZ);
 
-	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTGOT) && elf->HasDynValue(DT_PLTGOT));
-	GetDynPtr(elf, &program->dynamic_info->pltgot_vaddr, DT_OS_PLTGOT);
-	GetDynPtr(elf, &program->dynamic_info->pltgot_vaddr, DT_PLTGOT);
-
 	Elf64_Sxword jmprel_type = 0;
 	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTREL) && elf->HasDynValue(DT_PLTREL));
 	GetDynValue(elf, &jmprel_type, DT_OS_PLTREL);
@@ -2281,6 +1942,11 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &program->dynamic_info->rela_table_total_size, DT_RELASZ);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_OS_RELAENT);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_RELAENT);
+	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_total_size % sizeof(Elf64_Rela) != 0 ||
+	                     program->dynamic_info->jmprela_table_size % sizeof(Elf64_Rela) != 0);
+	const auto rela_count = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
+	const auto jmprela_count = program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
+	program->rela_bits.resize((rela_count + jmprela_count + 7u) / 8u);
 
 	GetDynValue(elf, &program->dynamic_info->relative_count, DT_RELACOUNT);
 
@@ -2290,12 +1956,6 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->debug != 0);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->textrel != 0);
-
-	std::vector<uint64_t> needed;
-	GetDynValues(elf, &needed, DT_NEEDED);
-	for (auto need: needed) {
-		program->dynamic_info->needed.push_back(program->dynamic_info->str_table + need);
-	}
 
 	uint64_t so_name = 0;
 	GetDynValue(elf, &so_name, DT_SONAME);
@@ -2327,43 +1987,6 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	           DT_OS_EXPORT_LIB_1);
 }
 
-static void InstallRelocateHandler(Program* program) {
-	KYTY_PROFILER_FUNCTION();
-
-	uint64_t pltgot_vaddr = program->dynamic_info->pltgot_vaddr + program->base_vaddr;
-	uint64_t pltgot_size  = static_cast<uint64_t>(3) * 8;
-	void**   pltgot       = reinterpret_cast<void**>(pltgot_vaddr);
-
-	Common::VirtualMemory::Mode old_mode {};
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
-	    pltgot_vaddr, pltgot_size, Common::VirtualMemory::Mode::Write, &old_mode));
-
-	pltgot[1] = program;
-	pltgot[2] = reinterpret_cast<void*>(RelocateHandler);
-
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(pltgot_vaddr, pltgot_size, old_mode));
-
-	if (Common::VirtualMemory::IsExecute(old_mode)) {
-		Common::VirtualMemory::FlushInstructionCache(pltgot_vaddr, pltgot_size);
-	}
-
-	// TODO(): check if this table already generated by compiler (sometimes it is missing)
-	if (program->custom_call_plt_vaddr == 0) {
-		program->custom_call_plt_num =
-		    program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
-		auto size                      = Jit::CallPlt::GetSize(program->custom_call_plt_num);
-		program->custom_call_plt_vaddr = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-		    SYSTEM_RESERVED, size, Common::VirtualMemory::Mode::Write, "custom_call_plt");
-		EXIT_NOT_IMPLEMENTED(program->custom_call_plt_vaddr == 0);
-		auto* code = new (reinterpret_cast<void*>(program->custom_call_plt_vaddr))
-		    Jit::CallPlt(program->custom_call_plt_num);
-		code->SetPltGot(pltgot_vaddr);
-		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->custom_call_plt_vaddr, size,
-		                                                     Common::VirtualMemory::Mode::Execute));
-		Common::VirtualMemory::FlushInstructionCache(program->custom_call_plt_vaddr, size);
-	}
-}
-
 void RuntimeLinker::Relocate(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2383,46 +2006,23 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->jmprela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->pltgot_vaddr == 0);
 
-	InstallRelocateHandler(program);
+	const auto rela_count = static_cast<uint32_t>(
+	    program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
 
-	std::vector<std::string> unresolved;
-	const bool               imports_only = program->relocated;
-
-	RelocateRecords(program->dynamic_info->rela_table, program->dynamic_info->rela_table_total_size,
-	                program, false, imports_only, &unresolved);
-	RelocateRecords(program->dynamic_info->jmprela_table, program->dynamic_info->jmprela_table_size,
-	                program, true, imports_only, &unresolved);
-	program->relocated = true;
+	ForEachRelocation(program, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
+		const auto bit_index = (jmprela ? rela_count : 0) + index;
+		if ((program->rela_bits[bit_index >> 3u] & (1u << (bit_index & 7u))) == 0 &&
+		    RelocateRecord(index, r, program, jmprela)) {
+			program->rela_bits[bit_index >> 3u] |= 1u << (bit_index & 7u);
+		}
+	});
 
 	if (program->tls.image_vaddr != 0 && program->tls.init_size != 0 &&
 	    program->tls.init_image.empty()) {
 		const auto* src = reinterpret_cast<const uint8_t*>(program->tls.image_vaddr);
 		program->tls.init_image.assign(src, src + program->tls.init_size);
 	}
-
-	if (!unresolved.empty()) {
-		LOGF("--- Stubbed unresolved imports: %zu ---\n", unresolved.size());
-		for (const auto& symbol: unresolved) {
-			LOGF("Stubbed: %s\n", symbol.c_str());
-		}
-	}
-}
-
-Program* RuntimeLinker::FindProgram(const ModuleId& m, const LibraryId& l) {
-	Common::LockGuard lock(m_mutex);
-
-	for (auto* p: m_programs) {
-		const auto& export_libs    = p->dynamic_info->export_libs;
-		const auto& export_modules = p->dynamic_info->export_modules;
-
-		if (std::find(export_libs.begin(), export_libs.end(), l) != export_libs.end() &&
-		    std::find(export_modules.begin(), export_modules.end(), m) != export_modules.end()) {
-			return p;
-		}
-	}
-	return nullptr;
 }
 
 const ModuleId* RuntimeLinker::FindModule(const Program& program, const std::string& id) {

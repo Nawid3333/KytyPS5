@@ -17,13 +17,11 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	std::span<const uint32_t> workgroup_counts;
 };
 
 enum class RuntimeValueType { Any, Integer };
 
-// Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
-// dynamic offsets remain explicit and are never assigned a fake slot.
-void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
@@ -41,8 +39,7 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
-	// An empty span means that all sources are active.
-	std::span<const uint8_t> FindActiveSources();
+	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:

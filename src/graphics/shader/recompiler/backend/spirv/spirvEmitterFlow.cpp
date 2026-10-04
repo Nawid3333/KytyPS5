@@ -366,18 +366,23 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
 			continue;
 		}
-		auto StoreDistance = [&](uint32_t variable, uint32_t index) {
+		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t variable, uint32_t index) {
 			if (index == UINT32_MAX) {
 				return;
 			}
-			const auto pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-			                          pointer, variable, ConstantU32(state, index));
+			uint32_t pointer;
+			if (state.program.stage == ShaderType::Mesh) {
+				pointer = MeshOutputPointer(state, kind, index);
+			} else {
+				pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
+				                          pointer, variable, ConstantU32(state, index));
+			}
 			state.builder.AddFunction(spv::OpStore, pointer, f32);
 		};
-		StoreDistance(state.clip_distance_variable, output.clip_distance);
-		StoreDistance(state.cull_distance_variable, output.cull_distance);
+		StoreDistance(IR::StageOutputKind::ClipDistance, state.clip_distance_variable, output.clip_distance);
+		StoreDistance(IR::StageOutputKind::CullDistance, state.cull_distance_variable, output.cull_distance);
 	}
 }
 
@@ -452,6 +457,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 		return;
 	}
+	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
+	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
+		return;
+	}
 	EmitIfCondition(state, exec, [&]() {
 		const auto data = ctx.Arg(inst, 0);
 		if (exp.kind == IR::ExportTargetKind::Primitive) {
@@ -492,6 +502,40 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index == 0 && !uint_output &&
+		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
+			// Broadcast logical alpha before swizzling the primary output.
+			const auto blend_output =
+			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
+			if (blend_output != 0) {
+				auto alpha = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
+				                          3u, 3u, 3u, 3u);
+				uint32_t alpha_factor = 0;
+				switch (state.input_info.pixel->alpha_blend_source) {
+					case ShaderAlphaBlendSource::SourceAlphaOne:
+						alpha_factor = ConstantF32Value(state, 1.0f);
+						break;
+					case ShaderAlphaBlendSource::SourceAlphaZero:
+						alpha_factor = ConstantF32Value(state, 0.0f);
+						break;
+					default: break;
+				}
+				if (alpha_factor != 0) {
+					const auto mapping = state.input_info.pixel->target_export_mapping[0];
+					for (uint32_t component = 0; component < 4; component++) {
+						if (mapping.Map(component) != 3u) continue;
+						const auto factors = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeInsert, vector_type, factors,
+						                          alpha_factor, alpha, component);
+						alpha = factors;
+						break;
+					}
+				}
+				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
+			}
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
@@ -557,6 +601,14 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 
 void EmitVoid(ValueEmitContext&) {}
 
+void EmitStoreCompletion(EmitterState& state) {
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	    ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
+	                          spv::MemorySemanticsImageMemoryMask));
+}
+
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
@@ -564,9 +616,11 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
-	                                       : spv::MemorySemanticsAcquireReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                        ? spv::MemorySemanticsUniformMemoryMask
+	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
+	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
@@ -606,6 +660,14 @@ uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) 
 	return EmitBuiltinU32(ctx.state, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
 }
 
+uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto start = ctx.state.program.bindings.dispatch_thread_dword;
+	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
+		ctx.Fail(inst, "invalid dispatch thread extent");
+	}
+	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+}
+
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpUndef, TypeId(state, inst.GetType()), result);
@@ -634,6 +696,29 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
+}
+
+uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
+	// A native scalar branch makes one decision for both emulated wave halves.
+	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	const auto kind = inst.Flags<CFG::BranchCondition>();
+	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	const auto ballot = ctx.Ballot(inst.Arg(0));
+	const auto low = ctx.state.builder.AllocateId();
+	const auto high = ctx.state.builder.AllocateId();
+	const auto combined = ctx.state.builder.AllocateId();
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
+	                              TypeU32(ctx.state), combined, low, high);
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
+	                              TypeBool(ctx.state), result, combined,
+	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
+	return result;
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

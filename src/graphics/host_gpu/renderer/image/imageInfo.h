@@ -15,19 +15,21 @@
 
 namespace Libs::Graphics {
 
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
-enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
+enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 
 struct ImageMetadataInfo {
 	GuestRange          range;
-	ImageMetadataKind   kind               = ImageMetadataKind::None;
-	uint32_t            control            = 0;
-	uint32_t            dcc_clear_word           = 0;
-	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
-	bool                stencil_compressed = false;
-	bool                dcc_clear_register_valid = false;
-	bool                dcc_alpha_msb            = true;
+	ImageMetadataKind   kind                 = ImageMetadataKind::None;
+	uint32_t            control              = 0;
+	uint32_t            clear_word           = 0;
+	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
+	bool                stencil_compressed   = false;
+	bool                clear_register_valid = false;
+	bool                dcc_alpha_msb        = true;
 };
 
 struct ImageSubresources {
@@ -70,6 +72,14 @@ struct ImageInfo {
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
+	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
+		if (bgra16) return ColorTransform::SwapBgra16;
+		switch (guest_format) {
+			case Prospero::BufferFormat::k10_11_11Float:
+				return ColorTransform::Reverse10_11_11;
+			default: return ColorTransform::None;
+		}
+	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -91,7 +101,8 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
-		       bytes_per_block == other.bytes_per_block;
+		       bytes_per_block == other.bytes_per_block &&
+		       GetColorTransform() == other.GetColorTransform();
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
 		if (container.resources.levels > container.mip_layout.size()) {
@@ -329,7 +340,9 @@ struct VideoOutFormatPolicy {
 	VideoOutPixelFormatInfo info;
 };
 
-inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
+
+inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -338,6 +351,8 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
+     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
@@ -422,6 +437,20 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
 	}
 	clear = next;
 	return true;
+}
+
+// Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
+// Keep this separate: the first register word alone cannot describe a 64-bit color.
+[[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
+                                               vk::ClearColorValue& clear) {
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		if (packed != 0) {
+			return false;
+		}
+		clear = vk::ClearColorValue {};
+		return true;
+	}
+	return DecodePackedColorClear(format, packed, clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

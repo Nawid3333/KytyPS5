@@ -2266,7 +2266,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
-		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2274,12 +2273,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				queued = true;
+				cp.BufferFlush();
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
-		}
-		if (queued) {
-			cp.BufferFlush();
 		}
 	};
 
@@ -2318,7 +2314,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlush();
+		}
 
 		return 7;
 	}
@@ -3624,6 +3622,18 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
+	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS;
+	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			cp.GetShCtx().SetPsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS,
+			                                   value);
+		};
+	}
+	for (uint32_t offset = 4; offset <= 5; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			cp.GetShCtx().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
+		};
+	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};

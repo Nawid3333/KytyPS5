@@ -327,9 +327,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			}
 		}
 
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
-
 		EXIT_IF(registers_num < 1 || registers_num > 4);
 	}
 
@@ -403,8 +400,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
-		    (static_params.separate_alpha_blend[i] ? GetBlendFactor(static_params.alpha_srcblend[i])
-		                                           : color_blend_attachment[i].srcColorBlendFactor);
+		    (static_params.separate_alpha_blend[i]
+		         ? GetBlendFactor(static_params.alpha_srcblend[i])
+		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
 		         ? GetBlendFactor(static_params.alpha_destblend[i])

@@ -97,30 +97,6 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
-	// Scalar-instruction conditions already test the full wave's raw register values.
-	if (ctx.other_half == nullptr ||
-	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
-	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
-		return ctx.Def(info.condition);
-	}
-	const auto ballot = ctx.Ballot(info.condition);
-	const auto low    = ctx.state.builder.AllocateId();
-	const auto high   = ctx.state.builder.AllocateId();
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const auto kind     = info.terminator.condition;
-	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
-	                      kind == CFG::BranchCondition::VccZero ||
-	                      kind == CFG::BranchCondition::SccZero;
-	const auto combined =
-	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
-	return result;
-}
-
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
@@ -160,7 +136,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			const auto condition = ctx.Def(info.condition);
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -193,7 +169,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, BranchCondition(ctx, info),
+			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}
@@ -267,6 +243,12 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
+	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+		// Both operations already combine both emulated halves into one whole-wave result.
+		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
@@ -333,6 +315,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
+			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -440,6 +423,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
+		case IR::Type::F64: return TypeF64(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -702,6 +686,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineBvhIntersect(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||
@@ -766,6 +751,17 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
+		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
