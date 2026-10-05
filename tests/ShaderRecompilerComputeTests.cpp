@@ -32584,7 +32584,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
-  program.descriptor_sources[0].indirect_descriptor.emplace().table_stride = 16;
+  // libstdc++ rejects optional<nested aggregate>::emplace() here (the nested type's default member
+  // initializers make is_constructible false inside the enclosing class); assign a value instead.
+  program.descriptor_sources[0].indirect_descriptor = ShaderRecompiler::IR::DescriptorSource::IndirectDescriptor {};
+  program.descriptor_sources[0].indirect_descriptor->table_stride = 16;
   ShaderComputeInputInfo compute;
   compute.wave_size = 32;
   compute.host_subgroup_size = vulkan.SubgroupSize();
