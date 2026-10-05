@@ -14937,6 +14937,7 @@ int main() {
   TestNewShaderRecompilerDecoderBranchTargetOutOfBounds();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerUnusedImageInstructions();
+  TestNewShaderRecompilerImageSampleOpcodeAliases();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
