@@ -44,6 +44,16 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	};
 	const auto mapping = ConstantU32(state, mapping_offset);
 	const auto count = LoadMapping(mapping);
+	if (search_iterations == 0u) {
+		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
+		                          ConstantU32(state, 2u));
+		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
+		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
+		                          ConstantU32(state, mapping_offset + 1u));
+		return Select(state, TypeU32(state), valid, LoadMapping(entry),
+		              ConstantU32(state, default_resource));
+	}
 	const auto entry_at = [&](uint32_t index) {
 		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
 		              Binary(state, spv::OpIAdd, TypeU32(state),
@@ -138,7 +148,7 @@ void EnsureLdsStorage(EmitterState& state) {
 	};
 	if (state.requirements.shared_int64_atomics) {
 		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
+		state.lds_u64_variable = define(TypeU64(state), 8u);
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
@@ -361,10 +371,12 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicCompareSwap32:
 		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::ImageAtomicSwap32:
+		case IR::ValueOpcode::ImageAtomicSwap64:
 		case IR::ValueOpcode::BufferAtomicSwap32:
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32:
+		case IR::ValueOpcode::ImageAtomicIAdd64:
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
@@ -374,6 +386,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSMin32:
 		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
 		case IR::ValueOpcode::ImageAtomicUMin32:
+		case IR::ValueOpcode::ImageAtomicUMin64:
 		case IR::ValueOpcode::BufferAtomicUMin32:
 		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicSMax32:
@@ -384,15 +397,18 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicUMax32:
 		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32:
+		case IR::ValueOpcode::ImageAtomicAnd64:
 		case IR::ValueOpcode::BufferAtomicAnd32:
 		case IR::ValueOpcode::BufferAtomicAnd64:
 		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32:
+		case IR::ValueOpcode::ImageAtomicOr64:
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32:
+		case IR::ValueOpcode::ImageAtomicXor64:
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
 		default: return spv::OpNop;
@@ -404,7 +420,7 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
 	const auto old    = ctx.state.builder.AllocateId();
 	const bool wide   = inst.GetType() == IR::Type::U64;
-	const auto type   = wide ? TypeScalarU64(ctx.state) : TypeU32(ctx.state);
+	const auto type   = wide ? TypeU64(ctx.state) : TypeU32(ctx.state);
 	if (opcode == spv::OpAtomicCompareExchange) {
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
@@ -413,13 +429,12 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
 		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
-		auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		if (wide) value = Unary(ctx.state, spv::OpBitcast, type, value);
+		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
 	}
-	return wide ? Unary(ctx.state, spv::OpBitcast, TypeU64(ctx.state), old) : old;
+	return old;
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
@@ -438,6 +453,20 @@ void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
 }
 
+namespace {
+
+uint32_t FloatOrderKey(EmitterState& state, uint32_t bits) {
+	const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
+	                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
+	const auto negative_key = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
+	const auto positive_key =
+	    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
+	return EmitSelectValueU32(state, negative, negative_key, positive_key);
+}
+
+} // namespace
+
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value) {
 	struct OrderedBits {
@@ -447,15 +476,7 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 	};
 	const auto classify = [&](uint32_t bits) {
 		const auto cls = EmitClassifyF32Bits(state, bits);
-		const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
-		                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
-		const auto negative_key = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
-		const auto positive_key =
-		    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
-		return OrderedBits {
-		    cls.nan, cls.zero,
-		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+		return OrderedBits {cls.nan, cls.zero, FloatOrderKey(state, bits)};
 	};
 	const auto source_class = classify(source);
 	const auto old_class    = classify(old);
@@ -468,6 +489,45 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 	return EmitSelectValueU32(
 	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
 	    old);
+}
+
+uint32_t EmitDsFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                      bool max_value) {
+	struct OrderedBits {
+		uint32_t nan;
+		uint32_t signaling_nan;
+		uint32_t key;
+	};
+	const auto classify = [&](uint32_t bits) {
+		const auto abs = EmitAndConstant(state, bits, 0x7fffffffu);
+		const auto nan = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u);
+		const auto signaling_nan = EmitLogicalAndBool(
+		    state, nan, EmitCompareU32Constant(state, spv::OpIEqual,
+		                                      EmitAndConstant(state, bits, 0x00400000u), 0u));
+		const auto small = EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x00800000u);
+		const auto sign = EmitAndConstant(state, bits, 0x80000000u);
+		const auto positive_denorm = EmitLogicalAndBool(
+		    state, EmitCompareU32Constant(state, spv::OpIEqual, sign, 0u),
+		    EmitCompareU32Constant(state, spv::OpINotEqual, abs, 0u));
+		// Negative denorms tie with -0; positive denorms tie only with each other.
+		const auto small_bits = EmitSelectValueU32(
+		    state, positive_denorm, ConstantU32(state, 1u), sign);
+		const auto key_bits = EmitSelectValueU32(state, small, small_bits, bits);
+		return OrderedBits {nan, signaling_nan, FloatOrderKey(state, key_bits)};
+	};
+	const auto lhs = classify(old);
+	const auto rhs = classify(source);
+	const auto choose_source = state.builder.AllocateId();
+	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThanEqual,
+	                          TypeBool(state), choose_source, rhs.key, lhs.key);
+	// Keep original bits: ordering denorms does not flush the selected operand.
+	auto result = EmitSelectValueU32(state, choose_source, source, old);
+	result = EmitSelectValueU32(state, lhs.nan, source, result);
+	result = EmitSelectValueU32(state, rhs.nan, old, result);
+	result = EmitSelectValueU32(state, rhs.signaling_nan,
+	                            EmitOrU32(state, source, ConstantU32(state, 0x00400000u)), result);
+	return EmitSelectValueU32(state, lhs.signaling_nan,
+	                          EmitOrU32(state, old, ConstantU32(state, 0x00400000u)), result);
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
