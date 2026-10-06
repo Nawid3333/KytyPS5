@@ -1,0 +1,28 @@
+# Fork-only: keeps Nawid3333/KytyPS5 main in step with KytyPS5/KytyPS5 main.
+# Uses GitHub's "Sync fork" API, which fast-forwards or merges and fails on conflicts
+# instead of overwriting the fork-only commits (this file and .github/pull.yml).
+name: Sync main with upstream
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Nawid3333/KytyPS5'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge KytyPS5/KytyPS5 main into this fork's main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=main --jq '"\(.merge_type): \(.message)"'
