@@ -712,7 +712,7 @@ constexpr u32 EncodeVopcSdwa(u32 src0, u32 sdst = 0, u32 sd = 0,
 
 constexpr u32 EncodeMubuf0(u32 opcode, u32 offset = 0, bool idxen = false,
                            bool offen = true, bool glc = false) {
-  return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+  return (0x38u << 26u) | ((opcode & 0xffu) << 18u) |
          (offen ? (1u << 12u) : 0u) | (idxen ? (1u << 13u) : 0u) |
          (glc ? (1u << 14u) : 0u) | (offset & 0xfffu);
 }
@@ -22148,6 +22148,65 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   return test;
 }
 
+TestCase Vop3Min3U16CapturedAndSelectors() {
+  using O = ShaderOpcode;
+  struct MinCase {
+    u32 lhs, rhs, third, expected;
+    u32 selectors = 0;
+    u32 dst = 17;
+    bool active = true;
+  };
+  constexpr u32 a = 0x0009ea60u, b = 0x0007c350u, c = 0x00059c40u;
+  const std::array<MinCase, 10> cases{{
+      {a, b, c, 0x0005beefu, 14}, // Captured: min(60000, 7, 5) into v17.hi.
+      {a, b, c, 0xa5a59c40u}, // Unsigned values above INT16_MAX.
+      {a, b, c, 0xa5a50009u, 1},
+      {a, b, c, 0xa5a50007u, 2},
+      {a, b, c, 0xa5a50005u, 4},
+      {a, b, c, 0x0005beefu, 15},
+      {a, b, c, 0x9c40ea60u, 8, 4}, // Destination aliases source 0.
+      {0xabcdffffu, 0xffff0000u, 0x98768000u, 0xa5a50000u},
+      {0x0000ffffu, 0x7fffffffu, 0x8000ffffu, 0xa5a5ffffu},
+      {a, b, c, 0xa5a5beefu, 14, 17, false},
+  }};
+  TestCase test;
+  test.name = "Vop3Min3U16CapturedAndSelectors";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs, entry.third});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    u32 offset = i * 12u;
+    for (u32 reg : {4u, 0u, 7u}) {
+      AppendVMovU32(&code, 30, offset);
+      AppendBufferLoadDword(&code, reg, 30); // Runtime inputs prevent folding.
+      offset += 4u;
+    }
+    AppendVMovLiteral(&code, 17, 0xa5a5beefu);
+    if (!entry.active) {
+      code.push_back(EncodeSop1(0x04, 24, 126)); // Preserve the initial active lanes.
+      code.push_back(EncodeSop1(0x04, 126, 128));
+    }
+    if (i == 0u) {
+      code.insert(code.end(), {0xd7537011u, 0x041e0104u});
+    } else {
+      AppendVop3(&code, 0x353, entry.dst, Vgpr(4), Vgpr(0), Vgpr(7), 0,
+                  entry.selectors);
+    }
+    if (!entry.active) code.push_back(EncodeSop1(0x04, 126, 24));
+    AppendStoreVgpr(&code, entry.dst, static_cast<u32>(test.initial.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN3_U16,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN3_U16", cases.size()}};
+  test.required_spirv = {"OpULessThan"};
+  return test;
+}
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -28714,6 +28773,108 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   return test;
+}
+
+std::vector<TestCase> BufferLoadFormatD16XCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct LoadCase {
+    const char *name;
+    F format;
+    u32 input;
+    u32 expected;
+    u32 selector = 4;
+    u32 index = 0;
+    bool active = true;
+    bool overlap = false;
+  };
+  constexpr LoadCase inputs[] = {
+      {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
+      {"BufferLoadFormatD16XFloat32", F::k32Float, 0x3f000000u, 0xabcd3800u},
+      {"BufferLoadFormatD16XUint32", F::k32UInt, 0x1234fffeu, 0xabcdffffu},
+      {"BufferLoadFormatD16XUintAtMax", F::k32UInt, 0x0000ffffu, 0xabcdffffu},
+      {"BufferLoadFormatD16XUintMax32", F::k32UInt, 0xffffffffu, 0xabcdffffu},
+      {"BufferLoadFormatD16XSint32", F::k32SInt, 0xffff8001u, 0xabcd8001u},
+      {"BufferLoadFormatD16XSintAboveMax", F::k32SInt, 0x00008000u, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintBelowMin", F::k32SInt, 0xffff7fffu, 0xabcd8000u},
+      {"BufferLoadFormatD16XSintAtMax", F::k32SInt, 0x00007fffu, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintAtMin", F::k32SInt, 0xffff8000u, 0xabcd8000u},
+      {"BufferLoadFormatD16XSintMax32", F::k32SInt, 0x7fffffffu, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintMin32", F::k32SInt, 0x80000000u, 0xabcd8000u},
+      {"BufferLoadFormatD16XUnorm8", F::k8UNorm, 0xffu, 0xabcd3c00u},
+      {"BufferLoadFormatD16XSnorm16", F::k16SNorm, 0x8001u, 0xabcdbc00u},
+      {"BufferLoadFormatD16XFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1},
+      {"BufferLoadFormatD16XOobFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 4},
+      {"BufferLoadFormatD16XOobUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 4},
+      {"BufferLoadFormatD16XOobZero", F::k32Float, 0u, 0xabcd0000u, 4, 4},
+      {"BufferLoadFormatD16XInactive", F::k32Float, 0u, 0xabcd1234u, 4, 0, false},
+      {"BufferLoadFormatD16XOverlappingAddress", F::k16UInt, 7u, 7u, 4, 0, true, true},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 0, input.overlap ? input.index : 0xabcd1234u);
+    AppendVMovU32(&test.code, 1, input.index);
+    if (!input.active) {
+      test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    }
+    test.code.push_back(EncodeMubuf0(0x80u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, input.overlap ? 0 : 1));
+    if (!input.active) {
+      test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    }
+    AppendStoreVgpr(&test.code, 0, 2);
+    AppendEnd(&test.code);
+    test.initial = {input.input, 0xdeadbeefu, 0u, 0xcafef00du};
+    test.expected = {input.input, 0xdeadbeefu, input.expected, 0xcafef00du};
+    test.user_data = MakeStructuredStorageBufferData(4, 4, false, BufferFormat(input.format));
+    test.user_data[3] = (test.user_data[3] & ~7u) | input.selector;
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_X,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
+std::vector<TestCase> BufferStoreFormatD16XCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct StoreCase {
+    const char *name;
+    F format;
+    u32 input;
+    u32 expected;
+  };
+  constexpr StoreCase inputs[] = {
+      {"BufferStoreFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xffffc000u},
+      {"BufferStoreFormatD16XFloat32", F::k32Float, 0x7e633800u, 0x3f000000u},
+      {"BufferStoreFormatD16XUint32", F::k32UInt, 0x7e63fffeu, 0x0000fffeu},
+      {"BufferStoreFormatD16XSint32", F::k32SInt, 0x7e63fffeu, 0xfffffffeu},
+      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, 0x7e633800u, 0xffffff80u},
+      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, 0x7e63b800u, 0xffffc000u},
+      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, 0x7e633800u, 0x00003800u},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 66, input.input);
+    AppendVMovU32(&test.code, 65, 1);
+    // Match the captured CS824586f35db5c80d instruction at pc 0x484.
+    test.code.push_back(EncodeMubuf0(0x84u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(66, 0, 65));
+    AppendEnd(&test.code);
+    test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+    test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
+    test.user_data = MakeStructuredStorageBufferData(4, 3, false, BufferFormat(input.format));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
 }
 
 std::vector<TestCase> FormattedStoreConversionCases() {
@@ -35357,6 +35518,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
+  AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -35547,6 +35709,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
+  for (auto &test : BufferLoadFormatD16XCases()) {
+    cases.push_back(std::move(test));
+  }
+  for (auto &test : BufferStoreFormatD16XCases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : FormattedStoreConversionCases()) {
     cases.push_back(std::move(test));
   }
@@ -40809,6 +40977,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    for (const auto &test : BufferLoadFormatD16XCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferStoreFormatD16XCases()) {
+      RunCase(&vulkan, test);
+    }
     for (const auto &test : FormattedStoreConversionCases()) {
       RunCase(&vulkan, test);
     }
@@ -41289,6 +41463,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
     RunCase(&vulkan, Vop3Med3I16Captured());
     return 0;
   }
