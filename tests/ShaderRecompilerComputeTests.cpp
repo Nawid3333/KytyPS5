@@ -1353,6 +1353,7 @@ struct GraphicsCase {
   std::vector<u32> push_constants;
   std::vector<u32> pixel_interpolator_settings;
   bool pixel_no_perspective = false;
+  bool provoking_vtx_last = false;
   std::vector<u32> vertices;
   bool pixel_ancillary = false;
   bool pixel_front_face = false;
@@ -1449,6 +1450,20 @@ void CheckPixelParameterAliases() {
   pixel.interpolator_settings[1] = 0u;
   pixel.interpolator_settings[2] = 1u;
   const std::array<uint32_t, 3> active = {0, 1, 2};
+  Require(name, "ordinary mixed aliases",
+          ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 1) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 2) == 1u,
+          "flat/smooth aliases must retain the real vertex export location");
+  std::vector<uint32_t> ordinary_key, rectangle_key, provoking_key;
+  BuildStageStaticKey(pixel, ordinary_key);
+  pixel.parameter_mode = ShaderPixelParameterMode::LastVertex;
+  BuildStageStaticKey(pixel, provoking_key);
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  BuildStageStaticKey(pixel, rectangle_key);
+  Require(name, "interpolation specialization",
+          ordinary_key != rectangle_key && ordinary_key != provoking_key,
+          "rectangle and provoking-vertex modes must participate in the shader key");
   Require(name, "reserved physical locations",
           ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
               ShaderPixelParameterLocation(pixel, active, 1) == 2u &&
@@ -1473,6 +1488,7 @@ void CheckRectListShaders() {
   vertex.stage.program = &vertex_program;
   vertex.stage.resources = &empty_snapshot;
   ShaderPixelInputInfo pixel{};
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
@@ -1774,6 +1790,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ? 1u
           : static_cast<u32>(test.pixel_interpolator_settings.size());
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
+  pixel_info.parameter_mode = test.provoking_vtx_last ? ShaderPixelParameterMode::LastVertex
+                                                    : ShaderPixelParameterMode::FirstVertex;
   pixel_info.ps_ancillary = test.pixel_ancillary;
   pixel_info.ps_front_face = test.pixel_front_face;
   pixel_info.ps_pos_w = test.pixel_position_w;
@@ -16928,6 +16946,12 @@ public:
     raster.frontFace = vk::FrontFace::eCounterClockwise;
     raster.lineWidth = 1.0f;
 
+    vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex{};
+    if (test.provoking_vtx_last) {
+      provoking_vertex.provokingVertexMode = vk::ProvokingVertexModeEXT::eLastVertex;
+      raster.pNext = &provoking_vertex;
+    }
+
     vk::PipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
     multisample.rasterizationSamples = test.samples;
@@ -22115,6 +22139,75 @@ TestCase Vop1SdwaNotPartialSourcesAndDestinations() {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_NOT_B32", 3u}};
   test.required_spirv = {"OpBitFieldUExtract", "OpNot"};
+  return test;
+}
+
+TestCase Vop2SdwaBitwiseByteDestinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  // Low result bytes of AND, OR, XOR, XNOR for the two runtime inputs.
+  constexpr std::array<u32, 4> result_bytes{0xa4u, 0xbeu, 0x1au, 0xe5u};
+  constexpr std::array<u32, 4> alias_expected{
+      0xc350e5a6u, 0xc3fce5a6u, 0xc3ace5a6u, 0xc353e5a6u};
+  constexpr u32 sentinel = 0xa1b2c3d4u;
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaBitwiseByteDestinationsWave64"
+                             : "Vop2SdwaBitwiseByteDestinationsWave32";
+  test.initial = {0xc3d4e5a6u, 0x9b785abcu};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 reg, u32 expected) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 op = 0; op < 4; ++op) {
+    AppendVMovU32(&code, 30, 0);
+    AppendBufferLoadDword(&code, 12, 30);
+    AppendVMovU32(&code, 30, 4);
+    AppendBufferLoadDword(&code, 13, 30);
+    for (u32 selector = 0; selector < 4; ++selector) {
+      for (u32 unused = 0; unused < 3; ++unused) {
+        AppendVMovLiteral(&code, 26, sentinel);
+        code.push_back(EncodeVop2(0x1b + op, 26, 249, 13));
+        code.push_back(EncodeVop2Sdwa(12, selector, unused));
+        // RDNA2 table 88: pad, sign extend above/zero below, or preserve.
+        const u32 shift = selector * 8u;
+        u32 expected = result_bytes[op] << shift;
+        if (unused == 1 && (result_bytes[op] & 0x80u) != 0) {
+          expected = (0xffffff00u | result_bytes[op]) << shift;
+        } else if (unused == 2) {
+          expected |= sentinel & ~(0xffu << shift);
+        }
+        store(26, expected);
+      }
+    }
+    // Read source byte2 and word1 before overwriting source0's byte2.
+    code.push_back(EncodeVop2(0x1b + op, 12, 249, 13));
+    code.push_back(EncodeVop2Sdwa(12, 2, 2, 2, 5));
+    store(12, alias_expected[op]);
+    // Source1 may also alias the destination.
+    AppendVMovU32(&code, 30, 0);
+    AppendBufferLoadDword(&code, 12, 30);
+    code.push_back(EncodeVop2(0x1b + op, 13, 249, 13));
+    code.push_back(EncodeVop2Sdwa(12, 1, 2));
+    store(13, 0x9b7800bcu | (result_bytes[op] << 8u));
+    for (u32 unused = 0; unused < 3; ++unused) {
+      AppendVMovLiteral(&code, 26, sentinel);
+      code.push_back(EncodeSMovB32(126, InlineU32(0)));
+      code.push_back(EncodeVop2(0x1b + op, 26, 249, 13));
+      code.push_back(EncodeVop2Sdwa(12, 2, unused));
+      code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      store(26, sentinel);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_AND_B32, O::V_OR_B32, O::V_XOR_B32, O::V_XNOR_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot",
+                         "OpBitFieldInsert", "OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -35871,6 +35964,38 @@ GraphicsCase GraphicsSmoothRawInputAlias() {
   return test;
 }
 
+GraphicsCase GraphicsSmoothFlatInputAlias(bool flat_first, bool provoking_last = false) {
+  auto test = GraphicsSmoothRawInputAlias();
+  test.name = provoking_last
+                  ? (flat_first ? "GraphicsFlatSmoothAliasLast" : "GraphicsSmoothFlatAliasLast")
+                  : (flat_first ? "GraphicsFlatSmoothInputAlias" : "GraphicsSmoothFlatInputAlias");
+  test.pixel_custom_interpolation_mask = 0;
+  test.provoking_vtx_last = provoking_last;
+  test.pixel_interpolator_settings = flat_first ? std::vector<u32>{0x400u, 0u}
+                                                : std::vector<u32>{0u, 0x400u};
+  const u32 smooth = flat_first ? 1u : 0u;
+  const u32 flat = smooth ^ 1u;
+  // One export carries smooth values (2,4,8) and packed light IDs (5,7,11).
+  // Flat P0 preserves the ID bits; flat P1/P2 uses the same provoking vertex.
+  test.vertices[4] = 0x3f800005u;
+  test.vertices[10] = 0x3f800007u;
+  test.vertices[16] = 0x3f80000bu;
+  test.fragment_code = {EncodeVintrp(0x00, 0, smooth, 1, 0),
+                        EncodeVintrp(0x01, 0, smooth, 1, 1),
+                        EncodeVintrp(0x02, 1, flat, 2, 2),
+                        EncodeVop2(0x1b, 1, InlineU32(63), 1),
+                        EncodeVop1(0x06, 1, Vgpr(1)),
+                        EncodeVintrp(0x00, 2, flat, 1, 0),
+                        EncodeVintrp(0x01, 2, flat, 1, 1),
+                        EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 0)};
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = {0x40700000u, provoking_last ? 0x41300000u : 0x40a00000u,
+                         provoking_last ? 0x41000000u : 0x40000000u, 0x40700000u};
+  test.opcodes.insert(test.opcodes.end(),
+                      {ShaderOpcode::V_AND_B32, ShaderOpcode::V_CVT_F32_U32});
+  return test;
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -36278,6 +36403,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
+  cases.push_back(Vop2SdwaBitwiseByteDestinations(32));
+  cases.push_back(Vop2SdwaBitwiseByteDestinations(64));
   AddCase(Vop1SdwaMovByteDestinations);
   cases.push_back(Vop1SdwaMovByteSources(32));
   cases.push_back(Vop1SdwaMovByteSources(64));
@@ -36714,6 +36841,10 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsPackedHalfInputAlias(false),
       GraphicsPackedHalfInputAlias(true),
       GraphicsSmoothRawInputAlias(),
+      GraphicsSmoothFlatInputAlias(false),
+      GraphicsSmoothFlatInputAlias(true),
+      GraphicsSmoothFlatInputAlias(false, true),
+      GraphicsSmoothFlatInputAlias(true, true),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -42196,6 +42327,11 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(false));
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(true));
     RunGraphicsCase(&vulkan, GraphicsSmoothRawInputAlias());
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(false));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(false, true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(true, true));
+    RunGraphicsCase(&vulkan, GraphicsFlatInterpolatorExport());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
@@ -42348,6 +42484,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarZeroShiftWithRuntimeCount());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-bitwise-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(32));
+    RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(64));
+    RunCase(&vulkan, Vop1SdwaNotPartialSourcesAndDestinations());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
