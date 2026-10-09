@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -19134,6 +19135,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_LOAD_SBYTE:
   case Opcode::BUFFER_LOAD_USHORT:
   case Opcode::BUFFER_LOAD_SSHORT:
+  case Opcode::BUFFER_LOAD_SHORT_D16:
+  case Opcode::BUFFER_LOAD_SHORT_D16_HI:
   case Opcode::BUFFER_LOAD_DWORDX2:
   case Opcode::BUFFER_LOAD_DWORDX3:
   case Opcode::BUFFER_LOAD_DWORDX4:
@@ -28650,6 +28653,53 @@ TestCase BufferLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase BufferLoadShortD16Captured(bool high) {
+  TestCase test;
+  test.name = high ? "BufferLoadShortD16HiCaptured" : "BufferLoadShortD16Captured";
+  auto& code = test.code;
+  const u32 data_reg = high ? 20u : 1u, index_reg = high ? 21u : 15u;
+  const std::array<u32, 2> load = high ? std::array{0xe0942006u, 0x80021415u}
+                                      : std::array{0xe090200eu, 0x8000010fu};
+  AppendVMovU32(&code, index_reg, 1);
+  AppendVMovLiteral(&code, data_reg, 0xabcd1234u);
+  // Load both halves of v20 through s8:s11.
+  if (high) code.insert(code.end(), {0xe090200eu, 0x80021415u});
+  code.insert(code.end(), load.begin(), load.end());
+  AppendStoreVgpr(&code, data_reg, 0);
+  AppendVMovLiteral(&code, data_reg, 0xdeaf4321u);
+  code.push_back(EncodeSop1(0x04, 32, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), load.begin(), load.end());
+  code.push_back(EncodeSop1(0x04, 126, 32));
+  AppendStoreVgpr(&code, data_reg, 1);
+  AppendVMovU32(&code, index_reg, 2);
+  AppendVMovLiteral(&code, data_reg, 0xbeef5678u);
+  code.insert(code.end(), load.begin(), load.end());
+  AppendStoreVgpr(&code, data_reg, 2);
+  AppendEnd(&code);
+  const u32 stride = high ? 16u : 32u;
+  test.initial.assign(high ? 12u : 20u, 0xa5a5a5a5u);
+  test.initial[high ? 5u : 11u] = 0x8001cafeu;
+  if (high) test.initial[7] = 0xcafefaceu;
+  test.expected = test.initial;
+  test.expected[0] = high ? 0x8001cafeu : 0xabcd8001u;
+  test.expected[1] = 0xdeaf4321u;
+  test.expected[2] = high ? 0x00005678u : 0xbeef0000u;
+  test.user_data = MakeStructuredStorageBufferData(stride, 2);
+  if (high) std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 8);
+  test.user_data[50] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = stride * 2u;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+      ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_STORE_DWORD,
+      ShaderOpcode::S_ENDPGM};
+  if (high) test.opcodes.push_back(ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI);
+  test.decoded_counts = {{high ? "BUFFER_LOAD_SHORT_D16_HI v20.sdwa(sel=5,sext=0)"
+                               : "BUFFER_LOAD_SHORT_D16 v1.sdwa(sel=4,sext=0)", 3}};
+  return test;
+}
+
 TestCase BufferSubwordLoadsAtHostOffset(u32 bytes, u32 component, bool sign) {
   using O = ShaderOpcode;
   TestCase test;
@@ -30743,6 +30793,42 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase FlatStoreSlcCaptured() {
+  TestCase test;
+  test.name = "FlatStoreSlcCaptured";
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x0b, 26, InlineU32(1))); // s26 = 0x80000000.
+  AppendVMovLiteral(&code, 12, 0x000c0008u); // Packed halfwords 8 and 12 select byte offset 8.
+  code.insert(code.end(), {0x260c18f9u, 0x0504060cu, // Unsigned minimum of the two halfwords.
+      0xd5590007u, 0x0431fe1au, 0x70000000u});
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  // Exercise an SLC store through v[6:7].
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  code.push_back(EncodeSop1(0x04, 126, 193)); // Restore EXEC before readback.
+  code.insert(code.end(), {0xd5590007u, 0x0431fe1au, 0x70000000u,
+      EncodeFlat0(0x0c, 0), EncodeFlat1(4, 0x7d, 0, 6)});
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(65, 0xa5a5a5a5u);
+  test.expected.assign(64, 0x12345678u);
+  test.expected.push_back(0xa5a5a5a5u);
+  test.opcodes = {ShaderOpcode::S_BREV_B32, ShaderOpcode::V_MIN_U32,
+      ShaderOpcode::V_MED3_U32, ShaderOpcode::V_MOV_B32, ShaderOpcode::FLAT_STORE_DWORD,
+      ShaderOpcode::S_MOV_B64, ShaderOpcode::FLAT_LOAD_DWORD,
+      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.compute_info.scratch_size_dwords = 4;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.decoded_counts = {{"slc=1", 2}};
+  test.forbidden_spirv = {"get_bda_pointer"};
   return test;
 }
 
@@ -36619,6 +36705,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
+  for (const bool high : {false, true}) cases.push_back(BufferLoadShortD16Captured(high));
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
@@ -36708,6 +36795,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(TBufferStoreVariants);
   cases.push_back(FlatLoadDlcCaptured(32));
   cases.push_back(FlatLoadDlcCaptured(64));
+  AddCase(FlatStoreSlcCaptured);
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   cases.push_back(GlobalLoadShortD16Captured(32));
@@ -41691,6 +41779,43 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
         static_cast<uint32_t>(address(target.data())),
         static_cast<uint32_t>(address(target.data()) >> 32u), control};
   };
+  // A one-word NOP must leave the following completion write reachable.
+  std::array<uint32_t, 7> nop_commands{};
+  CommandBufferLayout nop_dcb{nop_commands.data(), nop_commands.data() + nop_commands.size(),
+      nop_commands.data(), nop_commands.data() + nop_commands.size(), nullptr, nullptr, 0};
+  auto* nop_cb = reinterpret_cast<Gen5::CommandBuffer*>(&nop_dcb);
+  Require(name, "zero-sized NOP", Gen5::AgcCbNop(nop_cb, 0) == nullptr &&
+              nop_dcb.cursor_up == nop_commands.data() && nop_commands[0] == 0,
+          "zero-sized reservation changed the command buffer");
+  Require(name, "empty command list NOP", Gen5::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
+              nop_dcb.cursor_up == nop_commands.data() + 1 && nop_commands[0] == 0xffff1000u &&
+              Gen5::AgcCbNopGetSize(1) == 4 && Gen5::AgcGetPacketSize(nop_commands.data()) == 1,
+          "native NOP(1) did not reserve one DWORD");
+  const auto completion = write(&selected, 7);
+  std::copy(completion.begin(), completion.end(), nop_commands.begin() + 1);
+  nop_commands.back() = 0xffff1000u;
+  for (uint32_t predication : {1u, 0u}) {
+    Gen5::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
+    Require(name, "NOP range predication", nop_commands[0] == (0xffff1000u | predication) &&
+                nop_commands.back() == (0xffff1000u | predication) &&
+                nop_commands[1] == (completion[0] | predication) && nop_commands[5] == 7,
+            "range predication skipped a packet or modified a payload");
+    Pm4Execution execution;
+    selected = 0;
+    Require(name, "NOP and completion execution",
+            processor.Process(execution, nop_commands) == Pm4ProcessResult::Complete && selected == 7,
+            "one-DWORD NOP prevented the completion write or overread the stream end");
+  }
+  Common::File dump;
+  Require(name, "NOP dump file", dump.CreateInMem(), "could not create PM4 dump");
+  Pm4::DumpPm4PacketStream(&dump, nop_commands.data(), 0, nop_commands.size());
+  std::array<uint32_t, 3> payload{0, 0x12345678u, 0x9abcdef0u};
+  CommandBufferLayout payload_dcb{payload.data(), payload.data() + payload.size(),
+      payload.data(), payload.data() + payload.size(), nullptr, nullptr, 0};
+  Require(name, "NOP payload reservation",
+          Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
+              payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
+          "NOP emitter overwrote the caller's reserved payload");
   const auto then_commands = write(&selected, 11);
   const auto else_commands = write(&selected, 33);
   const auto branch_suffix = write(&selected, 44);
@@ -41730,6 +41855,56 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
               "taken branch resumed its discarded suffix or lost the caller's return");
     }
   }
+
+  std::array<uint32_t, 5> cx_packet{};
+  CommandBufferLayout cx_dcb{cx_packet.data(), cx_packet.data() + cx_packet.size(),
+                            cx_packet.data(), cx_packet.data() + cx_packet.size(),
+                            nullptr, nullptr, 0};
+  const ShaderRegister cx_register{Pm4::CB_TARGET_MASK, 0x76543210u};
+  Require(name, "indirect context packet size",
+          Gen5::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
+              Gen5::AgcDcbSetCxRegistersIndirect(
+                  reinterpret_cast<Gen5::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
+                  cx_packet.data() && cx_dcb.cursor_up == cx_dcb.top,
+          "indirect Cx size did not match the emitted command buffer");
+
+  std::array<uint32_t, 14> patched_branch{};
+  CommandBufferLayout branch_dcb{
+      patched_branch.data(), patched_branch.data() + patched_branch.size(),
+      patched_branch.data(), patched_branch.data() + patched_branch.size(),
+      nullptr, nullptr, 0};
+  Require(name, "branch packet size",
+          Gen5::AgcCbBranchGetSize() == sizeof(patched_branch) &&
+              Gen5::AgcCbBranch(reinterpret_cast<Gen5::CommandBuffer *>(&branch_dcb),
+                                1, 0, &condition, 0, 0, 0, nullptr, 0,
+                                3, else_commands.data(), else_commands.size()) ==
+                  patched_branch.data() && branch_dcb.cursor_up == branch_dcb.top,
+          "branch size did not match the emitted command buffer");
+  patched_branch[8] = 3;
+  patched_branch[10] = 0xc5a00000u;
+  const auto unpatched = patched_branch;
+  Require(name, "patched indirect context branch",
+          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
+                                            cx_packet.data(), cx_packet.size()) == 0 &&
+              (patched_branch[8] & 3u) == 3u &&
+              patched_branch[10] == 0xe5a00005u &&
+              std::equal(patched_branch.begin(), patched_branch.begin() + 8,
+                         unpatched.begin()) &&
+              std::equal(patched_branch.begin() + 11, patched_branch.end(),
+                         unpatched.begin() + 11),
+          "branch target patch lost reserved fields or changed the condition/else target");
+  Pm4Execution patched_execution;
+  Require(name, "patched branch execution",
+          processor.Process(patched_execution, patched_branch) == Pm4ProcessResult::Complete &&
+              processor.GetCtx().GetRenderTargetMask() == cx_register.value,
+          "patched branch did not fetch and apply its indirect context registers");
+  patched_branch[0] = KYTY_PM4(14, Pm4::IT_NOP, 0);
+  const auto mismatched = patched_branch;
+  Require(name, "branch packet mismatch",
+          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
+                                            then_commands.data(), then_commands.size()) ==
+                  static_cast<int>(0x8a6c000cu) && patched_branch == mismatched,
+          "branch patch accepted or changed a different packet type");
 
   // This stream exceeds native recursion capacity, while chains need one fetcher cursor.
   std::vector<std::array<uint32_t, 4>> links(65536);
@@ -42249,6 +42424,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
     VulkanHarness vulkan;
+    for (const bool high : {false, true}) RunCase(&vulkan, BufferLoadShortD16Captured(high));
+    RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
