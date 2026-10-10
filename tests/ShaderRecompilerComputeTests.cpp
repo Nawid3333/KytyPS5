@@ -20860,6 +20860,66 @@ TestCase ScalarBrevB32PreservesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarZeroBitOps() {
+  using O = ShaderOpcode;
+  constexpr uint64_t inputs[] = {0, UINT64_MAX, 0xaaaaaaaa55555555ull,
+      0xffffffff7fffffffull, 0xfffffffeffffffffull, 0x7fffffffffffffffull,
+      0x00000000ffffffffull, 0xffffffff00000000ull};
+  TestCase test;
+  test.name = "ScalarZeroBitOps";
+  for (const auto input : inputs)
+    test.initial.insert(test.initial.end(), {u32(input), u32(input >> 32)});
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto check = [&](u32 opcode, u32 source, uint64_t input, bool scc) {
+    const u32 width = opcode == 0x0e || opcode == 0x12 ? 64 : 32;
+    u32 count = 0, first = UINT32_MAX;
+    for (u32 bit = 0; bit < width; ++bit) {
+      if (((input >> bit) & 1u) == 0) {
+        ++count;
+        if (first == UINT32_MAX) first = bit;
+      }
+    }
+    const bool counting = opcode == 0x0d || opcode == 0x0e;
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(scc)));
+    code.push_back(EncodeSop1(opcode, 20, source));
+    if (source == 255) code.push_back(u32(input));
+    code.push_back(EncodeSMovB32(22, 253)); // Capture SCC before readback.
+    AppendStoreSgpr(&code, 20, u32(test.expected.size()));
+    AppendStoreSgpr(&code, 21, u32(test.expected.size() + 1));
+    AppendStoreSgpr(&code, 22, u32(test.expected.size() + 2));
+    test.expected.insert(test.expected.end(),
+        {counting ? count : first, u32(input >> 32), u32(counting ? count != 0 : scc)});
+  };
+  for (u32 index = 0; index < std::size(inputs); ++index) {
+    for (u32 word = 0; word < 2; ++word) {
+      AppendVMovU32(&code, 30, (index * 2 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8 + word, Vgpr(1)));
+    }
+    for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+      for (const bool scc : {false, true}) {
+        code.push_back(EncodeSop1(0x04, 20, 8)); // Destination aliases the source.
+        check(opcode, 20, inputs[index], scc);
+      }
+    }
+  }
+  for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+    for (const u32 source : {128u, 193u, 255u}) {
+      const uint64_t input = source == 128 ? 0 : source == 193 ? UINT64_MAX : 0xffffffffull;
+      AppendSMovLiteral(&code, 21, u32(input >> 32));
+      check(opcode, source, input, true); // Only inline -1 sign extends to B64.
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_BCNT0_I32_B32, O::S_BCNT0_I32_B64,
+      O::S_FF0_I32_B32, O::S_FF0_I32_B64, O::S_CMP_EQ_U32, O::S_MOV_B32,
+      O::S_MOV_B64, O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
@@ -24786,11 +24846,12 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
-TestCase VectorDpp8Captured(bool masked_exec) {
+TestCase VectorDpp8Captured(bool masked_exec, u32 wave_size = 64, bool fi = false) {
   using O = ShaderOpcode;
   constexpr u32 sentinel = 0xaaaaaaaau;
-  const u32 masks[] = {masked_exec ? 0x0f0f0f0fu : 0xffffffffu,
-                      masked_exec ? 0xf0f0f0f0u : 0xffffffffu};
+  // Both wave halves contain active and inactive lane-3 sources for the ADD.
+  const u32 masks[] = {masked_exec ? 0x0f0ff0f0u : 0xffffffffu,
+                      masked_exec ? 0xf0f00f0fu : 0xffffffffu};
   std::vector<u32> code;
   AppendVMovU32(&code, 5, 100);
   code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
@@ -24799,20 +24860,21 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendVMovLiteral(&code, 3, sentinel);
   AppendVMovLiteral(&code, 8, sentinel);
   AppendSMovLiteral(&code, 126, masks[0]);
-  AppendSMovLiteral(&code, 127, masks[1]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
   // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
-  code.push_back(EncodeVop1(0x01, 2, 233));
+  const u32 encoding = fi ? 234u : 233u;
+  code.push_back(EncodeVop1(0x01, 2, encoding));
   code.push_back(0xfacfac05u);
-  code.push_back(EncodeVop1(0x01, 3, 233));
+  code.push_back(EncodeVop1(0x01, 3, encoding));
   code.push_back(0x68868805u);
   // CS 6babb2a8915d35c4, pc 0xcc: add lane 3 of each group to its own v7.
-  code.push_back(0x4a100ee9u);
+  code.push_back(EncodeVop2(0x25, 8, encoding, 7));
   code.push_back(0x6db6db07u);
   AppendSMovLiteral(&code, 126, 0xffffffffu);
-  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 2, 6);
-  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  AppendVMovU32(&code, 7, wave_size * sizeof(u32));
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
   AppendBufferStoreDword(&code, 3, 6);
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
@@ -24820,11 +24882,13 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
-                          : "VectorDpp8Captured";
+  const char *names[2][2] = {
+      {"VectorDpp8Wave32MaskedExec", "VectorDpp8Wave64MaskedExec"},
+      {"VectorDpp8FiWave32MaskedExec", "VectorDpp8FiWave64MaskedExec"}};
+  test.name = masked_exec ? names[fi][wave_size == 64] : "VectorDpp8Captured";
   test.code = std::move(code);
-  test.expected.resize(192, sentinel);
-  for (u32 lane = 0; lane < 64; ++lane) {
+  test.expected.resize(3 * wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
     const auto mask = masks[lane / 32u];
     if ((mask & (1u << (lane % 32u))) == 0) {
       continue;
@@ -24833,20 +24897,20 @@ TestCase VectorDpp8Captured(bool masked_exec) {
                            (lane & ~7u) | (lane & 3u)};
     for (u32 permutation = 0; permutation < 2; ++permutation) {
       const auto source = sources[permutation];
-      test.expected[permutation * 64u + lane] =
-          (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
+      test.expected[permutation * wave_size + lane] =
+          fi || (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
     }
     const u32 source = (lane & ~7u) | 3u;
-    test.expected[128u + lane] = 100u + lane;
-    if ((mask & (1u << (source % 32u))) != 0) {
-      test.expected[128u + lane] += 100u + source;
+    test.expected[2 * wave_size + lane] = 100u + lane;
+    if (fi || (mask & (1u << (source % 32u))) != 0) {
+      test.expected[2 * wave_size + lane] += 100u + source;
     }
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{".dpp8(", 3}};
-  test.compute_info.wave_size = 64;
-  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -24899,6 +24963,56 @@ TestCase VectorDppRowXmask() {
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppRowShare(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorDppRowShareWave32" : "VectorDppRowShareWave64";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1)); // v1 = 100 + lane.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  for (u32 selector = 0; selector < 16; ++selector) {
+    for (const bool masked : {false, true}) {
+      const u32 row_mask = masked ? 0xau : 0xfu;
+      const u32 bank_mask = masked ? 0x5u : 0xfu;
+      // Keep the selected source active in every row while masking destination
+      // lanes. Row and bank masks affect destinations, not the shared source.
+      const u32 source_lanes = 0x00010001u << selector;
+      const u32 exec[] = {masked ? 0xaaaaaaaau | source_lanes : 0xffffffffu,
+                          masked ? 0x55555555u | source_lanes : 0xffffffffu};
+      AppendVMovLiteral(&code, 2, sentinel);
+      AppendVMovLiteral(&code, 3, sentinel);
+      AppendSMovLiteral(&code, 126, exec[0]);
+      if (wave_size == 64) AppendSMovLiteral(&code, 127, exec[1]);
+      code.push_back(EncodeVop1(0x01, 2, 250));
+      code.push_back(EncodeVop1Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeVop2(0x25, 3, 250, 0));
+      code.push_back(EncodeVop2Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeSop1(0x04, 126, 10));
+      for (const u32 reg : {2u, 3u}) {
+        AppendStoreVgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
+        for (u32 lane = 0; lane < wave_size; ++lane) {
+          const bool write = ((row_mask >> (lane / 16)) & 1u) &&
+              ((bank_mask >> ((lane / 4) % 4)) & 1u) &&
+              ((exec[lane / 32] >> (lane % 32)) & 1u);
+          const u32 source = (lane / 16) * 16 + selector;
+          test.expected.push_back(write ? 100 + source + (reg == 3 ? lane : 0) : sentinel);
+        }
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
@@ -37007,6 +37121,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarZeroBitOps);
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
@@ -37121,9 +37236,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));
-  cases.push_back(VectorDpp8Captured(true));
+  for (const u32 wave_size : {32u, 64u})
+    for (const bool fi : {false, true})
+      cases.push_back(VectorDpp8Captured(true, wave_size, fi));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
+  cases.push_back(VectorDppRowShare(32));
+  cases.push_back(VectorDppRowShare(64));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -42800,9 +42919,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorDpp8Captured(false));
-    RunCase(&vulkan, VectorDpp8Captured(true));
+    for (const u32 wave_size : {32u, 64u})
+      for (const bool fi : {false, true})
+        RunCase(&vulkan, VectorDpp8Captured(true, wave_size, fi));
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppRowShare(32));
+    RunCase(&vulkan, VectorDppRowShare(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     return 0;
@@ -42828,6 +42951,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareI16U16Ops());
     RunCase(&vulkan, Vop3Int16Ops());
     RunCase(&vulkan, Vop3pInt16Ops());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-bit-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarZeroBitOps());
+    RunCase(&vulkan, ScalarBitfieldPack());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {
