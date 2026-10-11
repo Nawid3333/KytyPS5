@@ -63,6 +63,7 @@ static void PrintUsage() {
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -219,6 +220,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--no-splash") {
+			options.config.splash_enabled = false;
+			continue;
+		}
+
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
 			continue;
@@ -294,6 +300,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
+			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
