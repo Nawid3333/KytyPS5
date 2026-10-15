@@ -72,6 +72,10 @@ bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }
 
+bool HdrEnabled() {
+	return g_config->hdr_enabled;
+}
+
 bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
@@ -94,6 +98,10 @@ uint32_t GetConsoleLanguage() {
 
 bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
+}
+
+bool IsNetworkConnected() {
+	return g_config->network_connected;
 }
 
 bool ShaderValidationEnabled() {
@@ -152,12 +160,24 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool SyncRawImageBuffersEnabled() {
+	return g_config->sync_raw_image_buffers;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool TrophyEnabled() {
+	return g_config->trophy_enabled;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
+}
+
+bool SkipNoticeScreen() {
+	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -168,6 +188,10 @@ bool RedZoneProtectionEnabled() {
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;
+}
+
+const std::vector<std::string>& GetGuestArguments() {
+	return g_config->guest_arguments;
 }
 
 } // namespace Config

@@ -19,6 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <span>
 #include <vector>
@@ -180,10 +181,12 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
-	for (const auto& binding: program.bindings.descriptors) {
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto index = std::countr_zero(mask);
+		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
+		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
@@ -471,14 +474,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -497,6 +492,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}

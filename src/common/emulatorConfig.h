@@ -53,9 +53,12 @@ struct ConfigOptions {
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   network_connected           = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -73,12 +76,17 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
+	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
+	std::vector<std::string> guest_arguments {""};
 };
 
 void Load(const ConfigOptions& cfg);
@@ -94,9 +102,11 @@ uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
+bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
+bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
@@ -122,13 +132,17 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
+bool TrophyEnabled();
 bool PlayGoHackEnabled();
+bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
 
 const Keymap& GetKeymap();
+const std::vector<std::string>& GetGuestArguments();
 
 } // namespace Config
 

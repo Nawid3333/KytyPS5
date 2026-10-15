@@ -312,9 +312,9 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                                     const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState& dynamic_state,
+                                       const ShaderVertexInputInfo& vs_input_info,
+                                       const RenderDepthInfo& depth, const RenderState& rendering) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
@@ -358,8 +358,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	dynamic_state.SetViewports(std::span {viewports}.first(viewport_count));
+	dynamic_state.SetScissors(std::span {scissors}.first(viewport_count));
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -372,20 +372,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	dynamic_state.SetLineWidth(line_width);
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	dynamic_state.SetBlendConstants(blend_constants);
+	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable);
+	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable);
+	dynamic_state.SetDepthCompareOp(depth.depth_compare_op);
+#if !defined(__APPLE__)
+	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
+	if (depth.depth_bounds_test_enable) {
+		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
+	}
+#endif
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	dynamic_state.SetDepthBiasEnabled(depth_bias_enable);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -394,19 +400,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		dynamic_state.SetDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	dynamic_state.SetStencilTestEnabled(depth.stencil_test_enable);
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		const auto& front = depth.stencil_front;
+		const auto& back  = depth.stencil_back;
+		dynamic_state.SetStencilOps({front.failOp, front.passOp, front.depthFailOp, front.compareOp},
+		                            {back.failOp, back.passOp, back.depthFailOp, back.compareOp});
+		dynamic_state.SetStencilCompareMasks(front.compareMask, back.compareMask);
+		dynamic_state.SetStencilWriteMasks(front.writeMask, back.writeMask);
+		dynamic_state.SetStencilReferences(front.reference, back.reference);
 	}
 
 #if defined(__APPLE__)
@@ -417,9 +422,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
-	if (rendering.num_color_attachments != 0) {
-		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
-	}
+	dynamic_state.SetColorWriteEnables(std::span {enable}.first(rendering.num_color_attachments));
 #endif
 }
 
@@ -583,8 +586,12 @@ static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
 	uint32_t    output_mask = 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (sh_regs.target_output_mode[slot] != 0 &&
+	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
+		const auto slot = ShaderPixelExportTarget(sh_regs.m_cbShaderMask, index);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+			break;
+		}
+		if (sh_regs.target_output_mode[index] != 0 &&
 		    render_target_mask_slot(write_mask, slot) != 0) {
 			output_mask |= 1u << slot;
 		}
@@ -601,16 +608,19 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                   uint32_t render_target_slice_offset) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
-	// These special modes run color-buffer metadata or decompression operations. The shader is a
-	// vehicle for that operation, and its exported color must not be applied as a normal draw.
-	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
-	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
-	// future CMask/FMask support can consume its state through the same TextureCache path.
-	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
-	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+		// FCE can precede any ordinary draw. Discover the target to materialize its native
+		// clear metadata before the expanded image is sampled.
+		RenderColorInfo target {};
+		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true);
+		return true;
+	}
+	// Metadata/decompression shaders must not export colors into the expanded image.
+	return mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
@@ -896,7 +906,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
-				mrt_mask |= 1u << output.index;
+				mrt_mask |= 1u << output.location;
 			}
 		}
 	}
@@ -1022,12 +1032,71 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                       const DrawEmitInfo& emit, DrawRenderState& state) {
+	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
+		return false;
+	}
+	auto& ucfg = buffer.GetUserConfig();
+	const auto& hw = buffer.GetRegisters();
+	auto& depth = state.depth_info;
+	auto& color = state.color_info[0];
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
+	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
+	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
+	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
+	                     state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	                     color.desc.info.samples != 1 ||
+	                     depth.desc.info.extent.width != color.Extent().width ||
+	                     depth.desc.info.extent.height != color.Extent().height ||
+	                     depth.desc.view_info.layer_count != 1 ||
+	                     color.desc.view_info.layer_count != 1 ||
+	                     hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
+	                     state.ps_input_info.ps_depth_export_enable ||
+	                     state.ps_input_info.ps_sample_mask_export_enable);
+	vk::ImageAspectFlags feedback;
+	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
+	if (depth.depth_load_clear_enable) {
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+	}
+	auto& cache = m_context.GetTextureCache();
+	auto& source = cache.GetImage(depth.image_id);
+	auto& destination = cache.GetImage(color.image_id);
+	EXIT_NOT_IMPLEMENTED((source.backing.format != vk::Format::eD32Sfloat &&
+	                      source.backing.format != vk::Format::eD32SfloatS8Uint) ||
+	                     destination.backing.format != vk::Format::eR32Sfloat);
+	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
+	                                    {rendering.width, rendering.height}, 0);
+	if (rect.right > rect.left && rect.bottom > rect.top) {
+		const vk::ImageCopy region {
+		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
+		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {vk::ImageAspectFlagBits::eColor, color.desc.view_info.base_level,
+		     color.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {static_cast<uint32_t>(rect.right - rect.left),
+		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
+		m_context.GetCommandScheduler().EndRendering();
+		const auto command = buffer.Handle();
+		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		               {}, command);
+		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+		                    vk::AccessFlagBits2::eTransferWrite, {}, command);
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                  1, &region);
+	}
+	return true;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
+	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		return;
+	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
@@ -1129,10 +1198,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
-	}
+	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+	                           rendering);
+	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
@@ -1190,7 +1260,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
@@ -1274,8 +1345,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 
 	DrawEmitInfo emit {};
-	emit.vertex_offset  = vertex_offset + args.base_vertex;
-	emit.first_instance = instance_offset;
+	// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
+	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
+	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
+	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1301,7 +1374,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
@@ -1363,8 +1437,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
-	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = instance_offset;
+	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
+	emit.first_vertex = native_indirect ? 0 :
+	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
+	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
