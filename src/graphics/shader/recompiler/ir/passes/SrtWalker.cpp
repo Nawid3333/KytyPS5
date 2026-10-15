@@ -16,6 +16,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// The walk also evaluates loads the shader may not execute, e.g. through a resource
+// table pointer that is still zero. Guest memory starts at 0x40000 on every host, so
+// ordinary reads below it return zeros instead of faulting, and aren't recorded.
+constexpr uint64_t GuestMemoryStart = 0x40000;
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -38,6 +43,9 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else if (address < GuestMemoryStart) {
+		std::ranges::fill(values, 0u);
+		return true;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
@@ -455,6 +463,9 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.push(code.rdi);
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
 		code.and_(code.rdi, code.r9);
+		// A table below guest memory (null) is left to the interpreter, which reads zeros.
+		code.cmp(code.rdi, GuestMemoryStart);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		const auto first = reads.begin()->first;
 		const auto last = reads.rbegin()->first;
 		if (first < 0) {
@@ -742,7 +753,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (address >= GuestMemoryStart)
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
 	return true;
@@ -1161,8 +1173,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		if (m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		                                          m_context.values.data(), m_context.generation,
+		                                          m_runtime.user_data.size()))
+			return true;
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
