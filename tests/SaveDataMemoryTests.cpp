@@ -577,6 +577,54 @@ void TestClassicSaveParams() {
 	CHECK(params[0].mtime == nested_mtime);
 }
 
+// Aliens: Fireteam Elite (#1020): builds before 569ec04d created save directories without
+// sce_sys metadata. A CREATE2 mount must give such a directory its metadata, or every per-field
+// SetParam fails with NOT_FOUND and the search never lists the save.
+void TestSaveWithoutMetadata() {
+	Reset("LEGACY");
+	const fs::path legacy = "_SaveData/LEGACY/slot";
+	CHECK(fs::create_directories(legacy));
+	std::ofstream(legacy / "USR-DATA") << "old progress";
+	CHECK(Search(1).empty());
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 32;
+	mount.blocks     = 48;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK && mounted.mount_status == 0);
+	const char title[] = "Title";
+	CHECK(SaveDataSetParam(&mounted.mount_point, 1, title, sizeof(title)) == OK);
+	SaveDataMountInfo info {};
+	CHECK(SaveDataGetMountInfo(&mounted.mount_point, &info) == OK && info.blocks == 48);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(Search(1) == std::vector<std::string> {"slot"});
+	std::string progress;
+	std::getline(std::ifstream(legacy / "USR-DATA"), progress);
+	CHECK(progress == "old progress");
+
+	// Builds from 8dc9b9d5 on already wrote blocks.bin; its allocation stays.
+	CHECK(fs::create_directories("_SaveData/LEGACY/partial/sce_sys"));
+	const uint64_t blocks = 96;
+	std::ofstream("_SaveData/LEGACY/partial/sce_sys/blocks.bin", std::ios::binary)
+	    .write(reinterpret_cast<const char*>(&blocks), sizeof(blocks));
+	const auto partial = DirName("partial");
+	mount.dir_name     = &partial;
+	CHECK(SaveDataMount3(&mount, &mounted) == OK && mounted.mount_status == 0);
+	CHECK(SaveDataGetMountInfo(&mounted.mount_point, &info) == OK && info.blocks == 96);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(Search(1) == std::vector<std::string>({"partial", "slot"}));
+
+	// A save that has param.bin but lost blocks.bin stays broken.
+	CHECK(fs::remove(legacy / "sce_sys/blocks.bin"));
+	mount.dir_name = &name;
+	CHECK(SaveDataMount3(&mount, &mounted) == OK && mounted.mount_status == 0);
+	CHECK(SaveDataGetMountInfo(&mounted.mount_point, &info) == SAVE_DATA_ERROR_BROKEN);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(!fs::exists(legacy / "sce_sys/blocks.bin"));
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -619,6 +667,7 @@ int main(int argc, char** argv) {
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
+	TestSaveWithoutMetadata();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

@@ -690,16 +690,17 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
+	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
+	if (open && !exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
+	if (create && exists) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
-	bool created = false;
-	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
+	// Directories from older builds can lack sce_sys metadata: write only the missing files.
+	if ((create || create2) && !Common::File::IsFileExisting(save_param_path(mount_dir))) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
@@ -709,23 +710,24 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		if (error) {
 			return SAVE_DATA_ERROR_INTERNAL;
 		}
-		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
-		                                   sizeof(mount->blocks));
+		const auto blocks_path = metadata / "blocks.bin";
+		int        status      = OK;
+		if (!Common::File::IsFileExisting(blocks_path)) {
+			status = write_save_file(blocks_path, &mount->blocks, sizeof(mount->blocks));
+		}
+		if (status == OK) {
+			const SaveDataParam initial {};
+			status = write_save_file(save_param_path(mount_dir), &initial, sizeof(initial));
+		}
 		if (status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			if (!exists) {
+				std::filesystem::remove_all(mount_dir, error);
+			}
 			return status;
 		}
-		const SaveDataParam initial {};
-		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
-		                                         sizeof(initial));
-		if (param_status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
-			return param_status;
-		}
-		created = true;
 	}
 
-	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
+	return mount_save_data(slot, mount_dir, exists ? 0u : 1u, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
