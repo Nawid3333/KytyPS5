@@ -598,6 +598,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	} else if (graphics.compute_subgroup_32_required && input_info.host_subgroup_size == 32u) {
+		comp_subgroup_size.requiredSubgroupSize = 32;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
