@@ -155,11 +155,59 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpBitwiseAnd, IR::Type::U8>(state, arg0, ConstantU32(state, 0xffu));
 }
 
+uint32_t EmitPackHalf2x16Rte(EmitterState& state, uint32_t pair, uint32_t halves) {
+	const auto packed = EmitPackHalf2x16(state, pair);
+	const auto value  = [&](uint32_t half_bits) {
+		const auto both =
+		    EmitExt(state, TypeF32Vector(state, 2), GLSLstd450UnpackHalf2x16, {half_bits});
+		return EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, both, 0u);
+	};
+	auto result = packed;
+	for (uint32_t i = 0; i < halves; i++) {
+		const auto input  = EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, i);
+		const auto target = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {input});
+		const auto native =
+		    EmitAndConstant(state,
+		                    i == 0 ? packed
+		                           : Binary(state, spv::OpShiftRightLogical, TypeU32(state), packed,
+		                                    ConstantU32(state, 16)),
+		                    0x7fffu);
+		const auto native_value = value(native);
+		const auto below =
+		    Binary(state, spv::OpFOrdLessThan, TypeBool(state), native_value, target);
+		const auto other    = Binary(state, spv::OpIAdd, TypeU32(state), native,
+		                             Select(state, TypeU32(state), below, ConstantU32(state, 1),
+		                                    ConstantU32(state, 0xffffffffu)));
+		const auto distance = [&](uint32_t f16_value) {
+			return EmitExt(state, TypeF32(state), GLSLstd450FAbs,
+			               {Binary(state, spv::OpFSub, TypeF32(state), target, f16_value)});
+		};
+		const auto native_distance = distance(native_value);
+		const auto other_distance  = distance(value(other));
+		const auto other_even =
+		    EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, other, 1u), 0);
+		const auto take_other = Binary(
+		    state, spv::OpLogicalOr, TypeBool(state),
+		    Binary(state, spv::OpFOrdLessThan, TypeBool(state), other_distance, native_distance),
+		    Binary(
+		        state, spv::OpLogicalAnd, TypeBool(state),
+		        Binary(state, spv::OpFOrdEqual, TypeBool(state), other_distance, native_distance),
+		        other_even));
+		const auto overflow = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), target,
+		                             ConstantF32(state, 0x477ff000u));
+		const auto rounded  = Select(state, TypeU32(state), overflow, ConstantU32(state, 0x7c00u),
+		                             Select(state, TypeU32(state), take_other, other, native));
+		result              = EmitBitFieldInsert(state, result, rounded, ConstantU32(state, 16 * i),
+		                                         ConstantU32(state, 15));
+	}
+	return result;
+}
+
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
 	const auto pair = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
 	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
+	return EmitPackHalf2x16Rte(state, pair, 1);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {

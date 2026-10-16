@@ -523,6 +523,8 @@ inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F3
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 
+uint32_t EmitPackHalf2x16Rte(EmitterState& state, uint32_t pair, uint32_t halves);
+
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 
 inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F32, uint32_t>;

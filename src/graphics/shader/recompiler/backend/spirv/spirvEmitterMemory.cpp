@@ -814,7 +814,7 @@ uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 			const auto pair = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
 			                          low, high);
-			packed[word] = EmitPackHalf2x16(state, pair);
+			packed[word] = EmitPackHalf2x16Rte(state, pair, 2);
 		}
 	}
 	return ConstructU32Composite(state, components, packed);
