@@ -1000,9 +1000,33 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
+				// LAB (KytyLab build 4, not for upstream): every candidate with its raw T# words, so a
+				// tester log shows whether the odd one out is a real texture or unrelated data.
+				std::string details = fmt::format(
+				    "\n  [lab] root={} candidates={} exemplar={} failing={} key_count={} search_iterations={} "
+				    "base_dim={} unfiltered_only={} storage_swizzle={}",
+				    root_index, resource_count, exemplar, candidate, key_count, root.indirect_search_iterations,
+				    static_cast<int>(base.dimension), base.unfiltered_access_only, storage_swizzle);
+				details += "\n  [lab] keys:";
+				for (size_t k = root.indirect_mapping_offset;
+				     k < snapshot.flattened_srt.size() && k < root.indirect_mapping_offset + 1u + 2u * 64u; k++) {
+					details += fmt::format(" {:x}", snapshot.flattened_srt[k]);
+				}
+				for (uint32_t other = 0; other < specialization.images.size(); other++) {
+					const auto& spec = specialization.images[other];
+					if (spec.indirect_root != root_index) continue;
+					const auto& value = snapshot.images[other];
+					details += fmt::format("\n  [lab] #{}{} dim={} cube={} mips={} conv={} swz={:#x} null={} T#=",
+					                       other, other == candidate ? "*" : "", static_cast<int>(spec.dimension),
+					                       spec.cube, spec.mip_count, static_cast<int>(spec.conversion_format),
+					                       spec.shader_swizzle, NullImageDescriptor(value));
+					for (uint32_t w = 0; w < value.dword_count && w < value.dwords.size(); w++) {
+						details += fmt::format("{}{:08x}", w == 0 ? "" : " ", value.dwords[w]);
+					}
+				}
 				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates{}",
+				                program.info.images[root_index].first_use_pc, details));
 			}
 		}
 	}
