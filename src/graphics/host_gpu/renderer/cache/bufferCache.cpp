@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -388,6 +389,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	LabProfile::QuietScope lab_readback(LabProfile::SyncReadback);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

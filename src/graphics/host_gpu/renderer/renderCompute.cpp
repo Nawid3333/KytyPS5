@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/labProfile.h" // LAB profile build
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -242,6 +243,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	LabProfile::Scope lab_dispatch(LabProfile::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -307,8 +309,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	LabProfile::Lap lab_lap;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	lab_lap.Mark(LabProfile::DispatchProgram);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -349,6 +353,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	lab_lap.Mark(LabProfile::DispatchPipeline);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -364,9 +369,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
+	lab_lap.Mark(LabProfile::DispatchBindings);
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	lab_lap.Mark(LabProfile::DispatchCommit);
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -445,6 +452,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	lab_lap.Mark(LabProfile::DispatchRecord);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetBufferCache().RecordPendingWrites(program.has_address_writes);
 
@@ -457,6 +465,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	LabProfile::Scope lab_dispatch(LabProfile::Dispatch);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -475,10 +484,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
+	LabProfile::Lap lab_lap;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	lab_lap.Mark(LabProfile::DispatchProgram);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	lab_lap.Mark(LabProfile::DispatchPipeline);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -494,8 +506,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	lab_lap.Mark(LabProfile::DispatchBindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	lab_lap.Mark(LabProfile::DispatchCommit);
 	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
@@ -516,6 +530,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	lab_lap.Mark(LabProfile::DispatchRecord);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetBufferCache().RecordPendingWrites(program.has_address_writes);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -396,6 +397,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	LabProfile::Scope lab_submit(LabProfile::Submit);
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);

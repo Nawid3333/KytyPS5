@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -895,6 +896,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	LabProfile::Scope lab_programs(LabProfile::DrawPrograms);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -903,6 +905,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	LabProfile::Scope lab_state(LabProfile::DrawPrepareState);
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1144,6 +1147,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	LabProfile::Lap lab_lap;
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1159,6 +1163,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	lab_lap.Mark(LabProfile::DrawBindings);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1166,6 +1171,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	lab_lap.Mark(LabProfile::DrawVertexIndex);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1173,10 +1179,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	lab_lap.Mark(LabProfile::DrawPipeline);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	lab_lap.Mark(LabProfile::DrawTargets);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1193,6 +1201,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
+	lab_lap.Mark(LabProfile::DrawCommit);
 	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
@@ -1257,6 +1266,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	lab_lap.Mark(LabProfile::DrawRecord);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -1266,6 +1276,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	LabProfile::Scope lab_draw(LabProfile::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1380,6 +1391,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	LabProfile::Scope lab_draw(LabProfile::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);

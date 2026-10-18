@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -301,6 +302,7 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		LabProfile::Scope lab_compile(LabProfile::ShaderCompile);
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -504,7 +505,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				LabProfile::Scope lab_command(LabProfile::GpuThreadCommand);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -515,7 +519,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		LabProfile::Lap lab_submission;
 		const bool complete = gpu->Process(submission);
+		lab_submission.Mark(LabProfile::GpuThreadSubmission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

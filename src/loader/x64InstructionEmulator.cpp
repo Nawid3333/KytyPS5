@@ -1,4 +1,5 @@
 #include "loader/x64InstructionEmulator.h"
+#include "common/labProfile.h" // LAB profile build
 
 #include "common/common.h"
 
@@ -800,6 +801,7 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 }
 
 bool TryEmulate(void* native_context) {
+	LabProfile::QuietScope lab_emulate(LabProfile::Emulate);
 	if (native_context == nullptr) {
 		return false;
 	}
