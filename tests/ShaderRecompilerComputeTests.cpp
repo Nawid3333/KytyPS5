@@ -390,7 +390,6 @@ struct TextureCacheTestAccess {
   static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
-    metadata.type = TextureCache::MetaDataInfo::Type::HTile;
     metadata.clear_mask.reset();
   }
 
@@ -10487,22 +10486,34 @@ public:
                                  vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
                                  uint32_t mip = 0) {
     auto &scheduler = context.GetCommandScheduler();
-    auto &image = context.GetTextureCache().GetImage(id);
-    const auto bytes = image.info.bytes_per_block * extent.width *
+    auto *image = &context.GetTextureCache().GetImage(id);
+    std::unique_ptr<Libs::Graphics::Image> resolved;
+    if (image->backing.samples > 1) {
+      auto info = image->info;
+      info.data = {};
+      info.metadata = {};
+      info.samples = 1;
+      info.resources = {1, 1};
+      resolved = std::make_unique<Libs::Graphics::Image>(m_runtime_context, scheduler, info);
+      resolved->Resolve(*image, {mip, 1, layer, 1}, {});
+      image = resolved.get();
+      layer = mip = 0;
+    }
+    const auto bytes = image->info.bytes_per_block * extent.width *
                        extent.height * extent.depth;
     auto probe = CreateHostBuffer(name, bytes,
                                  vk::BufferUsageFlagBits::eTransferDst, {});
     scheduler.Current().EndRendering();
-    image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+    image->Transit(vk::ImageLayout::eTransferSrcOptimal,
                   vk::AccessFlagBits2::eTransferRead, {},
                   scheduler.Current().Handle());
     vk::BufferImageCopy copy{};
-    copy.imageSubresource = {image.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+    copy.imageSubresource = {image->info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
                                                 : vk::ImageAspectFlagBits::eColor, mip, layer, 1};
     copy.imageOffset = offset;
     copy.imageExtent = extent;
     scheduler.Current().Handle().copyImageToBuffer(
-        image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+        image->backing.image, vk::ImageLayout::eTransferSrcOptimal,
         probe.buffer, 1, &copy);
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -11509,7 +11520,7 @@ public:
                 clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,
             "a repeated DWORD fill was decoded as a two-register clear");
     constexpr uintptr_t base = 0x0000000204100000ull;
-    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     struct FillCase {
       uint32_t fill;
@@ -11521,6 +11532,7 @@ public:
       Prospero::ChannelType type = Prospero::ChannelType::kFloat;
       uint32_t clear_word = 0;
       bool eliminate_fast_clear = false;
+      uint32_t samples_log2 = 0;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
@@ -11552,6 +11564,15 @@ public:
         FillCase{.fill = 0x20202020u, .texel = {0x0000ffffu},
                  .layout = Prospero::ChannelLayout::k16_16,
                  .type = Prospero::ChannelType::kUNorm, .clear_word = 0x0000ffffu},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .samples_log2 = 2},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .eliminate_fast_clear = true, .samples_log2 = 2},
+        FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
+                 .eliminate_fast_clear = true, .samples_log2 = 2},
+        FillCase{.fill = 0x40404040u, .texel = {0, 0x3c000000u}, .eliminate_fast_clear = true},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -11610,12 +11631,13 @@ public:
       const auto bytes_per_pixel = TextureGetRenderTargetFormat(
           layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
+      const uint32_t selected_layer = fill_case.cmask || fill_case.eliminate_fast_clear ? 1 : 0;
       TileSizeAlign dcc_size{};
-      (void)TileGetDccSize(512, 256, 1, bytes_per_pixel, 1,
-                          Prospero::TileMode::kRenderTarget, dcc_size, 0);
-      const uint64_t dcc_address = base + (fill_case.eliminate_fast_clear ? 0x200000 :
+      (void)TileGetDccSize(512, 256, selected_layer + 1, bytes_per_pixel, 1,
+                          Prospero::TileMode::kRenderTarget, dcc_size, fill_case.samples_log2);
+      const uint64_t dcc_address = base + (fill_case.samples_log2 != 0 ? 0x800000 :
+                                          fill_case.eliminate_fast_clear ? 0x200000 :
                                           fill_case.reuse_mips ? 0x160000 : 0x100000);
-      const uint32_t selected_layer = fill_case.cmask ? 1 : 0;
       const uint64_t metadata_size = fill_case.cmask ? 0x2000 : dcc_size.size;
       const std::vector<u32> expected(
           fill_case.texel.begin(), fill_case.texel.begin() + std::max(bytes_per_pixel / 4u, 1u));
@@ -11629,13 +11651,16 @@ public:
         auto &scheduler = context.GetCommandScheduler();
         registers.SetColorBase(0, {.addr = base});
         registers.SetColorInfo(
-            0, {.cmask_fast_clear_enable = !fill_case.reuse_unorm,
+            0, {.fmask_compression_enable = fill_case.samples_log2 != 0,
+                .cmask_fast_clear_enable = !fill_case.reuse_unorm,
                 .dcc_compression_enable = !fill_case.cmask,
                 .format = layout,
                 .channel_type = type,
                 .channel_order = Prospero::ChannelOrder::kStandard});
         registers.SetColorView(0, {.base_array_slice_index = selected_layer,
                                    .last_array_slice_index = selected_layer});
+        registers.SetColorAttrib(0, {.num_samples = fill_case.samples_log2,
+                                     .num_fragments = fill_case.samples_log2});
         registers.SetColorAttrib2(0, {.height = 255, .width = 511});
         registers.SetColorAttrib3(0,
                                   {.tile_mode = Prospero::TileMode::kRenderTarget,
@@ -11643,6 +11668,7 @@ public:
                                    .metadata_pipe_aligned = true});
         registers.SetColorDccAddr(0, {.addr = dcc_address});
         registers.SetColorCmask(0, {.addr = dcc_address});
+        registers.SetColorFmask(0, {.addr = fill_case.samples_log2 != 0 ? base + 0xc00000 : 0});
         registers.SetColorClearWord0(0, {.word0 = fill_case.cmask ? expected[0] : fill_case.clear_word});
         registers.SetColorClearWord1(0, {.word1 = fill_case.cmask && expected.size() > 1u ? expected[1] : 0});
         registers.SetRenderTargetMask(0x0f);
@@ -11724,9 +11750,10 @@ public:
           Require(name, "expanded metadata readback",
                   LibKernel::Memory::TryReadBacking(dcc_address, bytes.data(), bytes.size()),
                   "native color metadata could not be read back");
-          const auto selected = bytes.begin() + (fill_case.cmask ? 0x1000 : 0);
+          const auto selected = bytes.begin() + metadata_size * selected_layer / (selected_layer + 1);
           Require(name, "selected metadata slice expansion",
-                  std::all_of(bytes.begin(), selected, [](uint8_t v) { return v == 0; }) &&
+                  std::all_of(bytes.begin(), selected,
+                      [&](uint8_t v) { return v == static_cast<uint8_t>(fill_case.fill); }) &&
                       std::all_of(selected, bytes.end(), [](uint8_t v) { return v == 0xff; }),
                   "materialization retained a clear key or changed an unselected slice");
         };
@@ -11752,7 +11779,8 @@ public:
                   color.image_id == preexisting_id &&
                       texture_cache.FindTexture(color.image_id, sampled) != nullptr,
                   "FCE failed to retain the sampled allocation");
-          const std::vector<u32> stale = layout == Prospero::ChannelLayout::k11_11_10
+          const std::vector<u32> stale = layout == Prospero::ChannelLayout::k8_8_8_8
+              ? std::vector<u32>{0xffff00ffu} : layout == Prospero::ChannelLayout::k11_11_10
               ? std::vector<u32>{0x780003c0u} : layout == Prospero::ChannelLayout::k32_32
               ? std::vector<u32>{0x3f800000u, 0u} : std::vector<u32>{0x00003c00u, 0x3c003c00u};
           Require(name, "FCE before graphics shader or target binding",
@@ -11769,7 +11797,7 @@ public:
           Require(name, "repeated indexed FCE preserves expanded color",
                   ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 1) == stale,
                   "FCE reapplied the consumed clear after rendering");
-          WriteMetadata(context, dcc_address, metadata_size, 0);
+          WriteMetadata(context, dcc_address, metadata_size, fill_case.fill);
           RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
               {.index_count = 3, .instance_count = 1});
           (void)texture_cache.FindTexture(color.image_id, sampled);
@@ -11948,7 +11976,7 @@ public:
 
         ImageDesc previous_depth{};
         previous_depth.type = BindingType::DepthTarget;
-        previous_depth.info.data = {base + 0x180000, 0x10000};
+        previous_depth.info.data = {base + 0xa00000, 0x10000};
         previous_depth.info.pixel_format = vk::Format::eD32Sfloat;
         previous_depth.info.guest_format = Prospero::BufferFormat::k32Float;
         previous_depth.info.type = Prospero::ImageType::kColor2D;
@@ -14942,7 +14970,7 @@ public:
                   texture_cache.ClearMeta(high_slice_target.htile_data_base_addr),
               "single high slice was rejected or changed the backing layer layout");
       auto high_slice_readback = CreateHostBuffer(
-          name, 4 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
+          name, 7 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
       auto high_slice_metadata = CreateHostBuffer(
           name, 6 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
       const auto htile_slice_size = high_slice.desc.info.metadata.range.size / 87;
@@ -15013,20 +15041,53 @@ public:
       high_slice_storage.view_info.format = vk::Format::eR32Sfloat;
       high_slice_storage.view_info.aspect = vk::ImageAspectFlagBits::eColor;
       high_slice_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto high_slice_storage_id = texture_cache.FindImage(high_slice_storage);
       Require(name, "HTile depth replacement before raw buffer read",
-              texture_cache.FindImage(high_slice_storage) != high_slice.image_id,
+              high_slice_storage_id != high_slice.image_id,
               "R32 storage binding retained the native depth backing");
       resources.GetBufferCache().FillBuffer(
           htile_slice_address, htile_slice_size, 0, false);
       copy_htile(2);
       Config::Load({});
+      for (uint32_t pass = 0; pass < 3; ++pass) {
+        if (pass < 2) {
+          Require(name, "HTile clear across copied depth recreation",
+                  texture_cache.ClearMeta(high_slice_target.htile_data_base_addr),
+                  "copied depth lost HTile registration");
+        }
+        RenderDepthInfo copied_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), copied_depth);
+        if (pass == 2) {
+          vk::ClearValue prior_depth{};
+          prior_depth.depthStencil.depth = 0.625f;
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
+              copied_depth.image_id, {vk::ImageAspectFlagBits::eDepth, 0, 1, 86, 1},
+              prior_depth);
+        }
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, copied_depth);
+        Require(name, "copied depth consumes only subsequent HTile clears",
+                copied_depth.image_id != high_slice_storage_id &&
+                    rendering.depth_stencil_attachment.depth_clear == (pass == 1),
+                "copied depth was cleared again or ignored a subsequent metadata clear");
+        scheduler.BeginRendering(rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const vk::BufferImageCopy copy{(4 + pass) * sizeof(uint32_t), 0, 0,
+            {vk::ImageAspectFlagBits::eDepth, 0, 86, 1}, {}, {1, 1, 1}};
+        texture_cache.GetImage(copied_depth.image_id).Download(
+            std::span{&copy, 1}, high_slice_readback.buffer, 0, high_slice_readback.size);
+      }
       scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
       scheduler.Finish();
       Require(name, "high HTile slice contents and neighbor",
-              ReadBuffer(name, high_slice_readback, 4) == std::vector<uint32_t>{
+              ReadBuffer(name, high_slice_readback, 7) == std::vector<uint32_t>{
                   std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.375f),
-                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.625f)},
-              "layer86 clear missed, repeated, or changed adjacent layer85");
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.625f),
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.375f),
+                  std::bit_cast<uint32_t>(0.625f)},
+              "layer86 clear missed, repeated, or discarded copied depth");
       Require(name, "GPU-visible opt-in ZMask support",
               ReadBuffer(name, high_slice_metadata, 6) == std::vector<uint32_t>{0, 15, 0, 15, 0, 15},
               "raw HTile binding ignored the ZMask setting or lost it after depth replacement");
@@ -48998,6 +49059,9 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
+    CheckNativeMsaaState();
+    CheckPs5DepthRegisterDecoding();
+    CheckDepthHtileStencilCompatibility();
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
