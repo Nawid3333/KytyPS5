@@ -213,6 +213,12 @@ struct ImageTestAccess {
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
   }
+
+  static uint32_t CopyLength(uint32_t source, uint32_t source_block,
+                             uint32_t destination, uint32_t destination_block) {
+    return Image::CopyLength(source, source_block, destination,
+                             destination_block);
+  }
 };
 
 struct TileManagerTestAccess {
@@ -44065,6 +44071,19 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(32ull << 10, 4097, copy_capacity) == 4096 &&
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
+  // PPSA10264 (#1636) copies a 60-wide 3D image into a 54-wide one.
+  Require(name, "copy extent inside both images",
+          ImageTestAccess::CopyLength(60, 1, 54, 1) == 54 &&
+              ImageTestAccess::CopyLength(54, 1, 60, 1) == 54 &&
+              ImageTestAccess::CopyLength(60, 1, 60, 1) == 60 &&
+              ImageTestAccess::CopyLength(16, 4, 6, 4) == 4 &&
+              ImageTestAccess::CopyLength(6, 4, 6, 4) == 6 &&
+              ImageTestAccess::CopyLength(6, 4, 16, 4) == 4 &&
+              ImageTestAccess::CopyLength(256, 4, 64, 1) == 256 &&
+              ImageTestAccess::CopyLength(64, 1, 256, 4) == 64 &&
+              ImageTestAccess::CopyLength(2, 1, 6, 4) == 1 &&
+              ImageTestAccess::CopyLength(3, 4, 2, 4) == 0,
+          "an image copy region does not fit inside the smaller image");
 
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =
