@@ -2,6 +2,8 @@
 #define KYTY_GRAPHICS_PRESENTATION_WINDOW_HOST_INPUT_H_
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 struct SDL_Window;
 union SDL_Event;
@@ -37,6 +39,20 @@ void               HostInputDisconnectGamepadTouchPad(int id);
 [[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
+
+struct LabInputEvent {
+	enum class Kind { Invalid, Comment, Press, Mash, Stick, End, Wait };
+	Kind        kind     = Kind::Invalid;
+	double      t        = 0.0;
+	std::string name;
+	double      hold     = 0.15;
+	double      every    = 0.0;
+	double      duration = 0.0;
+	double      value    = 0.0;
+};
+
+[[nodiscard]] LabInputEvent ParseLabInputLine(std::string_view line);
+void                        HostInputStartLabScript(const char* path);
 
 } // namespace Libs::Graphics
 

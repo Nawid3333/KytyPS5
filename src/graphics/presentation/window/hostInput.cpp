@@ -9,12 +9,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 namespace Libs::Graphics {
@@ -1059,6 +1062,221 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		CenterMouseStick();
 	}
 	return has_event;
+}
+
+namespace {
+
+uint32_t LabPadButton(std::string_view name) {
+	if (name == "cross") return Controller::PAD_BUTTON_CROSS;
+	if (name == "circle") return Controller::PAD_BUTTON_CIRCLE;
+	if (name == "square") return Controller::PAD_BUTTON_SQUARE;
+	if (name == "triangle") return Controller::PAD_BUTTON_TRIANGLE;
+	if (name == "l1") return Controller::PAD_BUTTON_L1;
+	if (name == "r1") return Controller::PAD_BUTTON_R1;
+	if (name == "l2") return Controller::PAD_BUTTON_L2;
+	if (name == "r2") return Controller::PAD_BUTTON_R2;
+	if (name == "l3") return Controller::PAD_BUTTON_L3;
+	if (name == "r3") return Controller::PAD_BUTTON_R3;
+	if (name == "options") return Controller::PAD_BUTTON_OPTIONS;
+	if (name == "touchpad") return Controller::PAD_BUTTON_TOUCH_PAD;
+	if (name == "up") return Controller::PAD_BUTTON_UP;
+	if (name == "down") return Controller::PAD_BUTTON_DOWN;
+	if (name == "left") return Controller::PAD_BUTTON_LEFT;
+	if (name == "right") return Controller::PAD_BUTTON_RIGHT;
+	return 0;
+}
+
+bool LabStickAxis(std::string_view name, Controller::Axis* axis) {
+	if (name == "left_x") { *axis = Controller::Axis::LeftX; return true; }
+	if (name == "left_y") { *axis = Controller::Axis::LeftY; return true; }
+	if (name == "right_x") { *axis = Controller::Axis::RightX; return true; }
+	if (name == "right_y") { *axis = Controller::Axis::RightY; return true; }
+	return false;
+}
+
+bool LabFindValue(std::string_view line, std::string_view key, std::string_view* out) {
+	std::string quoted = "\"";
+	quoted.append(key);
+	quoted.push_back('"');
+	const auto key_pos = line.find(quoted);
+	if (key_pos == std::string_view::npos) {
+		return false;
+	}
+	auto pos = line.find(':', key_pos + quoted.size());
+	if (pos == std::string_view::npos) {
+		return false;
+	}
+	pos++;
+	while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+		pos++;
+	}
+	if (pos >= line.size()) {
+		return false;
+	}
+	if (line[pos] == '"') {
+		const auto end = line.find('"', pos + 1);
+		if (end == std::string_view::npos) {
+			return false;
+		}
+		*out = line.substr(pos + 1, end - pos - 1);
+		return true;
+	}
+	auto end = pos;
+	while (end < line.size() && line[end] != ',' && line[end] != '}' && line[end] != ' ' &&
+	       line[end] != '\t') {
+		end++;
+	}
+	*out = line.substr(pos, end - pos);
+	return true;
+}
+
+double LabToNumber(std::string_view token, double fallback) {
+	const std::string text(token);
+	char*             endp  = nullptr;
+	const double      value = std::strtod(text.c_str(), &endp);
+	return endp == text.c_str() ? fallback : value;
+}
+
+void LabPlayScript(std::string path) {
+	std::ifstream file(path);
+	if (!file.is_open()) {
+		LOGF("[lab-input] cannot open script: %s\n", path.c_str());
+		return;
+	}
+	using Kind            = LabInputEvent::Kind;
+	const auto start      = std::chrono::steady_clock::now();
+	const auto sleep_secs = [](double secs) {
+		if (secs > 0.0) {
+			std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+		}
+	};
+
+	std::string line;
+	while (std::getline(file, line)) {
+		const LabInputEvent event = ParseLabInputLine(line);
+		if (event.kind == Kind::Comment) {
+			continue;
+		}
+		if (event.kind == Kind::Invalid) {
+			LOGF("[lab-input] bad line skipped: %s\n", line.c_str());
+			continue;
+		}
+		std::this_thread::sleep_until(start + std::chrono::duration<double>(event.t));
+		if (event.kind == Kind::End) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, "end");
+			return;
+		}
+		if (event.kind == Kind::Wait) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, "wait");
+			continue;
+		}
+		if (event.kind == Kind::Press) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, ("press " + event.name).c_str());
+			const uint32_t button = LabPadButton(event.name);
+			SetButton(button, true);
+			sleep_secs(event.hold > 0.0 ? event.hold : 0.15);
+			SetButton(button, false);
+			continue;
+		}
+		if (event.kind == Kind::Mash) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, ("mash " + event.name).c_str());
+			const uint32_t button   = LabPadButton(event.name);
+			const double   every    = event.every > 0.0 ? event.every : 0.15;
+			const auto     mash_end = std::chrono::steady_clock::now() +
+			                      std::chrono::duration<double>(event.duration);
+			while (std::chrono::steady_clock::now() < mash_end) {
+				SetButton(button, true);
+				sleep_secs(std::min(every * 0.5, 0.15));
+				SetButton(button, false);
+				sleep_secs(every * 0.5);
+			}
+			continue;
+		}
+		if (event.kind == Kind::Stick) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, ("stick " + event.name).c_str());
+			Controller::Axis axis = Controller::Axis::LeftX;
+			LabStickAxis(event.name, &axis);
+			const double value = std::clamp(event.value, -1.0, 1.0);
+			const int    raw =
+			    std::clamp(128 + static_cast<int>(std::lround(value * 127.0)), 0, 255);
+			Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, raw);
+			sleep_secs(event.duration);
+			Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, 128);
+			continue;
+		}
+	}
+}
+
+} // namespace
+
+LabInputEvent ParseLabInputLine(std::string_view line) {
+	LabInputEvent event;
+	while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+		line.remove_prefix(1);
+	}
+	while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r' ||
+	                         line.back() == '\n')) {
+		line.remove_suffix(1);
+	}
+	if (line.empty() || line.front() == '#') {
+		event.kind = LabInputEvent::Kind::Comment;
+		return event;
+	}
+
+	std::string_view value;
+	if (LabFindValue(line, "t", &value)) {
+		event.t = LabToNumber(value, 0.0);
+	}
+	if (LabFindValue(line, "end", &value) && value == "true") {
+		event.kind = LabInputEvent::Kind::End;
+		return event;
+	}
+	if (LabFindValue(line, "wait", &value) && value == "true") {
+		event.kind = LabInputEvent::Kind::Wait;
+		return event;
+	}
+	if (LabFindValue(line, "press", &value)) {
+		if (LabPadButton(value) == 0) {
+			return event;
+		}
+		event.kind = LabInputEvent::Kind::Press;
+		event.name = std::string(value);
+		std::string_view hold;
+		event.hold = LabFindValue(line, "hold", &hold) ? LabToNumber(hold, 0.15) : 0.15;
+		return event;
+	}
+	if (LabFindValue(line, "mash", &value)) {
+		if (LabPadButton(value) == 0) {
+			return event;
+		}
+		event.kind     = LabInputEvent::Kind::Mash;
+		event.name     = std::string(value);
+		std::string_view token;
+		event.every    = LabFindValue(line, "every", &token) ? LabToNumber(token, 0.15) : 0.15;
+		event.duration = LabFindValue(line, "for", &token) ? LabToNumber(token, 0.0) : 0.0;
+		return event;
+	}
+	if (LabFindValue(line, "stick", &value)) {
+		Controller::Axis axis = Controller::Axis::LeftX;
+		if (!LabStickAxis(value, &axis)) {
+			return event;
+		}
+		event.kind     = LabInputEvent::Kind::Stick;
+		event.name     = std::string(value);
+		std::string_view token;
+		event.value    = LabFindValue(line, "value", &token) ? LabToNumber(token, 0.0) : 0.0;
+		event.duration = LabFindValue(line, "for", &token) ? LabToNumber(token, 0.0) : 0.0;
+		return event;
+	}
+	return event;
+}
+
+void HostInputStartLabScript(const char* path) {
+	if (path == nullptr) {
+		return;
+	}
+	LOGF("[lab-input] starting script: %s\n", path);
+	std::thread(LabPlayScript, std::string(path)).detach();
 }
 
 } // namespace Libs::Graphics
