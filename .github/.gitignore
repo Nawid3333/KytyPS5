@@ -1,0 +1,2 @@
+# fork-only: Python caches from running .github/scripts locally
+__pycache__/
