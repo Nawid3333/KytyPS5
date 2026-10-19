@@ -1,6 +1,9 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "common/labProfile.h" // LAB profile build
 
+#include <mutex>         // LAB profile build
+#include <unordered_set> // LAB profile build
+
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -321,6 +324,28 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (options.stage == ShaderType::Compute) { // LAB profile build: which game shaders take derivatives
+			static std::mutex                   lab_deriv_mutex;
+			static std::unordered_set<uint64_t> lab_deriv_seen;
+			const auto&                         words = result.spirv;
+			for (size_t i = 5; i < words.size() && (words[i] >> 16u) != 0u; i += words[i] >> 16u) {
+				const bool derivatives = (words[i] & 0xffffu) == 17u && (words[i] >> 16u) == 2u &&
+				                         i + 1 < words.size() &&
+				                         (words[i + 1] == 5288u || words[i + 1] == 5350u);
+				if (!derivatives) {
+					continue;
+				}
+				std::lock_guard lock(lab_deriv_mutex);
+				if (lab_deriv_seen.insert(options.shader_hash).second) {
+					const auto* cs = options.input_info.compute;
+					LOGF("[lab-deriv] compute shader hash=0x%016" PRIx64
+					     " uses derivatives (image_get_lod), threads %ux%ux%u\n",
+					     options.shader_hash, cs != nullptr ? cs->threads_num[0] : 0u,
+					     cs != nullptr ? cs->threads_num[1] : 0u, cs != nullptr ? cs->threads_num[2] : 0u);
+				}
+				break;
+			}
+		}
 
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
