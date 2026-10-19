@@ -126,13 +126,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	const bool metadata_read = resource.read && Config::SupportZmaskEnabled() &&
-	                           (address & 0x7fffu) == 0 &&
-	                           context.GetTextureCache().IsMeta(address);
-	auto [buffer, offset]    = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written || metadata_read,
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
+	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
-	if (metadata_read) buffer->Fill(offset, size, 0xf); // HTILE ZMask::kUncompressed.
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -768,7 +764,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
+			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
+				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
