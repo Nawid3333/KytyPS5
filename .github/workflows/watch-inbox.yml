@@ -1,0 +1,35 @@
+# Fork-only: posts new KytyPS5/KytyPS5 comments, reviews and PR state changes that concern
+# Nawid3333 to this fork's "Watch inbox" issue (see .github/scripts/watch_inbox.py).
+# It only reads from upstream; all writes go to the inbox issue in this fork.
+name: Watch inbox
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: watch-inbox
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.repository == 'Nawid3333/KytyPS5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout the script and watch list
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Collect upstream activity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: KytyPS5/KytyPS5
+          WATCH_USER: Nawid3333
+        run: python3 -I .github/scripts/watch_inbox.py

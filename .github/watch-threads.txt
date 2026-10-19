@@ -1,0 +1,56 @@
+# Fork-only: upstream KytyPS5/KytyPS5 issue and PR numbers whose new comments,
+# reviews and state changes .github/scripts/watch_inbox.py reports in the
+# fork's "Watch inbox" issue. One number per line; text after "#" is ignored.
+# Nawid3333's own open issues/PRs and @Nawid3333 mentions are always reported.
+1686
+1678
+1679
+1680
+821
+1059
+1152
+1176
+1209
+1254
+1421
+1428
+1453
+1510
+1511
+1515
+1528
+1546
+1552
+1554
+1565
+1566
+1567
+1568
+1570
+1573
+1574
+1575
+1578
+1587
+1588
+1591
+1595
+1598
+1600
+1603
+1609
+1610
+1613
+1619
+1620
+1622
+1624
+1626
+1630
+1636
+1637
+1660
+852
+1257
+1118
+1255
