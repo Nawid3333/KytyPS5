@@ -190,7 +190,28 @@ void TestDisabledMappingTabs() {
 }
 } // namespace
 
+static void TestLabInputParser() {
+	using namespace Libs::Graphics;
+	using Kind = LabInputEvent::Kind;
+
+	Check(ParseLabInputLine("# comment").kind == Kind::Comment, "comment line");
+
+	const auto press = ParseLabInputLine("{\"t\": 1.0, \"press\": \"cross\", \"hold\": 0.2}");
+	Check(press.kind == Kind::Press && press.name == "cross" && press.hold == 0.2, "press");
+
+	const auto mash = ParseLabInputLine("{\"t\": 2, \"mash\": \"circle\", \"every\": 0.1, \"for\": 1.0}");
+	Check(mash.kind == Kind::Mash && mash.name == "circle" && mash.every == 0.1 && mash.duration == 1.0, "mash");
+
+	const auto stick = ParseLabInputLine("{\"t\": 3, \"stick\": \"left_x\", \"value\": -1, \"for\": 0.5}");
+	Check(stick.kind == Kind::Stick && stick.name == "left_x" && stick.value == -1.0 && stick.duration == 0.5, "stick");
+
+	Check(ParseLabInputLine("{\"t\": 4, \"end\": true}").kind == Kind::End, "end");
+	Check(ParseLabInputLine("{\"t\": 5, \"wait\": true}").kind == Kind::Wait, "wait");
+	Check(ParseLabInputLine("{\"t\": 6, \"press\": \"nope\"}").kind == Kind::Invalid, "bad button");
+}
+
 int main() {
+	TestLabInputParser();
 	Config::Initialize();
 	Config::ConfigOptions options;
 	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger"};
