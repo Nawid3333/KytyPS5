@@ -97,6 +97,10 @@ void ToggleGyroEmulation(int) {}
 void CycleSetting(Setting) {}
 } // namespace Libs::Controller
 
+namespace Libs::Graphics {
+void RenderDocRequestCapture() {}
+} // namespace Libs::Graphics
+
 namespace {
 using namespace Libs::Graphics;
 using namespace Libs::Controller;
@@ -271,6 +275,7 @@ static void TestLabInputParser() {
 
 	Check(ParseLabInputLine("{\"t\": 4, \"end\": true}").kind == Kind::End, "end");
 	Check(ParseLabInputLine("{\"t\": 5, \"wait\": true}").kind == Kind::Wait, "wait");
+	Check(ParseLabInputLine("{\"t\": 7, \"capture\": true}").kind == Kind::Capture, "capture");
 	Check(ParseLabInputLine("{\"t\": 6, \"press\": \"nope\"}").kind == Kind::Invalid, "bad button");
 }
 
