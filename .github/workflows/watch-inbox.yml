@@ -8,9 +8,14 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+# Without pull-requests read, GITHUB_TOKEN gets upstream issue lists with the PRs left out;
+# actions and statuses read cover the upstream workflow runs and commit statuses.
 permissions:
   issues: write
   contents: read
+  pull-requests: read
+  actions: read
+  statuses: read
 
 concurrency:
   group: watch-inbox

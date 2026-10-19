@@ -317,6 +317,7 @@ class Collector:
         return info["open"] and same_user(info["author"])
 
     def add(self, number, stamp, kind, url, user=None, body=None):
+        self.thread(number)  # the title, for render()
         bot = bool(user) and is_bot(user)
         author = user["login"].removesuffix("[bot]") if user else ""
         self.events.append({"n": number, "at": stamp, "kind": kind, "url": url,
@@ -469,6 +470,7 @@ def main():
               f"{len(previous)} known conditions")
         collect = Collector(api, since, until, load_watch_list(WATCH_FILE))
         collect.threads_since()
+        print(f"{len(collect.threads)} upstream issues and PRs updated in the window")
         collect.comments()
         collect.review_comments()
         collect.closures()
