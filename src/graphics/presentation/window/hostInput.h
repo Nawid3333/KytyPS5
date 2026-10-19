@@ -41,7 +41,7 @@ void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
 
 struct LabInputEvent {
-	enum class Kind { Invalid, Comment, Press, Mash, Stick, End, Wait };
+	enum class Kind { Invalid, Comment, Press, Mash, Stick, End, Wait, Capture };
 	Kind        kind     = Kind::Invalid;
 	double      t        = 0.0;
 	std::string name;
