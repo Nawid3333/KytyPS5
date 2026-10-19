@@ -1048,6 +1048,13 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
 		return false;
 	}
+	{ // LAB profile build: logged before the checks below, which exit when maintenance8 is missing
+		static std::atomic_bool lab_d2c_seen = false;
+		if (!lab_d2c_seen.exchange(true, std::memory_order_relaxed)) {
+			LOGF("[lab-d2c] first depth-to-color copy draw, maintenance8=%s\n",
+			     m_context.GetGraphics().maintenance8_enabled ? "true" : "false");
+		}
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
@@ -1095,6 +1102,15 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                  1, &region);
+		{ // LAB profile build: total depth-to-color copies, logged at copy 1, 2, 4, 8, ...
+			static std::atomic<uint64_t> lab_d2c_copies = 0;
+			const uint64_t lab_copies = lab_d2c_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (std::has_single_bit(lab_copies)) {
+				LOGF("[lab-d2c] depth-to-color copies=%" PRIu64 " (this copy: %ux%u from %s)\n",
+				     lab_copies, region.extent.width, region.extent.height,
+				     source.backing.format == vk::Format::eD32SfloatS8Uint ? "D32S8" : "D32");
+			}
+		}
 	}
 	return true;
 }
@@ -1359,6 +1375,18 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		index_source.host_data = expanded_indices.data();
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
+		{ // LAB profile build: CPU-widened 8-bit index totals, logged at draw 1, 2, 4, 8, ...
+			static std::atomic<uint64_t> lab_u8_draws   = 0;
+			static std::atomic<uint64_t> lab_u8_indices = 0;
+			const uint64_t lab_draws = lab_u8_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+			const uint64_t lab_indices =
+			    lab_u8_indices.fetch_add(args.index_count, std::memory_order_relaxed) + args.index_count;
+			if (std::has_single_bit(lab_draws)) {
+				LOGF("[lab-u8idx] 8-bit index draws=%" PRIu64 " indices=%" PRIu64
+				     " (this draw: %u indices, primitive restart %s)\n",
+				     lab_draws, lab_indices, args.index_count, primitive_restart ? "on" : "off");
+			}
+		}
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,

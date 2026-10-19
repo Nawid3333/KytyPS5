@@ -715,6 +715,10 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
+	// LAB profile build: image paths the SPIR-V emitter took, counted for the pipeline cache log
+	uint32_t                      lab_implicit_lod_samples   = 0; // LAB profile build
+	uint32_t                      lab_dynamic_sample_offsets = 0; // LAB profile build
+	uint32_t                      lab_dynamic_gather_offsets = 0; // LAB profile build
 
 };
 

@@ -987,6 +987,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			} else {
 				component_or_dref = ConstantU32(state, ImageGatherSource(state, mem));
 			}
+			if (!HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal) && // LAB profile build
+			    layout.offset != NoImageComponent && !offset_value.IsImmediate()) {
+				state.program.lab_dynamic_gather_offsets++; // LAB profile build: count only
+			}
 			const auto samplers = LoadImageSamplers(ctx, inst);
 			const auto EmitGather = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
 				const auto& candidate = state.program.info.images[resource];
@@ -1027,6 +1031,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 		                          state.program.stage != ShaderType::Pixel;
+		if (explicit_lod && !HasFlag(mem, Decoder::ImageSampleFlagDerivative) && // LAB profile build
+		    !HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+		    !HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+			state.program.lab_implicit_lod_samples++; // LAB profile build: count only
+		}
 		auto       opcode       = spv::OpImageSampleImplicitLod;
 		if (explicit_lod) {
 			opcode = dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
@@ -1063,6 +1072,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (layout.offset != NoImageComponent &&
 		    !offset_value.IsImmediate() && !state.maintenance8_enabled) {
 			ctx.Fail(inst, "requires maintenance8 for a dynamic sample texel offset");
+		}
+		if (layout.offset != NoImageComponent && !offset_value.IsImmediate()) { // LAB profile build
+			state.program.lab_dynamic_sample_offsets++; // LAB profile build: count only
 		}
 		const auto samplers = LoadImageSamplers(ctx, inst);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {

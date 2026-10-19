@@ -346,6 +346,33 @@ struct PipelineCache::ProgramCache {
 				break;
 			}
 		}
+		{ // LAB profile build: rarely-tested image paths the emitter counted, once per shader hash
+			const auto& lab                 = result.program;
+			const bool  lab_cs_implicit_lod = options.stage == ShaderType::Compute &&
+			                                 lab.lab_implicit_lod_samples != 0;
+			const bool  lab_dynamic_offset  = lab.lab_dynamic_sample_offsets != 0 ||
+			                                lab.lab_dynamic_gather_offsets != 0;
+			static std::mutex                   lab_usage_mutex;
+			static std::unordered_set<uint64_t> lab_implicit_lod_seen;
+			static std::unordered_set<uint64_t> lab_dynamic_offset_seen;
+			if (lab_cs_implicit_lod || lab_dynamic_offset) {
+				std::lock_guard lock(lab_usage_mutex);
+				if (lab_cs_implicit_lod && lab_implicit_lod_seen.insert(options.shader_hash).second) {
+					const auto* cs = options.input_info.compute;
+					LOGF("[lab-cs-implicit-lod] compute shader hash=0x%016" PRIx64
+					     " has %u implicit-LOD samples (emitted as LOD 0), threads %ux%ux%u\n",
+					     options.shader_hash, lab.lab_implicit_lod_samples,
+					     cs != nullptr ? cs->threads_num[0] : 0u, cs != nullptr ? cs->threads_num[1] : 0u,
+					     cs != nullptr ? cs->threads_num[2] : 0u);
+				}
+				if (lab_dynamic_offset && lab_dynamic_offset_seen.insert(options.shader_hash).second) {
+					LOGF("[lab-dyn-offset] %s shader hash=0x%016" PRIx64
+					     " dynamic texel offsets: samples=%u (maintenance8) gathers=%u\n",
+					     stage_name, options.shader_hash, lab.lab_dynamic_sample_offsets,
+					     lab.lab_dynamic_gather_offsets);
+				}
+			}
+		}
 
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
