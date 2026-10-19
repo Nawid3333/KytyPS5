@@ -789,6 +789,10 @@ static void WindowCreate(WindowContext& context) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
 #endif
+	if (std::getenv("KYTY_LAB_BACKGROUND_INPUT") != nullptr) {
+		// LAB-ONLY: deliver gamepad events even when the window is not focused.
+		SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+	}
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
@@ -829,6 +833,9 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
+	if (const char* lab_script = std::getenv("KYTY_LAB_INPUT_SCRIPT"); lab_script != nullptr) {
+		HostInputStartLabScript(lab_script);
+	}
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
 }
