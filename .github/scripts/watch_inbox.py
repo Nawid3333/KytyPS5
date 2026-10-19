@@ -61,7 +61,7 @@ class Api:
             url = API + url
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-        if self.remaining is not None and self.remaining < MIN_RATE_REMAINING:
+        if method == "GET" and self.remaining is not None and self.remaining < MIN_RATE_REMAINING:
             raise RateLow(f"rate limit remaining {self.remaining} < {MIN_RATE_REMAINING}")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
@@ -106,6 +106,8 @@ class Api:
             data, headers = self.request("GET", url, query)
             yield from data
             url, query, page = next_link(headers, "next"), None, page + 1
+        if url:
+            print(f"::warning::{path}: stopped after {MAX_PAGES} pages, later items skipped")
 
     def tail(self, path, pages=2):
         """Items of the last `pages` pages of an ascending list, oldest first."""
