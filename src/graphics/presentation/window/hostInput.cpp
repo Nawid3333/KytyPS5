@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/renderDoc.h"
 #include "libs/controller.h"
 #include "libs/libs.h"
 
@@ -1171,6 +1172,11 @@ void LabPlayScript(std::string path) {
 			                    std::clamp(static_cast<int>(std::lround(event.value)), 0, 255));
 			continue;
 		}
+		if (event.kind == Kind::Capture) {
+			LOGF("[lab-input] t=%.2f %s\n", event.t, "capture");
+			RenderDocRequestCapture(); // same as F1: needs --rd; starts at the next guest flip
+			continue;
+		}
 		if (event.kind == Kind::Press) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, ("press " + event.name).c_str());
 			LabSetButton(event.name, true);
@@ -1262,6 +1268,10 @@ LabInputEvent ParseLabInputLine(std::string_view line) {
 		event.kind  = LabInputEvent::Kind::Axis;
 		event.name  = std::string(value);
 		event.value = LabToNumber(raw, 128.0);
+		return event;
+	}
+	if (LabFindValue(line, "capture", &value) && value == "true") {
+		event.kind = LabInputEvent::Kind::Capture;
 		return event;
 	}
 	if (LabFindValue(line, "press", &value)) {
