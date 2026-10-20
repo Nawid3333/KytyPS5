@@ -47,6 +47,8 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::unordered_map<uint64_t, ShaderTessellationInputInfo>       g_tess_layouts;
+static std::mutex                                                      g_tess_layouts_mutex;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -414,6 +416,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(info.user_clip_planes);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -440,7 +443,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
 		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
+		                       tess.output_topology});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -650,7 +654,18 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	// Reflection decodes both programs; the key also covers the VGT fields cached in tess.
+	const uint64_t key[] = {local_hash, control_hash,
+	                        uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u | sh.m_vgtTfParam};
+	{
+		std::scoped_lock lock(g_tess_layouts_mutex);
+		auto [entry, inserted] = g_tess_layouts.try_emplace(XXH3_64bits(key, sizeof(key)), tess);
+		if (inserted) {
+			ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code,
+			                                              entry->second);
+		}
+		tess = entry->second;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

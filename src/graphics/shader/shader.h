@@ -130,6 +130,8 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
@@ -152,6 +154,8 @@ struct ShaderVertexInputInfo {
 	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
 	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
+	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
