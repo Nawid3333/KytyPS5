@@ -27,6 +27,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -144,7 +145,9 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	// Lab: KYTY_LAB_SHADER_DUMP=1 dumps only the guest binaries, without the per-draw debug logging.
+	static const bool lab_dump = std::getenv("KYTY_LAB_SHADER_DUMP") != nullptr;
+	if (!Config::GraphicsDebugDumpEnabled() && !lab_dump) {
 		return;
 	}
 	EXIT_IF(code.empty());
