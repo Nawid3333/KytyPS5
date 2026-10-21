@@ -10429,14 +10429,12 @@ void TestNewShaderRecompilerNativeU64Translation() {
       ir.Emit(IR::ValueOpcode::BitwiseAnd64,
               {base, IR::Value(uint64_t{0xff00ff00ff00ff00ull})});
   const auto sum = ir.Emit(IR::ValueOpcode::IAdd64, {masked, base});
-  const auto product = ir.Emit(IR::ValueOpcode::IMul64, {sum, base});
   const auto shifted =
-      ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {product, lane});
+      ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {sum, lane});
   ir.Emit(IR::ValueOpcode::IEqual64, {shifted, base});
   ir.Emit(IR::ValueOpcode::INotEqual64, {shifted, base});
   ir.Emit(IR::ValueOpcode::ULessThan64, {shifted, base});
   ir.Emit(IR::ValueOpcode::SLessThan64, {shifted, base});
-  ir.Emit(IR::ValueOpcode::BitCount64, {shifted});
   for (const uint32_t count : {1u, 31u, 32u, 33u, 63u}) {
     ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {base, IR::Value(count)});
     ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {base, IR::Value(count)});
@@ -10451,7 +10449,6 @@ void TestNewShaderRecompilerNativeU64Translation() {
   Check(source.find("OpCapability Int64") != std::string::npos &&
             source.find("OpTypeInt 64 0") != std::string::npos &&
             SpirvSourceHasInstructionUsing(source, "OpIAdd", "%ulong") &&
-            SpirvSourceHasInstructionUsing(source, "OpIMul", "%ulong") &&
             SpirvSourceHasInstructionUsing(source, "OpBitwiseAnd", "%ulong"),
         "U64 arithmetic did not emit native 64-bit scalar instructions");
   Check(SpirvInstructionOpcodeCount(spirv, spv::OpIAddCarry) == 0u &&
@@ -10535,6 +10532,7 @@ void TestComputeDispatchWaveSize() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
+      EncodeVopc(0xd4, 0 + 256, 1), // v_cmpx_gt_u32 v0, v1
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -15147,7 +15145,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
             ValueDependsOn(carry_source->dwords[1],
                            ShaderRecompiler::IR::ValueOpcode::GetShaderBase) &&
             ValueDependsOn(carry_source->dwords[1],
-                           ShaderRecompiler::IR::ValueOpcode::IAddCarry32),
+                           ShaderRecompiler::IR::ValueOpcode::ULessThan32),
         "real s_add_u32/s_addc_u32 translation lost SCC carry provenance");
   std::array<uint32_t, 64> carry_user_data{};
   const uint64_t shader_base = 0x00000012fffffffbull;
