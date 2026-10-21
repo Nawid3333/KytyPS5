@@ -285,7 +285,6 @@ struct ImageSampleLayout {
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };
@@ -509,8 +508,6 @@ inline constexpr auto EmitLogicalOrBool =
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
-
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
