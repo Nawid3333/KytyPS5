@@ -37,6 +37,12 @@
 
 #define KYTY_ENABLE_DEBUG_PRINTF
 
+// Lab (#1511): KYTY_LAB_MAXIMAL_RECONVERGENCE=1 requests VK_KHR_shader_maximal_reconvergence.
+static bool LabMaximalReconvergence() {
+	const char* value = std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 namespace Libs::Graphics {
 
 struct VulkanExtensions {
@@ -498,7 +504,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	// Lab (#1511): request maximal reconvergence only when KYTY_LAB_MAXIMAL_RECONVERGENCE is set.
 	const bool maximal_reconvergence_extension =
-	    std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr &&
+	    LabMaximalReconvergence() &&
 	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence {};
 	if (maximal_reconvergence_extension) {
@@ -595,7 +601,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.maximal_reconvergence_enabled =
 	    maximal_reconvergence_extension && maximal_reconvergence.shaderMaximalReconvergence;
 	LOGF("Vulkan maximal reconvergence (lab, KYTY_LAB_MAXIMAL_RECONVERGENCE): requested=%s enabled=%s\n",
-	     std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr ? "true" : "false",
+	     LabMaximalReconvergence() ? "true" : "false",
 	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
@@ -1097,7 +1103,7 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		// Lab (#1511): only with KYTY_LAB_MAXIMAL_RECONVERGENCE, so runs without it match main.
-		if (std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr &&
+		if (LabMaximalReconvergence() &&
 		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 		}
