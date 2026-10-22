@@ -871,6 +871,12 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
+	// Lab (#1511): subgroup votes after divergent control flow see every invocation that reached
+	// them; without this the driver may run them with a partial subgroup.
+	if (state.profile.maximal_reconvergence && state.program.stage == ShaderType::Compute) {
+		state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
+	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.program.info.function_lds) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
