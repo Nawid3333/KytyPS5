@@ -1318,6 +1318,29 @@ struct BdaMapping {
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
 constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 
+// LAB (#1511, not for upstream): KYTY_LAB_MAXIMAL_RECONVERGENCE=1 compiles every compute case with
+// MaximallyReconvergesKHR and enables VK_KHR_shader_maximal_reconvergence on the harness device.
+bool LabMaximalReconvergence() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+const ShaderProfile *LabComputeProfile(const ShaderProfile *profile) {
+  if (!LabMaximalReconvergence() || profile == nullptr) {
+    return profile;
+  }
+  static std::map<const ShaderProfile *, std::unique_ptr<ShaderProfile>> copies;
+  auto &copy = copies[profile];
+  if (!copy) {
+    copy = std::make_unique<ShaderProfile>(*profile);
+    copy->maximal_reconvergence = true;
+  }
+  return copy.get();
+}
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1689,7 +1712,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.profile = test.profile;
+  options.profile = LabComputeProfile(test.profile);
   options.dump_ir = true;
   options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
@@ -21090,6 +21113,12 @@ private:
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
+    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence{};
+    maximal_reconvergence.shaderMaximalReconvergence = true;
+    if (LabMaximalReconvergence()) {
+      maximal_reconvergence.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &maximal_reconvergence;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
@@ -21113,6 +21142,9 @@ private:
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
         VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+    if (LabMaximalReconvergence()) {
+      device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
