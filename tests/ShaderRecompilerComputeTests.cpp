@@ -1845,6 +1845,19 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
+  // LAB (KytyLab, not for upstream): KYTY_LAB_COMPUTE_DUMP=<file> writes the case's compute
+  // SPIR-V; with KYTY_LAB_COMPUTE_DUMP_ONLY the process exits before the driver compiles it.
+  if (const char *path = std::getenv("KYTY_LAB_COMPUTE_DUMP")) {
+    std::FILE *file = std::fopen(path, "wb");
+    Require(test.name, "lab compute dump", file != nullptr, "cannot create the SPIR-V file");
+    std::fwrite(result.spirv.data(), sizeof(u32), result.spirv.size(), file);
+    std::fclose(file);
+    std::printf("[lab] compute SPIR-V written to %s (%zu words)\n", path, result.spirv.size());
+    if (std::getenv("KYTY_LAB_COMPUTE_DUMP_ONLY") != nullptr) {
+      std::fflush(nullptr);
+      std::_Exit(0);
+    }
+  }
   ValidateSpirv(test.name, result.spirv);
   CheckSpirvEmission(test, result.spirv);
   if (test.max_spirv_words != 0u) {
