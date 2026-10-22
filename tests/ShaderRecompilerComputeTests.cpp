@@ -1018,6 +1018,54 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+// LAB (KytyLab, not for upstream): KYTY_LAB_HOST32=1 runs every guest compute
+// pipeline as a host with 32-lane subgroups does (NVIDIA, Intel, MoltenVK): the
+// recompiler gets host_subgroup_size 32 and each compute pipeline requires
+// subgroup size 32.
+bool LabHost32() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("KYTY_LAB_HOST32");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// LAB (KytyLab, not for upstream): KYTY_LAB_FRAGMENT_HOST32=1 requires subgroup
+// size 32 for the graphics cases' fragment stage (the subgroup size NVIDIA and
+// Intel use for fragment shaders). The fragment SPIR-V is unchanged: Kyty emits
+// pixel shaders without a host subgroup size.
+bool LabFragmentHost32() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("KYTY_LAB_FRAGMENT_HOST32");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// LAB (KytyLab, not for upstream): KYTY_LAB_RASTER_OPTIONAL_FEEDBACK=1 follows
+// production (vulkanWindow.cpp): rasterization does not need
+// attachmentFeedbackLoopDynamicState, feedback loops are enabled only when it exists.
+bool LabRasterOptionalFeedback() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("KYTY_LAB_RASTER_OPTIONAL_FEEDBACK");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// LAB: the LocalSize X of a SPIR-V module, 0 when it has none.
+u32 LabSpirvLocalSizeX(std::span<const u32> spirv) {
+  for (size_t i = 5; i < spirv.size();) {
+    const u32 count = spirv[i] >> 16u;
+    if ((spirv[i] & 0xffffu) == 16u && count >= 4 && i + 3 < spirv.size() &&
+        spirv[i + 2] == 17u) {
+      return spirv[i + 3];
+    }
+    i += count != 0 ? count : 1;
+  }
+  return 0;
+}
+
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
   namespace SystemDialog = Libs::Dialog::SystemDialog;
@@ -2075,6 +2123,9 @@ public:
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
   [[nodiscard]] u32 SubgroupSize() const {
+    if (LabHost32()) {
+      return 32;
+    }
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     vk::PhysicalDeviceProperties2 properties{};
     properties.pNext = &subgroup;
@@ -2089,6 +2140,24 @@ public:
   // the capability instead of failing the whole binary before the first case.
   [[nodiscard]] bool RasterizationSupported() const {
     return m_rasterization_supported;
+  }
+  [[nodiscard]] bool LabFragmentHost32Active() const { return m_lab_fragment_host32; }
+  // LAB (KytyLab, not for upstream): with KYTY_LAB_HOST32=1, requires 32-lane
+  // subgroups for a compute stage, and full subgroups when its LocalSize X is a
+  // multiple of 32 (VUID-VkPipelineShaderStageCreateInfo-flags-02759).
+  void LabRequireHost32(vk::PipelineShaderStageCreateInfo &stage,
+                        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo &required,
+                        std::span<const u32> spirv) const {
+    if (!LabHost32()) {
+      return;
+    }
+    required.requiredSubgroupSize = 32;
+    required.pNext = const_cast<void *>(stage.pNext);
+    stage.pNext = &required;
+    const u32 local_x = LabSpirvLocalSizeX(spirv);
+    if (m_lab_full_subgroups && local_x != 0 && local_x % 32u == 0) {
+      stage.flags |= vk::PipelineShaderStageCreateFlagBits::eRequireFullSubgroups;
+    }
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
@@ -8424,6 +8493,8 @@ public:
       observer_stage.stage = vk::ShaderStageFlagBits::eCompute;
       observer_stage.module = ms_depth_module;
       observer_stage.pName = "main";
+      vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo lab_required_size{};
+      LabRequireHost32(observer_stage, lab_required_size, GPU_TEST_MS_DEPTH_SPV);
       vk::ComputePipelineCreateInfo observer_pipeline_info{};
       observer_pipeline_info.sType =
           vk::StructureType::eComputePipelineCreateInfo;
@@ -13888,6 +13959,10 @@ public:
 
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
+    if (m_lab_feedback_missing) { // expects feedback loops for sampled depth/stencil writes
+      std::printf("[lab] SKIPPED: %s needs attachment feedback loops\n", name);
+      return;
+    }
     constexpr uintptr_t base = 0x0000000203600000ull;
     constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -17462,6 +17537,8 @@ public:
     stage.stage = vk::ShaderStageFlagBits::eCompute;
     stage.module = module;
     stage.pName = "main";
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo lab_required_size{};
+    LabRequireHost32(stage, lab_required_size, compiled.spirv);
 
     vk::ComputePipelineCreateInfo pipeline_info{};
     pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
@@ -17850,6 +17927,10 @@ public:
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
+    if (depth_feedback && m_lab_feedback_missing) {
+      std::printf("[lab] SKIPPED: %s needs attachment feedback loops\n", name);
+      return;
+    }
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
     switch (color_format) {
@@ -18113,7 +18194,9 @@ public:
       }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (!m_lab_feedback_missing) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -19336,6 +19419,11 @@ public:
     stages[1].stage = vk::ShaderStageFlagBits::eFragment;
     stages[1].module = fragment_module;
     stages[1].pName = "main";
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo lab_fragment_size{};
+    if (m_lab_fragment_host32) {
+      lab_fragment_size.requiredSubgroupSize = 32;
+      stages[1].pNext = &lab_fragment_size;
+    }
 
     vk::VertexInputBindingDescription vertex_binding{};
     vertex_binding.binding = 0;
@@ -20788,6 +20876,11 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_lab_full_subgroups = false;
+  // LAB: rasterization runs without attachment feedback loops (only with
+  // KYTY_LAB_RASTER_OPTIONAL_FEEDBACK=1 on a device without the dynamic state).
+  bool m_lab_feedback_missing = false;
+  bool m_lab_fragment_host32 = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20824,7 +20917,8 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.conditional_rendering_enabled = true;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_enabled =
+        m_rasterization_supported && !m_lab_feedback_missing;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
@@ -20891,6 +20985,13 @@ private:
               m_instance.enumeratePhysicalDevices(&physical_count,
                                                   physical_devices.data()),
               "vkEnumeratePhysicalDevices");
+    // LAB (KytyLab, not for upstream): KYTY_GPU_INDEX=<n> considers only physical device n.
+    if (const char *index = std::getenv("KYTY_GPU_INDEX")) {
+      const auto i = static_cast<size_t>(std::atoi(index));
+      Require("VulkanHarness", "dispatch", i < physical_devices.size(),
+              "KYTY_GPU_INDEX is out of range");
+      physical_devices = {physical_devices[i]};
+    }
 
     for (auto physical : physical_devices) {
       u32 queue_count = 0;
@@ -20943,6 +21044,25 @@ private:
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
+    // LAB (KytyLab, not for upstream): identity and subgroup limits of the selected device.
+    vk::PhysicalDeviceSubgroupSizeControlProperties lab_size_control{};
+    {
+      vk::PhysicalDeviceDriverProperties driver{};
+      driver.pNext = &lab_size_control;
+      vk::PhysicalDeviceSubgroupProperties subgroup{};
+      subgroup.pNext = &driver;
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &subgroup;
+      m_physical_device.getProperties2(&properties);
+      const auto &device = properties.properties;
+      std::printf("[lab] device: %s (vendor 0x%04x, device 0x%04x), driver: %s, %s, "
+                  "Vulkan %u.%u.%u, subgroup default %u min %u max %u\n",
+                  device.deviceName.data(), device.vendorID, device.deviceID,
+                  driver.driverName.data(), driver.driverInfo.data(),
+                  VK_API_VERSION_MAJOR(device.apiVersion), VK_API_VERSION_MINOR(device.apiVersion),
+                  VK_API_VERSION_PATCH(device.apiVersion), subgroup.subgroupSize,
+                  lab_size_control.minSubgroupSize, lab_size_control.maxSubgroupSize);
+    }
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -21034,8 +21154,15 @@ private:
                                 available_clip_control.depthClipControl &&
                                 available_color_write.colorWriteEnable &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                                (available_feedback_dynamic.attachmentFeedbackLoopDynamicState ||
+                                 LabRasterOptionalFeedback()) &&
                                 available_provoking_vertex.provokingVertexLast;
+    m_lab_feedback_missing = m_rasterization_supported &&
+                             !available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
+    if (m_lab_feedback_missing) {
+      std::printf("[lab] rasterization without attachment feedback loops "
+                  "(no attachmentFeedbackLoopDynamicState)\n");
+    }
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -21073,6 +21200,31 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    if (LabHost32()) {
+      Require("VulkanHarness", "lab host32",
+              available_features13.subgroupSizeControl == true &&
+                  lab_size_control.minSubgroupSize <= 32 &&
+                  lab_size_control.maxSubgroupSize >= 32 &&
+                  (lab_size_control.requiredSubgroupSizeStages &
+                   vk::ShaderStageFlagBits::eCompute),
+              "the device cannot require subgroup size 32 for compute");
+      device_features13.subgroupSizeControl = true;
+      device_features13.computeFullSubgroups = available_features13.computeFullSubgroups;
+      m_lab_full_subgroups = available_features13.computeFullSubgroups == true;
+      std::printf("[lab] host32 mode: subgroup 32 required, full subgroups %s\n",
+                  m_lab_full_subgroups ? "when LocalSize X % 32 == 0" : "unavailable");
+    }
+    if (LabFragmentHost32()) {
+      m_lab_fragment_host32 = available_features13.subgroupSizeControl == true &&
+                              lab_size_control.minSubgroupSize <= 32 &&
+                              lab_size_control.maxSubgroupSize >= 32 &&
+                              bool(lab_size_control.requiredSubgroupSizeStages &
+                                   vk::ShaderStageFlagBits::eFragment);
+      device_features13.subgroupSizeControl |= m_lab_fragment_host32;
+      std::printf("[lab] fragment host32: %s\n",
+                  m_lab_fragment_host32 ? "fragment stage requires subgroup size 32"
+                                        : "unavailable (requiredSubgroupSizeStages lacks FRAGMENT)");
+    }
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -21095,7 +21247,9 @@ private:
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.pNext = m_lab_feedback_missing
+                                   ? static_cast<void *>(&feedback_layout)
+                                   : static_cast<void *>(&feedback_dynamic);
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -21150,8 +21304,10 @@ private:
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (!m_lab_feedback_missing) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -21669,7 +21825,31 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
     vulkan->SkipRasterizationCases(1);
     return;
   }
+  if (vulkan != nullptr && LabFragmentHost32() && !vulkan->LabFragmentHost32Active()) {
+    std::printf("[lab] SKIPPED: %s needs a required fragment subgroup size of 32\n", test.name);
+    vulkan->SkipRasterizationCases(1);
+    return;
+  }
   auto compiled = CompileFragmentCase(test);
+  // LAB (KytyLab, not for upstream): KYTY_LAB_FRAGMENT_DUMP=<file> writes the case's
+  // compiled fragment SPIR-V before any replacement.
+  if (const char *path = std::getenv("KYTY_LAB_FRAGMENT_DUMP")) {
+    std::FILE *file = std::fopen(path, "wb");
+    Require(test.name, "lab fragment dump", file != nullptr, "cannot create the SPIR-V file");
+    std::fwrite(compiled.spirv.data(), sizeof(u32), compiled.spirv.size(), file);
+    std::fclose(file);
+    std::printf("[lab] fragment SPIR-V written to %s (%zu words)\n", path, compiled.spirv.size());
+  }
+  // LAB (KytyLab, not for upstream): KYTY_LAB_FRAGMENT_SPV=<file> replaces the
+  // fragment SPIR-V, for driver experiments with the case's draw.
+  if (const char *path = std::getenv("KYTY_LAB_FRAGMENT_SPV")) {
+    std::FILE *file = std::fopen(path, "rb");
+    Require(test.name, "lab fragment spirv", file != nullptr, "cannot open the SPIR-V file");
+    compiled.spirv.resize(1u << 16u);
+    compiled.spirv.resize(std::fread(compiled.spirv.data(), sizeof(u32), compiled.spirv.size(), file));
+    std::fclose(file);
+    std::printf("[lab] fragment SPIR-V replaced by %s (%zu words)\n", path, compiled.spirv.size());
+  }
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
@@ -49717,6 +49897,247 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, test);
       }
     }
+    return 0;
+  }
+  // LAB (KytyLab, not for upstream): per-case runner for the host32 sweep.
+  // --lab-cases lists every MakeCases() entry and the standalone compute checks;
+  // --lab-case <index> runs one MakeCases() entry and --lab-check <name> one
+  // check, each in its own process so one failure does not hide the rest.
+  // A production rasterization check, reported skipped on a device without it.
+  const auto raster = [](void (*check)(VulkanHarness &)) {
+    return [check](VulkanHarness &v) {
+      if (!v.RasterizationSupported()) {
+        std::printf("[lab] SKIPPED: no production rasterization\n");
+        return;
+      }
+      check(v);
+    };
+  };
+  const auto host = [](void (*check)()) { return [check](VulkanHarness &) { check(); }; };
+  const auto renderer = [](void (*check)(RenderContext &)) {
+    return [check](VulkanHarness &v) { check(v.RuntimeRenderer()); };
+  };
+  const std::vector<std::pair<const char *, std::function<void(VulkanHarness &)>>> lab_checks = {
+      {"BoundedFormattedBufferCopy", CheckBoundedFormattedBufferCopy},
+      {"IndirectBufferStore", CheckIndirectBufferStore},
+      {"RuntimeBufferRecords", CheckRuntimeBufferRecords},
+      {"ComputeThreadDimensions", CheckComputeThreadDimensions},
+      {"CountedRowImageSelector", CheckCountedRowImageSelector},
+      {"PointerImageTable", CheckPointerImageTable},
+      {"GuardedRecordImageTable", CheckGuardedRecordImageTable},
+      {"IndirectImageKeySwitch", CheckIndirectImageKeySwitch},
+      {"DynamicSampleOffsets32", [](VulkanHarness &v) { CheckDynamicSampleOffsets(v, 32u); }},
+      {"DynamicSampleOffsets64", [](VulkanHarness &v) { CheckDynamicSampleOffsets(v, 64u); }},
+      {"FiniteInlineSamplerPhi", CheckFiniteInlineSamplerPhi},
+      {"ComputeLdsLimit", CheckComputeLdsLimit},
+      {"LdsStorageFallbackVariants",
+       [](VulkanHarness &v) {
+         for (auto test : {DsWideLdsPartialBounds(), DsAtomic64Bounds(false),
+                           DsAtomic64Bounds(true), DsAtomicReturn64()}) {
+           test.compute_info.lds_storage = true;
+           std::erase(test.required_spirv, "WorkgroupMemoryExplicitLayoutKHR");
+           test.required_spirv.push_back("StorageBuffer");
+           RunCase(&v, test);
+         }
+       }},
+      {"SamplerBorderColors", [](VulkanHarness &v) { v.CheckSamplerBorderColors(); }},
+      {"PackedTextureComponents", [](VulkanHarness &v) { v.CheckPackedTextureComponents(); }},
+      {"CubeFaceStorageExpansion", [](VulkanHarness &v) { v.CheckCubeFaceStorageExpansion(); }},
+      {"ComparisonDepthTexture",
+       raster([](VulkanHarness &v) { v.CheckComparisonDepthTexture(); })},
+      {"RenderExecutorStencilBindingDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorStencilBindingDiscovery(); })},
+      // The other production rasterization checks of the full run.
+      {"GraphicsPushConstantBank",
+       raster([](VulkanHarness &v) { v.CheckGraphicsPushConstantBank(); })},
+      {"RenderExecutorColorDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColorDiscovery(); })},
+      {"RenderExecutorColor1DArrayDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColor1DArrayDiscovery(); })},
+      {"RenderExecutorColorVolumeDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColorVolumeDiscovery(); })},
+      {"RenderExecutorColorMetadataClear",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColorMetadataClear(); })},
+      {"SampledDccClear", raster([](VulkanHarness &v) { v.CheckSampledDccClear(); })},
+      {"RenderExecutorColorStandardTileDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColorStandardTileDiscovery(); })},
+      {"RenderExecutorColorDepthTileDiscovery",
+       raster([](VulkanHarness &v) { v.CheckRenderExecutorColorDepthTileDiscovery(); })},
+      {"Bgra16Readback", raster([](VulkanHarness &v) { v.CheckBgra16Readback(); })},
+      {"DepthAttachmentFeedback", raster([](VulkanHarness &v) { v.CheckRasterization(true); })},
+      {"PolygonModeRasterization", raster([](VulkanHarness &v) { v.CheckRasterization(false); })},
+      {"PackedFloatVertexColor",
+       raster([](VulkanHarness &v) {
+         v.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
+       })},
+      {"PackedUscaledVertexColor",
+       raster([](VulkanHarness &v) {
+         v.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+       })},
+      {"BufferCacheDirtyGarbageCollection",
+       raster([](VulkanHarness &v) { v.CheckBufferCacheDirtyGarbageCollection(); })},
+      // The remaining standalone checks of the full run.
+      {"BoundedRecordBufferAccess", CheckBoundedRecordBufferAccess},
+      {"GpuSelectedRecordBufferAccess", CheckGpuSelectedRecordBufferAccess},
+      {"GuardedWaterfallBufferRecords", CheckGuardedWaterfallBufferRecords},
+      {"GpuSelectedFormattedRecordStore", CheckGpuSelectedFormattedRecordStore},
+      {"FiniteBufferSelection", CheckFiniteBufferSelection},
+      {"SharedIndirectBufferLoads", CheckSharedIndirectBufferLoads},
+      {"NestedPointerImageTable", CheckNestedPointerImageTable},
+      {"FiniteFirstLaneImageChoice", CheckFiniteFirstLaneImageChoice},
+      {"Signed16ImageStore", CheckSigned16ImageStore},
+      {"SchedulerTimeline", [](VulkanHarness &v) { v.CheckSchedulerTimeline(); }},
+      {"HostImageAllocation", [](VulkanHarness &v) { v.CheckHostImageAllocation(); }},
+      {"DescriptorHeapLargeSet", [](VulkanHarness &v) { v.CheckDescriptorHeapLargeSet(); }},
+      {"GpuMappedRangeLifecycle", [](VulkanHarness &v) { v.CheckGpuMappedRangeLifecycle(); }},
+      {"StreamBufferRing", [](VulkanHarness &v) { v.CheckStreamBufferRing(); }},
+      {"GpuTilerCpuParity", [](VulkanHarness &v) { v.CheckGpuTilerCpuParity(); }},
+      {"NativeIndirectDispatch", [](VulkanHarness &v) { v.CheckNativeIndirectDispatch(); }},
+      {"NullTextureDescriptors", [](VulkanHarness &v) { v.CheckNullTextureDescriptors(); }},
+      {"BdaPageTableUploads", [](VulkanHarness &v) { v.CheckBdaPageTableUploads(); }},
+      {"BdaSyncUploads", [](VulkanHarness &v) { v.CheckBdaSyncUploads(); }},
+      {"LargeSparseImageUpload", [](VulkanHarness &v) { v.CheckLargeSparseImageUpload(); }},
+      {"UnifiedTextureCacheFlow", [](VulkanHarness &v) { v.CheckUnifiedTextureCacheFlow(); }},
+      {"UnifiedImageViewCache", [](VulkanHarness &v) { v.CheckUnifiedImageViewCache(); }},
+      {"GpuSuspendPoint", [](VulkanHarness &v) { v.CheckGpuSuspendPoint(); }},
+      {"GpuCommandLane", [](VulkanHarness &v) { v.CheckGpuCommandLane(); }},
+      {"ScalarLeafCall", [](VulkanHarness &v) { v.CheckScalarLeafCall(); }},
+      {"AgcSystemTable", renderer(CheckAgcSystemTable)},
+      {"Pm4AcquireMemPackets", renderer(CheckPm4AcquireMemPackets)},
+      {"Pm4SyntheticOcclusionCounterDump", renderer(CheckPm4SyntheticOcclusionCounterDump)},
+      {"Pm4Predication", renderer(CheckPm4Predication)},
+      {"Pm4StencilInfoValueLane", renderer(CheckPm4StencilInfoValueLane)},
+      {"Pm4NativeTargetGeometryRegisters", renderer(CheckPm4NativeTargetGeometryRegisters)},
+      {"Pm4IndirectShaderRegisters", renderer(CheckPm4IndirectShaderRegisters)},
+      {"Pm4IndirectUconfigRegisters", renderer(CheckPm4IndirectUconfigRegisters)},
+      {"Pm4DirectShaderRegisterFallback", renderer(CheckPm4DirectShaderRegisterFallback)},
+      {"Pm4GuardBandRegisterRanges", renderer(CheckPm4GuardBandRegisterRanges)},
+      {"Pm4BlendColorRegisterRanges", renderer(CheckPm4BlendColorRegisterRanges)},
+      {"Pm4PolygonOffsetRegisters", renderer(CheckPm4PolygonOffsetRegisters)},
+      {"Pm4DepthControlHighBits", renderer(CheckPm4DepthControlHighBits)},
+      {"Pm4DepthRenderOverride", renderer(CheckPm4DepthRenderOverride)},
+      {"Pm4WaitPackets", renderer(CheckPm4WaitPackets)},
+      {"Pm4DrawIndirectMultiPacket", renderer(CheckPm4DrawIndirectMultiPacket)},
+      {"Pm4ContextStateOperations", renderer(CheckPm4ContextStateOperations)},
+      {"Pm4IndirectControlFlow", renderer(CheckPm4IndirectControlFlow)},
+      {"Pm4WaitResume", renderer(CheckPm4WaitResume)},
+      {"Pm4RewindResume", renderer(CheckPm4RewindResume)},
+      {"Pm4CeCompletion", renderer(CheckPm4CeCompletion)},
+      {"ImageSamplerSpecialization", host(CheckImageSamplerSpecialization)},
+      {"ResourcePlanHandoff", host(CheckResourcePlanHandoff)},
+      {"NativeImageDescriptorTypes", host(CheckNativeImageDescriptorTypes)},
+      {"ClipControlDepthClipState", host(CheckClipControlDepthClipState)},
+      {"ReferenceClockScale", host(CheckReferenceClockScale)},
+      {"ErrorDialogLifecycle", host(CheckErrorDialogLifecycle)},
+      {"SigninDialogLifecycle", host(CheckSigninDialogLifecycle)},
+      {"Vulkan13FeatureRequirements", host(CheckVulkan13FeatureRequirements)},
+      {"ShaderFusion", host(CheckShaderFusion)},
+      {"EmbeddedFetchVertexOffset", host(CheckEmbeddedFetchVertexOffset)},
+      {"EmbeddedFetchLaneSpill", host(CheckEmbeddedFetchLaneSpill)},
+      {"TessellationPrograms", host(CheckTessellationPrograms)},
+      {"PixelParameterAliases", host(CheckPixelParameterAliases)},
+      {"PixelFrontFaceModes", host(CheckPixelFrontFaceModes)},
+      {"RectListShaders", host(CheckRectListShaders)},
+      {"Wave64WholeWaveResults", host(CheckWave64WholeWaveResults)},
+      {"Ps5GameExampleImageClearRuntimeShape", host(CheckPs5GameExampleImageClearRuntimeShape)},
+      {"DepthFeedbackAspects", host(CheckDepthFeedbackAspects)},
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+      {"ImageTransitionState", renderer(CheckImageTransitionState)},
+      {"RenderTargetFormatContract", host(CheckRenderTargetFormatContract)},
+      {"SampledColorViews", host(CheckSampledColorViews)},
+      {"SampledDepthResource", host(CheckSampledDepthResource)},
+      {"DepthTextureEncoding", host(CheckDepthTextureEncoding)},
+      {"BasicStorageTextureDescriptor", host(CheckBasicStorageTextureDescriptor)},
+      {"StorageTextureLinearUploadLayout", host(CheckStorageTextureLinearUploadLayout)},
+      {"StorageTextureDepthTileUploadLayout", host(CheckStorageTextureDepthTileUploadLayout)},
+      {"Standard64RenderTargetTileRoundTrip", host(CheckStandard64RenderTargetTileRoundTrip)},
+      {"StorageTextureVolumeUploadLayout", host(CheckStorageTextureVolumeUploadLayout)},
+      {"StorageTextureVolumeMipRegions", host(CheckStorageTextureVolumeMipRegions)},
+      {"StorageTextureGpuOwnedRebindState", host(CheckStorageTextureGpuOwnedRebindState)},
+      {"NativeMsaaState", host(CheckNativeMsaaState)},
+      {"Ps5DepthRegisterDecoding", host(CheckPs5DepthRegisterDecoding)},
+      {"DepthHtileStencilCompatibility", host(CheckDepthHtileStencilCompatibility)},
+      {"DepthAttachmentWrites", host(CheckDepthAttachmentWrites)},
+      {"DynamicRenderingState", host(CheckDynamicRenderingState)},
+      {"DepthTargetFootprints", host(CheckDepthTargetFootprints)},
+      {"SlotVectorLifetime", host(CheckSlotVectorLifetime)},
+#endif
+  };
+  if (argc == 2 && std::strcmp(argv[1], "--lab-cases") == 0) {
+    const auto tests = MakeCases();
+    for (size_t i = 0; i < tests.size(); i++) {
+      const auto &test = tests[i];
+      const auto &info = test.compute_info;
+      std::printf("case\t%zu\t%s\twave%u\t%ux%ux%u\tlds=%u\tlds_storage=%d\tcompute_info=%d\t"
+                  "compile_only=%d\tdispatch=%ux%ux%u\t",
+                  i, test.name, test.has_compute_info ? info.wave_size : 64u,
+                  info.threads_num[0], info.threads_num[1], info.threads_num[2],
+                  info.lds_size_dwords, info.lds_storage ? 1 : 0,
+                  test.has_compute_info ? 1 : 0, test.compile_only ? 1 : 0, test.dispatch_x,
+                  test.dispatch_y, test.dispatch_z);
+      for (size_t j = 0; j < test.opcodes.size(); j++) {
+        const auto name = magic_enum::enum_name(test.opcodes[j]);
+        std::printf("%s%.*s", j == 0 ? "" : ",", static_cast<int>(name.size()), name.data());
+      }
+      std::printf("\n");
+    }
+    for (const auto &[name, check] : lab_checks) {
+      std::printf("check\t%s\n", name);
+    }
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--lab-case") == 0) {
+    const auto tests = MakeCases();
+    const auto &test = tests.at(std::strtoul(argv[2], nullptr, 10));
+    VulkanHarness vulkan;
+    RunCase(&vulkan, test);
+    std::printf("[lab] PASS %s\n", test.name);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--lab-check") == 0) {
+    const auto check = std::ranges::find_if(
+        lab_checks, [&](const auto &item) { return std::strcmp(item.first, argv[2]) == 0; });
+    Require(argv[2], "lab check", check != lab_checks.end(), "unknown check");
+    VulkanHarness vulkan;
+    check->second(vulkan);
+    std::printf("[lab] PASS %s\n", argv[2]);
+    return 0;
+  }
+  // LAB: --lab-graphics-cases lists every MakeGraphicsCases() entry and
+  // --lab-graphics-case <index> runs one of them.
+  if (argc == 2 && std::strcmp(argv[1], "--lab-graphics-cases") == 0) {
+    const auto tests = MakeGraphicsCases();
+    for (size_t i = 0; i < tests.size(); i++) {
+      const auto &test = tests[i];
+      std::printf("%zu\t%s\tsamples=%u\tlayers=%u\twidth=%u\tprovoking_last=%d\t", i, test.name,
+                  static_cast<u32>(test.samples), test.layers, test.width,
+                  test.provoking_vtx_last ? 1 : 0);
+      for (size_t j = 0; j < test.opcodes.size(); j++) {
+        const auto name = magic_enum::enum_name(test.opcodes[j]);
+        std::printf("%s%.*s", j == 0 ? "" : ",", static_cast<int>(name.size()), name.data());
+      }
+      std::printf("\n");
+    }
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--lab-graphics-case") == 0) {
+    const auto tests = MakeGraphicsCases();
+    const auto &test = tests.at(std::strtoul(argv[2], nullptr, 10));
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, test);
+    std::printf(vulkan.SkippedCaseCount() != 0 ? "[lab] SKIPPED: %s, no production rasterization\n"
+                                               : "[lab] PASS %s\n",
+                test.name);
+    return 0;
+  }
+  // LAB: --lab-graphics-spirv <index> <file> writes that case's fragment SPIR-V (no GPU).
+  if (argc == 4 && std::strcmp(argv[1], "--lab-graphics-spirv") == 0) {
+    const auto compiled =
+        CompileFragmentCase(MakeGraphicsCases().at(std::strtoul(argv[2], nullptr, 10)));
+    std::FILE *file = std::fopen(argv[3], "wb");
+    Require(argv[3], "lab graphics spirv", file != nullptr, "cannot open the output file");
+    std::fwrite(compiled.spirv.data(), sizeof(u32), compiled.spirv.size(), file);
+    std::fclose(file);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
