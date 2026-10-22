@@ -25,6 +25,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -495,6 +496,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
+	// Lab (#1511): request maximal reconvergence only when KYTY_LAB_MAXIMAL_RECONVERGENCE is set.
+	const bool maximal_reconvergence_extension =
+	    std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr &&
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence {};
+	if (maximal_reconvergence_extension) {
+		maximal_reconvergence.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &maximal_reconvergence;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -582,6 +592,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.maximal_reconvergence_enabled =
+	    maximal_reconvergence_extension && maximal_reconvergence.shaderMaximalReconvergence;
+	LOGF("Vulkan maximal reconvergence (lab, KYTY_LAB_MAXIMAL_RECONVERGENCE): requested=%s enabled=%s\n",
+	     std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr ? "true" : "false",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
@@ -690,6 +705,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.maximal_reconvergence_enabled) {
+		maximal_reconvergence.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext           = &maximal_reconvergence;
 	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
@@ -1076,6 +1095,11 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Lab (#1511): only with KYTY_LAB_MAXIMAL_RECONVERGENCE, so runs without it match main.
+		if (std::getenv("KYTY_LAB_MAXIMAL_RECONVERGENCE") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

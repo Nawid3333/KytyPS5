@@ -36,6 +36,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
+	// Lab (#1511): KYTY_LAB_MAXIMAL_RECONVERGENCE=1 and VK_KHR_shader_maximal_reconvergence.
+	bool                               maximal_reconvergence_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

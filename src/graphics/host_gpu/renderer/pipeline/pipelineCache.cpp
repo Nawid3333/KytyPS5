@@ -499,7 +499,8 @@ struct PipelineCache::ProgramCache {
 	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	      profile {.maintenance8 = graphics.maintenance8_enabled,
 		           .native_float_min_max =
-		               graphics.physical_device_properties.vendorID == 0x1002u} {
+		               graphics.physical_device_properties.vendorID == 0x1002u,
+		           .maximal_reconvergence = graphics.maximal_reconvergence_enabled} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
