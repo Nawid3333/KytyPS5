@@ -2712,7 +2712,7 @@ public:
     write(compute_list.data(), &async_value, 29);
     // A frame can contain many lists; completing them must not age either cache.
     for (uint32_t i = 0; i < 32; ++i) {
-      gpu.Submit(graphics_list, {});
+      gpu.Submit(graphics_list);
       gpu.SubmitCompute(0x20, compute_list);
     }
     finish();
@@ -2832,7 +2832,7 @@ public:
       release_lane.acquire();
     });
     lane_entered.acquire();
-    gpu.Submit(before, {});
+    gpu.Submit(before);
     std::binary_semaphore queued_returned{0};
     std::jthread queued([&] {
       gpu.SuspendPoint();
@@ -2849,7 +2849,7 @@ public:
               "suspend-point insertion drained pending guest graphics");
     }
     queued.join();
-    gpu.Submit(after, {});
+    gpu.Submit(after);
     release_lane.release();
     bool prefix_reached = false;
     bool graphics_ordered = false;
@@ -2943,7 +2943,7 @@ public:
             std::array<uint32_t, 8> packet{};
             const auto address = reinterpret_cast<uint64_t>(destination);
             const auto event_index = (action >= 0x2fu ? 6u : 5u);
-            packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+            packet[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
             packet[1] = action | (event_index << 8u) | (gcr_cntl << 12u);
             packet[2] = (interrupt_selector << 24u) | (data_sel << 29u);
             packet[3] = static_cast<uint32_t>(address);
@@ -3000,8 +3000,7 @@ public:
           auto packet = make_release_mem(0, 0, nullptr, 0);
           Pm4Execution execution;
           const auto result = processor->Process(execution, packet);
-          processor->IncrementDe();
-          const bool cache_and_counter_did_not_submit =
+          const bool cache_event_did_not_submit =
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
@@ -3039,10 +3038,10 @@ public:
           const auto interrupt_result =
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
-              cache_and_counter_did_not_submit &&
+              cache_event_did_not_submit &&
               cb_db_release_did_not_submit &&
               interrupt_result == Pm4ProcessResult::Complete &&
-              gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+              gpu_scheduler.CurrentTick() == interrupt_tick &&
               interrupt_only_gds_label == UINT64_MAX;
         });
         parser_complete.release();
@@ -3067,8 +3066,7 @@ public:
               "CPU-only unmap submitted or waited for unrelated native work");
       Require("GpuCommandLane", "nonblocking GPU packets",
               parser_did_not_wait_gpu && parser_kept_nonblocking_boundaries,
-              "a cache event, GL2 writeback, DE counter, or interrupt boundary "
-              "used the wrong "
+              "a cache event, GL2 writeback, or interrupt used the wrong "
               "submission behavior");
 
       alignas(uint64_t) uint64_t release_label = 0;
@@ -3077,27 +3075,33 @@ public:
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
-        const auto clock_before = Sync::ReadReferenceClock();
-        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
-                                     &release_label, UINT64_MAX, 2);
-        Require("GpuCommandLane", "EOP reference clock with interrupt",
-                release_label >= clock_before &&
-                    release_label <= Sync::ReadReferenceClock(),
-                "clock write with writeback and interrupt lost its data");
-
-        for (const auto interrupt : {0u, 3u, 1u, 2u}) {
-          release_label = 0;
-          auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
-          Pm4Execution immediate_execution;
-          const auto immediate_tick = gpu_scheduler.CurrentTick();
-          const auto immediate_result =
-              processor->Process(immediate_execution, immediate);
-          Require("GpuCommandLane", "32-bit release boundary",
-                  immediate_result == Pm4ProcessResult::Complete &&
-                      gpu_scheduler.CurrentTick() ==
-                          immediate_tick + (interrupt == 1 || interrupt == 2) &&
-                      release_label == (interrupt == 1 ? 0 : 0x11223344u),
-                  "label-only release submitted work or interrupt release lost its boundary");
+        // Every end-of-pipe and end-of-shader action, with or without GL2
+        // writeback, writes each label size and submits nothing for its interrupt.
+        for (const uint32_t action : {0x04u, 0x14u, 0x28u, 0x2bu, 0x2du, 0x2fu, 0x30u}) {
+          for (const uint32_t gcr : {0u, 1u << 9u}) {
+            for (const uint32_t data_sel : {1u, 2u, 3u}) {
+              release_label = 0;
+              const auto clock_before = Sync::ReadReferenceClock();
+              auto release = make_release_mem(data_sel, 2, &release_label,
+                                              0x1122334455667788ull, action, gcr);
+              release[3] |= 1u; // ADDRESS_LO starts at bit 2.
+              Pm4Execution release_execution;
+              const auto release_tick = gpu_scheduler.CurrentTick();
+              const auto release_result =
+                  processor->Process(release_execution, release);
+              bool label_written =
+                  release_label == (data_sel == 1 ? 0x55667788ull : 0x1122334455667788ull);
+              if (data_sel == 3) {
+                label_written = release_label >= clock_before &&
+                                release_label <= Sync::ReadReferenceClock();
+              }
+              Require("GpuCommandLane", "release with write-confirm interrupt",
+                      release_result == Pm4ProcessResult::Complete &&
+                          label_written &&
+                          gpu_scheduler.CurrentTick() == release_tick,
+                      "an end-of-pipe action lost its label or submitted work");
+            }
+          }
         }
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
@@ -3106,14 +3110,6 @@ public:
         const auto gds_result = processor->Process(gds_execution, gds);
         const bool gds_waited_once =
             gpu_scheduler.CurrentTick() == gds_tick + 1;
-
-        auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
-        Pm4Execution interrupt_execution;
-        const auto interrupt_tick = gpu_scheduler.CurrentTick();
-        const auto interrupt_result =
-            processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -3124,9 +3120,7 @@ public:
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
         release_mem_submission_counts =
-            gds_result == Pm4ProcessResult::Complete &&
-            gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            gds_result == Pm4ProcessResult::Complete && gds_waited_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -3136,10 +3130,9 @@ public:
       });
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
-                  static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its GDS readback or retained a redundant GPU "
+              "wait");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
@@ -3163,7 +3156,7 @@ public:
       graphics_gate_entered.release();
       graphics_gate_release.acquire();
     });
-    gpu.Submit(live_graphics_commands, {});
+    gpu.Submit(live_graphics_commands);
     graphics_gate_entered.acquire();
     live_graphics_commands[4] = 22;
     graphics_gate_release.release();
@@ -3212,7 +3205,7 @@ public:
            void *destination, uint64_t value, uint32_t context_id) {
           std::array<uint32_t, 8> packet{};
           const auto address = reinterpret_cast<uint64_t>(destination);
-          packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+          packet[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
           packet[1] = 0x28u | (5u << 8u);
           packet[2] = (interrupt_selector << 24u) | (data_selector << 29u);
           packet[3] = static_cast<uint32_t>(address);
@@ -3222,10 +3215,11 @@ public:
           packet[7] = context_id & 0x07ffffffu;
           return packet;
         };
+    // Waits only for submitted work, so an interrupt arrives only through its
+    // end-of-slice flush.
     const auto finish_gpu = [&] {
       gpu.SendCommandSync([&] {
         auto &scheduler = context.GetCommandScheduler();
-        scheduler.Finish();
         scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
       });
     };
@@ -3236,11 +3230,11 @@ public:
               interrupt_queue, &event, 1, &count, &timeout);
         };
 
+    // kDataAfterWriteConfirm writes its label without an interrupt.
     uint32_t no_interrupt_graphics_value = 0;
-    std::array<uint32_t, 5> no_interrupt_graphics_commands{};
-    write_packet(no_interrupt_graphics_commands.data(),
-                 &no_interrupt_graphics_value, 55);
-    gpu.Submit(no_interrupt_graphics_commands, {});
+    auto no_interrupt_graphics_commands =
+        make_interrupt_packet(1, 3, &no_interrupt_graphics_value, 55, 0);
+    gpu.Submit(no_interrupt_graphics_commands);
     gpu.WaitForIdle();
     finish_gpu();
 
@@ -3251,7 +3245,8 @@ public:
     Require("GpuCommandLane", "no implicit graphics interrupt",
             no_graphics_interrupt_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
                 interrupt_count == 0 && no_interrupt_graphics_value == 55,
-            "graphics submission completion synthesized an interrupt");
+            "kDataAfterWriteConfirm or graphics submission completion raised an "
+            "interrupt");
 
     auto live_interrupt_commands =
         make_interrupt_packet(0, 1, nullptr, 0, 0x234u);
@@ -3280,7 +3275,7 @@ public:
     uint32_t graphics_interrupt_label = 0xa5a5a5a5u;
     auto graphics_interrupt_commands = make_interrupt_packet(
         1, 1, &graphics_interrupt_label, 0x11223344u, 0);
-    gpu.Submit(graphics_interrupt_commands, {});
+    gpu.Submit(graphics_interrupt_commands);
     gpu.WaitForIdle();
     finish_gpu();
 
@@ -3354,6 +3349,51 @@ public:
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
+    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x789u);
+    gpu.SubmitCompute(0x20, send_context_commands);
+    gpu.WaitForIdle();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto send_context_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "kSendIntCtx interrupt",
+            send_context_wait == 0 && interrupt_count == 1 &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == 0x789u,
+            "kSendIntCtx lost its interrupt or context id");
+
+    // A GDS release interrupt follows the interrupts queued before it, so
+    // neither arrives while the priority thread is parked.
+    std::binary_semaphore priority_parked{0};
+    gpu.SendCommandSync([&] {
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Finish();
+      scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+    });
+    uint32_t ordered_gds_label = 0;
+    const auto ordered_first = make_interrupt_packet(0, 2, nullptr, 0, 0xa1u);
+    const auto ordered_gds =
+        make_interrupt_packet(5, 2, &ordered_gds_label, 1u << 16u, 0xa2u);
+    std::array<uint32_t, 16> ordered_commands{};
+    std::copy(ordered_first.begin(), ordered_first.end(), ordered_commands.begin());
+    std::copy(ordered_gds.begin(), ordered_gds.end(), ordered_commands.begin() + 8);
+    gpu.SubmitCompute(0x20, ordered_commands);
+    gpu.WaitForIdle();
+    interrupt_count = 0;
+    const auto parked_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    priority_parked.release();
+    finish_gpu();
+    LibKernel::EventQueue::KernelEvent second_event{};
+    int second_count = 0;
+    interrupt_count = 0;
+    const auto first_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto second_wait = wait_for_interrupt(second_event, second_count);
+    Require("GpuCommandLane", "GDS interrupt order",
+            parked_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT && first_wait == 0 &&
+                interrupt_count == 1 && interrupt_event.data == 0xa1u &&
+                second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
+            "a GDS release interrupt overtook an earlier interrupt");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -3396,7 +3436,7 @@ public:
       stream_gate_entered.release();
       stream_gate_release.acquire();
     });
-    gpu.Submit(polling_commands, {});
+    gpu.Submit(polling_commands);
     stream_gate_entered.acquire();
     stream_gate_release.release();
     uint32_t packet_marker_a_at_callback = UINT32_MAX;
@@ -3447,7 +3487,7 @@ public:
     commands[14] = static_cast<uint32_t>(address(&suffix));
     commands[15] = static_cast<uint32_t>(address(&suffix) >> 32u);
     commands[16] = 22;
-      gpu.Submit(commands, {});
+      gpu.Submit(commands);
 
     std::binary_semaphore ordered_started{0};
     std::atomic<bool> ordered_finished{false};
@@ -3477,7 +3517,7 @@ public:
     label = 0;
     prefix = 0;
     suffix = 0;
-    gpu.Submit(commands, {});
+    gpu.Submit(commands);
 
     std::binary_semaphore unmap_complete{0};
     std::jthread unmap_thread([&] {
@@ -3618,7 +3658,7 @@ public:
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
-    gpu.Submit(dma_commands, {});
+    gpu.Submit(dma_commands);
     gpu.WaitForIdle();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
@@ -10907,8 +10947,8 @@ public:
           return base + (wave_size == 64 ? 0x8000u : 0u) + 0x100u + phase * 0x2000u;
         };
         for (u32 sgpr = 0; sgpr < 16; ++sgpr)
-          shaders.SetCsUserSgpr(sgpr, 0, HW::UserSgprType::Unknown);
-        shaders.SetCsUserSgpr(8, 0x92u, HW::UserSgprType::Unknown);
+          shaders.SetCsUserSgpr(sgpr, 0);
+        shaders.SetCsUserSgpr(8, 0x92u);
         for (u32 phase = 0; phase < 3; ++phase) {
           const auto &code = phase == 1 ? writer : reader;
           shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
@@ -10920,7 +10960,7 @@ public:
           output.fields[3] = DstSel(4, 5, 6, 7) |
               (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
           for (u32 i = 0; i < 4; ++i)
-            shaders.SetCsUserSgpr(12 + i, output.fields[i], HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(12 + i, output.fields[i]);
           ShaderComputeInputInfo input{};
           (void)context.GetPipelineCache().GetComputeProgram(
               shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
@@ -11012,7 +11052,7 @@ public:
       out.fields[3] = DstSel(4, 5, 6, 7) |
           (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
       for (u32 i = 0; i < 4; ++i)
-        shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(i, out.fields[i]);
       uint64_t original_id = 0;
       struct Case { uint64_t address; u32 value; bool update; u32 field = 0; };
       for (const auto test : {Case{first, 41, false}, Case{first, 41, false},
@@ -11123,7 +11163,7 @@ public:
             }
             user_data[6] = active_lanes;
             for (u32 i = 0; i < user_data.size(); ++i)
-              shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+              shaders.SetCsUserSgpr(i, user_data[i]);
             Require(name, "reset caller output", context.InvalidateMemory(output, wave_size * 4),
                     "caller output escaped mapped memory");
             std::array<float, 64> actual{};
@@ -11270,8 +11310,8 @@ public:
             out.fields[3] = DstSel(4, 5, 6, 7) |
                 (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
             for (u32 i = 0; i < 4; ++i) {
-              shaders.SetCsUserSgpr(i, input.fields[i], HW::UserSgprType::Unknown);
-              shaders.SetCsUserSgpr(i + 4, out.fields[i], HW::UserSgprType::Unknown);
+              shaders.SetCsUserSgpr(i, input.fields[i]);
+              shaders.SetCsUserSgpr(i + 4, out.fields[i]);
             }
             processor.DispatchDirect(1, 1, 1, wave == 32 ? 0x8041u : 0x41u);
             cache.ReadMemory(output, wave * sizeof(u32));
@@ -11381,11 +11421,9 @@ public:
               DstSel(4, 5, 6, 7) |
               (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
           for (u32 i = 0; i < 4; ++i)
-            shaders.SetCsUserSgpr(i, output.fields[i],
-                                  HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(i, output.fields[i]);
           for (u32 i = 0; i < 3; ++i)
-            shaders.SetCsUserSgpr(4 + i, i == 2 ? count : groups[i],
-                                  HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(4 + i, i == 2 ? count : groups[i]);
           processor.DispatchDirect(groups[0], groups[1], groups[2],
                                    wave_size == 32 ? 0x8049u : 0x49u);
           cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
@@ -11542,8 +11580,7 @@ public:
         descriptor.fields[3] = DstSel(4, 5, 6, 7) |
             (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
         for (u32 i = 0; i < 4; i++) {
-          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i],
-                               HW::UserSgprType::Unknown);
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i]);
         }
       };
       for (size_t index = 0; index < cases.size(); index++) {
@@ -11561,7 +11598,7 @@ public:
                                .wave_size = 64, .user_sgpr = 15});
           for (u32 i = 0; i < 3; i++) {
             set_buffer(i * 4u, args + i * 4u, 4);
-            shaders.SetCsUserSgpr(12u + i, test.dimensions[i], HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(12u + i, test.dimensions[i]);
           }
           processor.DispatchDirect(1, 1, 1, 0x41u);
         }
@@ -11640,8 +11677,7 @@ public:
                              .wave_size = 64, .user_sgpr = 15});
         for (u32 i = 0; i < 3; i++) {
           set_buffer(i * 4u, count_args + i * 4u, 4);
-          shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 1u,
-                               HW::UserSgprType::Unknown);
+          shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 1u);
         }
         processor.DispatchDirect(1, 1, 1, 0x41u);
         Require(name, "GPU-owned descriptor count", cache.HasGpuDirtyBytes(count_args, 4),
@@ -11730,8 +11766,8 @@ public:
                            .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
                            .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true,
                            .tgid_y_en = true, .tgid_z_en = true});
-      shaders.SetCsUserSgpr(0, static_cast<u32>(parameters), HW::UserSgprType::Unknown);
-      shaders.SetCsUserSgpr(1, static_cast<u32>(parameters >> 32u), HW::UserSgprType::Unknown);
+      shaders.SetCsUserSgpr(0, static_cast<u32>(parameters));
+      shaders.SetCsUserSgpr(1, static_cast<u32>(parameters >> 32u));
       const ShaderBufferResource table_buffer{{static_cast<u32>(table_address),
           static_cast<u32>(table_address >> 32u) | (148u << 16u), 2, 0x5204u}};
       LibKernel::Memory::WriteBacking(parameters, table_buffer.fields, sizeof(table_buffer.fields));
@@ -11860,7 +11896,7 @@ public:
                                .wave_size = 64, .user_sgpr = 15});
           for (u32 word = 0; word < 3u; ++word) {
             set_buffer(word * 4u, address + word * stride, 4u);
-            shaders.SetCsUserSgpr(12u + word, values[word], HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(12u + word, values[word]);
           }
           processor.DispatchDirect(1, 1, 1, 0x41u);
         };
@@ -11900,9 +11936,9 @@ public:
                                  .user_sgpr = 13, .tgid_x_en = true});
             set_buffer(0, record_keys, based ? 5u : 3u, based ? 8u : 12u);
             set_buffer(4, record_table, 2u, 192u);
-            if (based) shaders.SetCsUserSgpr(5, record_table >> 32u, HW::UserSgprType::Unknown);
+            if (based) shaders.SetCsUserSgpr(5, record_table >> 32u);
             set_buffer(8, record_output, wave * 2u, 8u);
-            shaders.SetCsUserSgpr(12, std::countr_zero(wave), HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(12, std::countr_zero(wave));
             processor.DispatchIndirect(record_args, 0x41u |
                 (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
             cache.ReadMemory(record_output, expected_output.size() * 4u);
@@ -12086,7 +12122,7 @@ public:
                                .wave_size = 64, .user_sgpr = 15});
           for (u32 axis = 0; axis < 3; axis++) {
             set_buffer(axis * 4, lds_args + axis * sizeof(u32), sizeof(u32));
-            shaders.SetCsUserSgpr(12 + axis, groups[axis], HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(12 + axis, groups[axis]);
           }
           processor.DispatchDirect(1, 1, 1, 0x41u);
           Require(name, "GPU-authored LDS dispatch arguments",
@@ -12421,7 +12457,7 @@ public:
               static_cast<uint32_t>(dcc_address >> 32u) | (4u << 16u),
               count, 0x00014004u, fill_case.fill, 0, 0x200, 0, count, 1};
           for (uint32_t i = 0; i < (goat ? 4u : user_data.size()); i++) {
-            shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+            shaders.SetCsUserSgpr(i, user_data[i]);
           }
           executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
@@ -12856,8 +12892,8 @@ public:
                            .num_thread_x = 2, .num_thread_y = 2, .num_thread_z = 1,
                            .wave_size = 64, .user_sgpr = 16, .tidig_comp_cnt = 1});
       for (u32 i = 0; i < 8; i++) {
-        shaders.SetCsUserSgpr(i, target.fields[i], HW::UserSgprType::Unknown);
-        shaders.SetCsUserSgpr(8u + i, depth_bits.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(i, target.fields[i]);
+        shaders.SetCsUserSgpr(8u + i, depth_bits.fields[i]);
       }
       processor.DispatchDirect(1, 1, 1, 0x41u);
 
@@ -12955,8 +12991,8 @@ public:
       const std::array<u32, 8> args{std::bit_cast<u32>(1.0f), 0, 0, std::bit_cast<u32>(1.0f),
                                     1, 1, 2, (2u << 16u) | 4u};
       for (u32 i = 0; i < 8; i++) {
-        shaders.SetCsUserSgpr(i, target.fields[i], HW::UserSgprType::Unknown);
-        shaders.SetCsUserSgpr(8u + i, args[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(i, target.fields[i]);
+        shaders.SetCsUserSgpr(8u + i, args[i]);
       }
       processor.DispatchDirect(1, 1, 1, 0x41u);
       for (const int row : {1, 2, 3}) {
@@ -19149,8 +19185,8 @@ public:
       shaders.SetEsShaderBase(indirect_vs);
       shaders.SetPsShaderBase(pixel_address);
       shaders.SetGsShaderResource2({.user_sgpr = 2});
-      shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
-      shaders.SetGsUserSgpr(1, 5, HW::UserSgprType::Unknown);
+      shaders.SetGsUserSgpr(0, 7);
+      shaders.SetGsUserSgpr(1, 5);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
       for (const bool indexed : {false, true}) {
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
@@ -19237,8 +19273,7 @@ public:
                                 reinterpret_cast<uint64_t>(&attribute)};
         shaders.SetGsShaderResource2({.user_sgpr = 4});
         for (u32 i = 0; i < 4; i++) {
-          shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)),
-                                HW::UserSgprType::Unknown);
+          shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)));
         }
         const auto check = [&](const char *step, uint64_t vertex_shader, bool indexed, u32 first) {
           shaders.SetEsShaderBase(vertex_shader);
@@ -19306,7 +19341,7 @@ public:
       shaders.SetPsShaderBase(rect_ps);
       shaders.SetGsShaderResource2({.user_sgpr = 4});
       for (u32 i = 0; i < 4; i++) {
-        shaders.SetGsUserSgpr(i, rect_buffer.fields[i], HW::UserSgprType::Vsharp);
+        shaders.SetGsUserSgpr(i, rect_buffer.fields[i]);
       }
       registers.SetPsInControl(0x8001);
       registers.SetPsInputEna(2);
@@ -21246,8 +21281,10 @@ private:
     available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceMaintenance8FeaturesKHR available_maintenance8{};
     available_maintenance8.pNext = &available_min_lod;
+    vk::PhysicalDeviceShaderClockFeaturesKHR available_clock{};
+    available_clock.pNext = &available_maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
-    available_robustness2.pNext = &available_maintenance8;
+    available_robustness2.pNext = &available_clock;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
@@ -21295,6 +21332,8 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "dispatch", available_maintenance8.maintenance8 == true,
             "maintenance8 dynamic image offsets are not supported");
+    Require("VulkanHarness", "dispatch", available_clock.shaderDeviceClock == true,
+            "shader device clock is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     m_rasterization_supported = available_features.fillModeNonSolid &&
@@ -21377,7 +21416,10 @@ private:
                         : static_cast<void *>(&derivatives);
     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
     maintenance8.maintenance8 = true;
-    maintenance8.pNext = &min_lod;
+    vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
+    shader_clock.shaderDeviceClock = true;
+    shader_clock.pNext = &min_lod;
+    maintenance8.pNext = &shader_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
@@ -21406,6 +21448,7 @@ private:
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+        VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
         VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
     if (m_rasterization_supported) {
@@ -23116,6 +23159,43 @@ TestCase ScalarFlbitI32B32Gpu() {
           {},
           {0xffffffffu, 16, 0, 1},
           {O::S_MOV_B32, O::S_FLBIT_I32_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase ScalarFlbitSignedGpu() {
+  using O = ShaderOpcode;
+
+  // RDNA2's S_FLBIT_I32 examples; 64-bit signs come from the high word.
+  constexpr u32 values32[] = {0x00000000u, 0x0000ccccu, 0xffff3333u,
+                          0x7fffffffu, 0x80000000u, 0xffffffffu};
+  constexpr uint64_t values64[] = {0x0000000000000000ull, 0xffffffffffffffffull,
+                               0x0000000100000000ull, 0xffffffff7fffffffull,
+                               0xc000000000000000ull, 0x0000000000008000ull};
+  std::vector<u32> code;
+  u32 out = 0;
+  for (const auto value : values32) {
+    AppendSMovLiteral(&code, 0, value);
+    code.push_back(EncodeSop1(0x17, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  for (const auto value : values64) {
+    AppendSMovLiteral(&code, 0, static_cast<u32>(value));
+    AppendSMovLiteral(&code, 1, static_cast<u32>(value >> 32u));
+    code.push_back(EncodeSop1(0x18, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  // A signed 64-bit source sign-extends a literal.
+  code.push_back(EncodeSop1(0x18, 20, 255));
+  code.push_back(0x80000000u);
+  AppendStoreSgpr(&code, 20, out);
+  AppendEnd(&code);
+
+  return {"ScalarFlbitSignedGpu",
+          code,
+          {},
+          {0xffffffffu, 16, 16, 1, 1, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+           31, 32, 2, 48, 33},
+          {O::S_MOV_B32, O::S_FLBIT_I32, O::S_FLBIT_I32_I64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -31933,29 +32013,60 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+// Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
+// min(delta, 64). The profile period picks the host clock shift.
+std::vector<TestCase> ScalarMemRealtimeCases() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeCases", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
               decoded.src0.kind == D::OperandKind::Unknown &&
               decoded.src1.kind == D::OperandKind::Unknown,
           "captured clock instruction must write s12:s13 without memory operands");
-  AppendStoreSgprPair(&code, 12, 0);
-  code.insert(code.end(), {0xf4940300u, 0xfa000000u});
-  AppendStoreSgprPair(&code, 12, 2);
+  code.insert(code.end(),
+              {EncodeSop1(0x03, 17, InlineU32(0)),          // s_mov_b32 s17, 0
+               0xf4940380u, 0xfa000000u,                    // loop: s_memrealtime s[14:15]
+               EncodeSop2(0x01, 16, 14, 12),                // s_sub_u32 s16, s14, s12
+               EncodeSop2(0x00, 17, 17, InlineU32(1)),      // s_add_u32 s17, s17, 1
+               EncodeSopc(0x09, 16, InlineU32(64)),         // s_cmp_ge_u32 s16, 64
+               EncodeSopp(0x05, 3),                         // s_cbranch_scc1 done
+               EncodeSopc(0x0a, 17, 255), 1u << 20,         // s_cmp_lt_u32 s17, 1 << 20
+               EncodeSopp(0x05, static_cast<u32>(-9)),      // s_cbranch_scc1 loop
+               EncodeSop2(0x07, 16, 16, InlineU32(64))});   // done: s_min_u32 s16, s16, 64
+  AppendStoreSgpr(&code, 16, 0);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+
+  static const struct {
+    const char *name;
+    ShaderProfile profile;
+    std::vector<std::string> required, forbidden;
+  } variants[] = {
+      {"ScalarMemRealtimeShiftsNanosecondClock",
+       {.maintenance8 = true, .device_clock_period_ps = 1000},
+       {"OpShiftRightLogical %ulong", "%uint_3\n"},
+       {}},
+      {"ScalarMemRealtimeKeeps100MHzClock",
+       {.maintenance8 = true, .device_clock_period_ps = 10000},
+       {"OpReadClockKHR %ulong %uint_1"},
+       {"OpShiftRightLogical %ulong"}}};
+  std::vector<TestCase> tests;
+  for (const auto &variant : variants) {
+    TestCase test{variant.name, code, {}, {64},
+                  {O::S_MEMREALTIME, O::S_MOV_B32, O::S_SUB_U32, O::S_ADD_U32, O::S_CMP_GE_U32,
+                   O::S_CBRANCH_SCC1, O::S_CMP_LT_U32, O::S_MIN_U32, O::V_MOV_B32,
+                   O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+    test.profile = &variant.profile;
+    test.required_spirv = variant.required;
+    test.forbidden_spirv = variant.forbidden;
+    tests.push_back(std::move(test));
+  }
+  return tests;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -43766,6 +43877,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarFlbitI32B32Gpu);
+  AddCase(ScalarFlbitSignedGpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
@@ -44009,7 +44121,9 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32, true); });
   AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64, true); });
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  for (auto &test : ScalarMemRealtimeCases()) {
+    cases.push_back(std::move(test));
+  }
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -48395,6 +48509,12 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
   }
+  // PS5 has no constant engine: WRITE_CONST_RAM, DUMP_CONST_RAM, the CE/DE
+  // counter increments and waits. RELEASE_MEM replaces EVENT_WRITE_EOP/EOS.
+  for (const uint32_t opcode :
+       {0x47u, 0x48u, 0x81u, 0x83u, 0x84u, 0x85u, 0x86u, 0x88u}) {
+    legacy_slots_are_unhandled &= g_cp_op_func[opcode] == nullptr;
+  }
   // Restoring shader state after Toolkit rendering still emits the compiler's
   // GS-front allocation metadata at 0xca.
   for (uint32_t offset = 0x0cbu; offset <= 0x0ebu; offset++) {
@@ -48428,7 +48548,8 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   Require("Pm4NativeTargetGeometry", "legacy register holes",
           legacy_slots_are_unhandled && native_pace_slots_are_handled &&
               native_ps_address_slots_are_handled && native_index_size_packet_complete,
-          "a removed GCN register has a handler or a native packet is not handled");
+          "a removed GCN register or PS4 packet has a handler or a native packet is "
+          "not handled");
   std::printf("[host]    %-32s ok\n", "Pm4NativeTargetGeometry");
 }
 
@@ -49204,8 +49325,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
             "indirect draw did not write the expected user SGPR offsets");
   };
   // These locations match the captured NGG prolog: user SGPR9/10 become s17/s18.
-  shaders.SetGsUserSgpr(9, 17821, HW::UserSgprType::Unknown);
-  shaders.SetGsUserSgpr(10, 0x898f3f24u, HW::UserSgprType::Unknown);
+  shaders.SetGsUserSgpr(9, 17821);
+  shaders.SetGsUserSgpr(10, 0x898f3f24u);
   arguments = {0, 1};
   std::array<uint32_t, 5> indexed_packet{
       KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0), 0,
@@ -49516,25 +49637,18 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
               payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
           "NOP emitter overwrote the caller's reserved payload");
-  for (const uint32_t value : {0x68750820u, 0x68751777u, 0x68751004u}) {
+  // The PS4-era flip tags are payload too.
+  for (const uint32_t value : {0x68750820u, 0x68751777u, 0x68751004u,
+                               0x68750777u, 0x68750778u, 0x68750781u}) {
     std::array<uint32_t, 8> commands{KYTY_PM4(3, Pm4::IT_NOP, Pm4::R_ZERO), value, 0x12345678u};
     std::copy(completion.begin(), completion.end(), commands.begin() + 3);
-    processor.SetUserDataMarker(HW::UserSgprType::Unknown);
     selected = 0;
     Pm4Execution execution;
     Require(name, "opaque NOP payload",
             processor.Process(execution, commands) == Pm4ProcessResult::Complete && selected == 7 &&
-                processor.GetUserDataMarker() == HW::UserSgprType::Unknown && commands[1] == value,
-            "a NOP payload prefix executed a marker or blocked the following packet");
+                commands[1] == value,
+            "a NOP payload executed or blocked the following packet");
   }
-  const std::array<uint32_t, 2> vsharp_marker{
-      KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0x68750004u};
-  Pm4Execution marker_execution;
-  Require(name, "exact user-data marker",
-          processor.Process(marker_execution, vsharp_marker) == Pm4ProcessResult::Complete &&
-              processor.GetUserDataMarker() == HW::UserSgprType::Vsharp,
-          "exact marker dispatch lost the existing user-data annotation");
-  processor.SetUserDataMarker(HW::UserSgprType::Unknown);
   alignas(8) uint64_t released = 0;
   std::array<uint32_t, 20> disabled_commands{};
   const auto disabled_write = write(&returned, 99);
@@ -49555,9 +49669,9 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
               Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
               disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
               disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
-              disabled_commands[6] == 0x123u &&
+              disabled_commands[6] == 0x68750123u &&
               release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
-              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+              unpatched_commands[7] == 0xc0064900u &&
               Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
               Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
               Gen5::AgcGetPacketSize(release) == 8 &&
@@ -49565,13 +49679,34 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                          unpatched_commands.begin() + 1) &&
               std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
                          unpatched_commands.begin() + 8),
-          "SetNop changed a packet length, kept its operation or marker, or touched its payload");
+          "SetNop changed a packet length, kept its operation, or touched its payload");
   selected = returned = 0;
   Pm4Execution disabled_execution;
   Require(name, "SetNop execution",
           processor.Process(disabled_execution, disabled_commands) == Pm4ProcessResult::Complete &&
               returned == 0 && released == 0 && selected == 88,
           "a disabled packet still executed or hid the packet after it");
+  // Like the driver, the end-of-pipe patch helpers take only a native
+  // RELEASE_MEM, keep the address alignment bits and skip kSendIntCtx.
+  std::array<uint32_t, 8> patched{};
+  std::copy_n(unpatched_commands.begin() + 7, patched.size(), patched.begin());
+  patched[3] |= 1u;
+  const auto* label = reinterpret_cast<const volatile Gen5::Label*>(0x123456789abcdef7ull);
+  bool patch_helpers_match =
+      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) == 0 &&
+      patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u &&
+      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0x1122334455667788ull) == 0 &&
+      patched[5] == 0x55667788u && patched[6] == 0x11223344u;
+  patched[2] |= 4u << 24u;
+  patch_helpers_match &= Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), nullptr) == 0 &&
+                         patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u;
+  patched[0] = KYTY_PM4(8, Pm4::IT_NOP, 0x18);
+  patch_helpers_match &=
+      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) ==
+          static_cast<int>(0x8a6c000cu) &&
+      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0) == static_cast<int>(0x8a6c000cu);
+  Require(name, "end-of-pipe patch helpers", patch_helpers_match,
+          "RELEASE_MEM or its patch helpers diverged from the driver");
   const auto then_commands = write(&selected, 11);
   const auto else_commands = write(&selected, 33);
   const auto branch_suffix = write(&selected, 44);
@@ -49722,7 +49857,7 @@ void CheckWaitUntilSafeForRendering() {
   hold[3] = static_cast<uint32_t>(address(&gate) >> 32u);
   hold[4] = 1;
   hold[5] = UINT32_MAX;
-  gpu.Submit(hold, {});
+  gpu.Submit(hold);
   Require(name, "flip black",
           VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
           "CPU flip failed");
@@ -49763,6 +49898,92 @@ void CheckWaitUntilSafeForRendering() {
 
   gpu.WaitForIdle();
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0, "video-out close failed");
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// R_FLIP itself publishes the dumped occlusion counters, then flips.
+void CheckPm4Flip() {
+  namespace EventQueue = LibKernel::EventQueue;
+  constexpr const char *name = "Pm4Flip";
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .occlusion_queries_enabled = true});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window =
+      SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+  auto &gpu = renderer.GetGpu();
+  Require(name, "occlusion queries", renderer.GetOcclusionQueries().Enabled(),
+          "the device has no host occlusion queries");
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  uint32_t udata = 0;
+  Require(name, "events",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
+          "video-out or flip event registration failed");
+  GraphicsInitJmpTables();
+
+  alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
+  constexpr int64_t flip_arg = 0x777;
+  std::array<uint32_t, 14> commands{};
+  const auto dump = [&](size_t at, const uint64_t *counter) {
+    const auto address = reinterpret_cast<uint64_t>(counter);
+    commands[at] = KYTY_PM4(4, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO);
+    commands[at + 1] = 0x139u;
+    commands[at + 2] = static_cast<uint32_t>(address);
+    commands[at + 3] = static_cast<uint32_t>(address >> 32u);
+  };
+  // Begin and end z-pass dumps, then a vsync flip of the blank buffer.
+  dump(0, &results[0]);
+  dump(4, &results[1]);
+  commands[8] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
+  commands[9] = static_cast<uint32_t>(handle);
+  commands[10] = static_cast<uint32_t>(-1);
+  commands[11] = 1;
+  commands[12] = flip_arg;
+  bool complete = false;
+  bool published = true;
+  gpu.SendCommandSync([&] {
+    CommandProcessor processor(renderer, 0);
+    processor.BufferInit();
+    Pm4Execution execution;
+    complete =
+        processor.Process(execution, commands) == Pm4ProcessResult::Complete;
+    for (const auto counter : results) {
+      published &= (counter & OCCLUSION_QUERY_READY) != 0;
+    }
+    processor.BufferFlush();
+  });
+
+  EventQueue::KernelEvent event{};
+  int count = 0;
+  LibKernel::KernelUseconds timeout = 2'000'000;
+  int64_t flipped_arg = -1;
+  Require(name, "flip",
+          complete && published &&
+              EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                           &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
+              flipped_arg == flip_arg,
+          "R_FLIP did not publish the occlusion counters or flip");
+
+  gpu.WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();
   std::printf("[host]    %-32s ok\n", name);
@@ -49929,58 +50150,6 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-void CheckPm4CeCompletion(RenderContext &renderer) {
-  GraphicsInitJmpTables();
-  CommandProcessor processor(renderer, 0);
-  uint32_t suffix = 0;
-  const auto address = reinterpret_cast<uint64_t>(&suffix);
-
-  std::array<uint32_t, 9> commands{};
-  commands[0] = 0xc0008600u;
-  commands[1] = 1;
-  commands[2] = 0xc0008500u;
-  commands[3] = 0;
-  commands[4] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-  commands[5] = 0;
-  commands[6] = static_cast<uint32_t>(address);
-  commands[7] = static_cast<uint32_t>(address >> 32u);
-  commands[8] = 33;
-
-  processor.ResetDeCe();
-  Pm4Execution execution;
-  Require("Pm4CeCompletion", "wait",
-          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
-              suffix == 0,
-          "DE did not wait for an active CE stream");
-
-  std::array<uint32_t, 2> ce_increment{0xc0008400u, 1};
-  Pm4Execution ce_execution;
-  Require("Pm4CeCompletion", "CE increment",
-          processor.Process(ce_execution, ce_increment) ==
-              Pm4ProcessResult::Complete,
-          "CE counter increment did not complete");
-  Require(
-      "Pm4CeCompletion", "counter gate",
-      processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
-          suffix == 33,
-      "DE did not resume after CE advanced or failed to increment its counter");
-
-  suffix = 0;
-  Pm4Execution balanced_execution;
-  Require("Pm4CeCompletion", "balanced wait",
-          processor.Process(balanced_execution, commands) ==
-                  Pm4ProcessResult::Blocked &&
-              suffix == 0,
-          "balanced CE/DE counters did not gate the next DE packet");
-  processor.SetCeComplete(true);
-  Require("Pm4CeCompletion", "stream complete",
-          processor.Process(balanced_execution, commands) ==
-                  Pm4ProcessResult::Complete &&
-              suffix == 33,
-          "DE remained blocked after the CE stream completed");
-  std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
-}
-
 } // namespace
 } // namespace Libs::Graphics
 
@@ -50070,6 +50239,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(32));
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(64));
+    RunCase(&vulkan, ScalarFlbitSignedGpu());
     for (bool add : {false, true}) {
       RunCase(&vulkan, DsAtomic64Bounds(add));
       for (u32 wave_size : {32, 64}) {
@@ -50085,7 +50255,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    for (const auto &test : ScalarMemRealtimeCases()) {
+      RunCase(&vulkan, test);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
@@ -50662,6 +50834,10 @@ int main(int argc, char **argv) {
     CheckWaitUntilSafeForRendering();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
+    CheckPm4Flip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
@@ -50670,7 +50846,6 @@ int main(int argc, char **argv) {
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
-    CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
@@ -51139,7 +51314,6 @@ int main(int argc, char **argv) {
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
-  CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
