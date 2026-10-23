@@ -37,6 +37,25 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
+
+// Lab (#1511, test build, not for upstream): KYTY_LAB_DISPATCH_BARRIER=1 puts a full memory barrier before every guest
+// dispatch, so a dispatch never runs before all earlier GPU work is finished and visible (tests a missing-sync cause).
+static void LabDispatchBarrier(vk::CommandBuffer cmd) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LAB_DISPATCH_BARRIER");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                    &barrier, 0, nullptr, 0, nullptr);
+}
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
@@ -453,6 +472,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                   std::max(input_info.threads_num[2], 1u);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+		LabDispatchBarrier(vk_buffer);
 		// A single guest wave per group can run in launch order without a device-wide
 		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
 		for (uint32_t z = 0; z < thread_group_z; ++z) {
@@ -466,6 +486,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 	} else {
+		LabDispatchBarrier(vk_buffer);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
@@ -538,6 +559,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	LabDispatchBarrier(vk_buffer);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
