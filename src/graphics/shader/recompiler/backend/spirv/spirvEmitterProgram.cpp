@@ -51,6 +51,7 @@ struct DeferredPhiPatch {
 struct StructuredFunctionState {
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
+	std::unordered_set<const IR::Block*>           loop_cap_merges; // Lab (#1511): merges of always-repeating loops.
 };
 
 struct DispatcherFunctionState {
@@ -94,7 +95,25 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
+// Lab (#1511): loads the invocation's back-edge count (and adds this back edge when counting).
+uint32_t EmitLoopCapCount(EmitterState& state, bool count) {
+	const auto counted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), counted, state.loop_cap_variable);
+	if (count) {
+		state.builder.AddFunction(spv::OpStore, state.loop_cap_variable,
+		                          EmitAddU32(state, counted, ConstantU32(state, 1)));
+	}
+	return counted;
+}
+
+// Lab (#1511): true while the invocation has taken fewer than loop_cap back edges.
+uint32_t EmitLoopCapWithin(EmitterState& state, bool count) {
+	return Binary(state, spv::OpULessThan, TypeBool(state), EmitLoopCapCount(state, count),
+	              ConstantU32(state, state.profile.loop_cap));
+}
+
+void EmitStructuredTerminator(ValueEmitContext& ctx, const StructuredFunctionState& structured,
+                              const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -118,6 +137,11 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
+			// Lab (#1511): an always-taken back edge only counts; the loop's breaks test the cap.
+			if (ctx.state.loop_cap_variable != 0 && target->terminator.loop_header &&
+			    target->terminator.continue_block == block) {
+				EmitLoopCapCount(ctx.state, true);
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranch, target->Definition());
 			return;
@@ -129,7 +153,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			// Lab (#1511): a conditional back edge (true: header, false: merge) counts and stays
+			// within the cap; a break out of an always-repeating loop is also taken at the cap.
+			if (ctx.state.loop_cap_variable != 0) {
+				auto& state = ctx.state;
+				if (true_block->terminator.loop_header && true_block->terminator.continue_block == block &&
+				    true_block->terminator.merge_block == false_block) {
+					condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition,
+					                   EmitLoopCapWithin(state, true));
+				} else if (structured.loop_cap_merges.contains(true_block)) {
+					condition = Binary(state, spv::OpLogicalOr, TypeBool(state), condition,
+					                   Unary(state, spv::OpLogicalNot, TypeBool(state),
+					                         EmitLoopCapWithin(state, false)));
+				} else if (structured.loop_cap_merges.contains(false_block)) {
+					condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition,
+					                   EmitLoopCapWithin(state, false));
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -335,6 +376,16 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	if (ctx.state.loop_cap_variable != 0) {
+		for (const auto* block: program.blocks) {
+			const auto& term = block->terminator;
+			if (term.loop_header && term.merge_block != nullptr && term.continue_block != nullptr &&
+			    term.continue_block->terminator.kind == CFG::TerminatorKind::Branch &&
+			    term.continue_block->terminator.true_block == block) {
+				structured.loop_cap_merges.insert(term.merge_block);
+			}
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -342,7 +393,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block);
+		EmitStructuredTerminator(ctx, structured, block);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
@@ -364,9 +415,14 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (state.loop_cap_variable != 0) {
+		// Lab (#1511): here the cap counts block steps, not guest loop iterations.
+		done = Binary(state, spv::OpLogicalOr, TypeBool(state), done,
+		              Unary(state, spv::OpLogicalNot, TypeBool(state), EmitLoopCapWithin(state, true)));
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -610,6 +666,10 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (state.program.stage == ShaderType::Compute && state.profile.loop_cap != 0) {
+		state.loop_cap_variable = state.builder.AllocateId();
+		state.builder.AddName(state.loop_cap_variable, "lab_loop_cap_back_edges");
+	}
 	for (const auto* block: program.blocks) {
 		// Re-emission may use a different host subgroup width and ID allocation order.
 		for (const auto& inst: *block) {
@@ -706,6 +766,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.loop_cap_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_cap_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -734,6 +799,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_cap_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_cap_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

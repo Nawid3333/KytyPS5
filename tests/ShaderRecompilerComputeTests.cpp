@@ -1376,15 +1376,25 @@ bool LabMaximalReconvergence() {
   return enabled;
 }
 
+// LAB (#1511, not for upstream): KYTY_LAB_LOOP_CAP=N compiles every compute case with the loop cap.
+uint32_t LabLoopCap() {
+  static const uint32_t cap = [] {
+    const char *value = std::getenv("KYTY_LAB_LOOP_CAP");
+    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+  }();
+  return cap;
+}
+
 const ShaderProfile *LabComputeProfile(const ShaderProfile *profile) {
-  if (!LabMaximalReconvergence() || profile == nullptr) {
+  if ((!LabMaximalReconvergence() && LabLoopCap() == 0) || profile == nullptr) {
     return profile;
   }
   static std::map<const ShaderProfile *, std::unique_ptr<ShaderProfile>> copies;
   auto &copy = copies[profile];
   if (!copy) {
     copy = std::make_unique<ShaderProfile>(*profile);
-    copy->maximal_reconvergence = true;
+    copy->maximal_reconvergence = copy->maximal_reconvergence || LabMaximalReconvergence();
+    copy->loop_cap = LabLoopCap();
   }
   return copy.get();
 }
