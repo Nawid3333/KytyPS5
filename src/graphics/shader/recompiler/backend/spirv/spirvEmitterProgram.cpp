@@ -666,7 +666,8 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
-	if (state.program.stage == ShaderType::Compute && state.profile.loop_cap != 0) {
+	if ((state.program.stage == ShaderType::Compute || state.program.stage == ShaderType::Pixel) &&
+	    state.profile.loop_cap != 0) {
 		state.loop_cap_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_cap_variable, "lab_loop_cap_back_edges");
 	}

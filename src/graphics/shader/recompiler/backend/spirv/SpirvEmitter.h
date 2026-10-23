@@ -14,7 +14,7 @@ struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
 	bool maximal_reconvergence = false; // Lab (#1511): compute entry points get MaximallyReconvergesKHR.
-	uint32_t loop_cap          = 0;     // Lab (#1511): compute loops leave after N back edges per invocation.
+	uint32_t loop_cap          = 0;     // Lab (#1511): compute and pixel loops leave after N back edges per invocation.
 };
 
 inline constexpr Profile DefaultProfile {};

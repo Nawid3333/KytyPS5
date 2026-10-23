@@ -224,7 +224,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	return hash;
 }
 
-// Lab (#1511): KYTY_LAB_LOOP_CAP=N makes every compute loop leave after N back edges per invocation.
+// Lab (#1511): KYTY_LAB_LOOP_CAP=N makes every compute and pixel loop leave after N back edges per invocation.
 static uint32_t LabLoopCap() {
 	const char* value = std::getenv("KYTY_LAB_LOOP_CAP");
 	const auto  cap   = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
@@ -510,7 +510,7 @@ struct PipelineCache::ProgramCache {
 		           .maximal_reconvergence = graphics.maximal_reconvergence_enabled,
 		           .loop_cap              = LabLoopCap()} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
-		LOGF("Lab compute loop cap (KYTY_LAB_LOOP_CAP): %u back edges per invocation (0 = off)\n",
+		LOGF("Lab compute+pixel loop cap (KYTY_LAB_LOOP_CAP): %u back edges per invocation (0 = off)\n",
 		     profile.loop_cap);
 	}
 	~ProgramCache() {
