@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/labDeviceDiag.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -246,8 +247,10 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
+	const auto lab_serial = LabDeviceDiag::Begin(command, 0, copy.extent.width, copy.extent.height, 0, 10);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	LabDeviceDiag::End(command, lab_serial);
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -770,6 +773,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
+	const auto lab_serial      = LabDeviceDiag::Begin(vk_command, 0, m_image_index, 0, 0, 9, 0, 1);
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
 	if (source != nullptr) {
@@ -870,6 +874,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
+	LabDeviceDiag::End(vk_command, lab_serial, 1);
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {

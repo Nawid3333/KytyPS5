@@ -2,9 +2,10 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_LABDEVICEDIAG_H_
 
 // Lab (#1511, not for upstream): KYTY_LAB_DEVICE_DIAG=1 enables VK_EXT_device_fault and
-// VK_AMD_buffer_marker. Every guest dispatch and draw (and helper blit) writes its serial before it
+// VK_AMD_buffer_marker. Every guest dispatch and draw, helper blit and flip copy (render stream, slot 0)
+// and every presenter command buffer (present stream, slot 1; same queue) writes its serial before it
 // (top of pipe) and after it (bottom of pipe) into a host buffer; a lost device logs the fault
-// records and the commands that started but did not finish.
+// records and, per stream, the commands that started but did not finish.
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -34,7 +35,8 @@ struct Dispatch {
 	uint32_t y     = 0;
 	uint32_t z     = 0;
 	uint32_t kind  = 0; // 1 dispatch, 2 dispatch indirect, 3 ordered dispatchBase loop, 4 draw,
-	                    // 5 mesh draw, 6 draw indirect, 7 helper blit
+	                    // 5 mesh draw, 6 draw indirect, 7 helper blit, 9 present commands, 10 flip copy
+	uint32_t slot  = 0; // 0 render stream, 1 present stream
 };
 
 struct State {
@@ -83,7 +85,7 @@ inline void Init(vk::PhysicalDevice physical, vk::Device device, bool fault, boo
 				    device.mapMemory(state.memory, 0, VK_WHOLE_SIZE, {}, &pointer) ==
 				        vk::Result::eSuccess) {
 					state.mapped = static_cast<volatile uint32_t*>(pointer);
-					state.mapped[0] = state.mapped[1] = 0;
+					state.mapped[0] = state.mapped[1] = state.mapped[2] = state.mapped[3] = 0;
 				}
 				break;
 			}
@@ -96,20 +98,21 @@ inline void Init(vk::PhysicalDevice physical, vk::Device device, bool fault, boo
 
 // Before a guest dispatch; returns the serial for End (0 = markers off).
 inline uint32_t Begin(vk::CommandBuffer cmd, uint64_t hash, uint32_t x, uint32_t y, uint32_t z,
-                      uint32_t kind, uint64_t hash2 = 0) {
+                      uint32_t kind, uint64_t hash2 = 0, uint32_t slot = 0) {
 	auto& state = Get();
 	if (state.mapped == nullptr) {
 		return 0;
 	}
 	const auto serial = state.serial.fetch_add(1, std::memory_order_relaxed) + 1;
-	state.ring[serial % state.ring.size()] = {hash, hash2, x, y, z, kind};
-	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, state.buffer, 0, serial);
+	state.ring[serial % state.ring.size()] = {hash, hash2, x, y, z, kind, slot};
+	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, state.buffer, slot * 8u, serial);
 	return serial;
 }
 
-inline void End(vk::CommandBuffer cmd, uint32_t serial) {
+inline void End(vk::CommandBuffer cmd, uint32_t serial, uint32_t slot = 0) {
 	if (serial != 0) {
-		cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, Get().buffer, 4, serial);
+		cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, Get().buffer, slot * 8u + 4u,
+		                         serial);
 	}
 }
 
@@ -143,20 +146,28 @@ inline void Report(const char* where) {
 		}
 	}
 	if (state.mapped != nullptr) {
-		const uint32_t top    = state.mapped[0];
-		const uint32_t bottom = state.mapped[1];
-		const uint32_t last   = state.serial.load(std::memory_order_relaxed);
-		LOGF("Lab device diag: command markers started=%u finished=%u recorded=%u\n", top, bottom,
-		     last);
-		const uint32_t first = bottom + 1u > 3u ? bottom - 2u : 1u;
-		for (uint32_t serial = first; serial <= top + 2u && serial <= last && serial - first < 40u;
-		     serial++) {
-			const auto& entry = state.ring[serial % state.ring.size()];
-			LOGF("Lab device diag:   command %u %s kind=%u hash=0x%016" PRIx64 " hash2=0x%016" PRIx64
-			     " size=%ux%ux%u\n",
-			     serial,
-			     serial <= bottom ? "finished" : (serial <= top ? "STARTED, NOT FINISHED" : "not started"),
-			     entry.kind, entry.hash, entry.hash2, entry.x, entry.y, entry.z);
+		const uint32_t last = state.serial.load(std::memory_order_relaxed);
+		for (uint32_t slot = 0; slot < 2u; slot++) {
+			const uint32_t top    = state.mapped[slot * 2u];
+			const uint32_t bottom = state.mapped[slot * 2u + 1u];
+			LOGF("Lab device diag: %s markers started=%u finished=%u recorded=%u\n",
+			     slot == 0 ? "render stream" : "present stream", top, bottom, last);
+			uint32_t shown = 0;
+			uint32_t after = 0;
+			for (uint32_t serial = bottom > 2u ? bottom - 2u : 1u; serial <= last && shown < 24u && after < 3u;
+			     serial++) {
+				const auto& entry = state.ring[serial % state.ring.size()];
+				if (entry.slot != slot || serial + state.ring.size() <= last) {
+					continue; // other stream, or overwritten in the ring
+				}
+				shown++;
+				after += serial > top ? 1u : 0u;
+				LOGF("Lab device diag:   command %u %s kind=%u hash=0x%016" PRIx64 " hash2=0x%016" PRIx64
+				     " size=%ux%ux%u\n",
+				     serial,
+				     serial <= bottom ? "finished" : (serial <= top ? "STARTED, NOT FINISHED" : "not started"),
+				     entry.kind, entry.hash, entry.hash2, entry.x, entry.y, entry.z);
+			}
 		}
 	}
 }
