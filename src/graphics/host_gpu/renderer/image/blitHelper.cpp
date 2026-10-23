@@ -4,6 +4,7 @@
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/labDeviceDiag.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -191,7 +192,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
+	const auto lab_serial = LabDeviceDiag::Begin(command, 0, destination_info.extent.width,
+	                                             destination_info.extent.height, 0, 7);
 	command.draw(3, 1, 0, 0);
+	LabDeviceDiag::End(command, lab_serial);
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();

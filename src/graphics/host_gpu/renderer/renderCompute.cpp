@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/labDeviceDiag.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -473,6 +474,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		LabDispatchBarrier(vk_buffer);
+		const auto lab_serial = LabDeviceDiag::Begin(vk_buffer, program.shader_hash, thread_group_x,
+		                                             thread_group_y, thread_group_z, 3);
 		// A single guest wave per group can run in launch order without a device-wide
 		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
 		for (uint32_t z = 0; z < thread_group_z; ++z) {
@@ -485,9 +488,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				}
 			}
 		}
+		LabDeviceDiag::End(vk_buffer, lab_serial);
 	} else {
 		LabDispatchBarrier(vk_buffer);
+		const auto lab_serial = LabDeviceDiag::Begin(vk_buffer, program.shader_hash, thread_group_x,
+		                                             thread_group_y, thread_group_z, 1);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		LabDeviceDiag::End(vk_buffer, lab_serial);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
@@ -560,7 +567,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	LabDispatchBarrier(vk_buffer);
+	const auto lab_serial = LabDeviceDiag::Begin(vk_buffer, program.shader_hash, 0, 0, 0, 2);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	LabDeviceDiag::End(vk_buffer, lab_serial);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

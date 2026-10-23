@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/labDeviceDiag.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -511,6 +512,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maximal_reconvergence.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &maximal_reconvergence;
 	}
+	// Lab (#1511): VK_EXT_device_fault is only in the list with KYTY_LAB_DEVICE_DIAG=1.
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (device_fault_extension) {
+		device_fault.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &device_fault;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -715,6 +724,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maximal_reconvergence_enabled) {
 		maximal_reconvergence.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext           = &maximal_reconvergence;
+	}
+	LabDeviceDiag::Get().fault = device_fault_extension && device_fault.deviceFault;
+	if (LabDeviceDiag::Get().fault) {
+		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFaultVendorBinary = VK_FALSE;
+		create_info.pNext                    = &device_fault;
 	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
@@ -1107,6 +1122,12 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 		}
+		// Lab (#1511): only with KYTY_LAB_DEVICE_DIAG=1 (see labDeviceDiag.h).
+		for (const char* extension: {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, VK_AMD_BUFFER_MARKER_EXTENSION_NAME}) {
+			if (LabDeviceDiag::Requested() && HasExtension(available_extensions, extension)) {
+				device_extensions.push_back(extension);
+			}
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1120,6 +1141,10 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (LabDeviceDiag::Requested()) {
+		LabDeviceDiag::Init(graphic_ctx.physical_device, graphic_ctx.device, LabDeviceDiag::Get().fault,
+		                    HasExtension(device_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME));
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
