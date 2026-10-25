@@ -92,6 +92,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -447,7 +448,7 @@ struct RenderExecutorTestAccess {
     std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
     bool compute = false;
     for (const auto *prepared : stages) {
-      const auto &program = *prepared->runtime->program;
+      const auto &program = prepared->runtime->module->info;
       compute |= program.stage == ShaderType::Compute;
       const auto shader_stage = program.stage == ShaderType::Vertex
                                     ? vk::ShaderStageFlagBits::eVertex
@@ -498,7 +499,7 @@ struct RenderExecutorTestAccess {
                                                 PreparedBindings &bindings) {
     std::array<PreparedBindings *, 1> stages{&bindings};
     auto pipeline = CreateDescriptorPipeline(executor, stages);
-    const auto bind_point = bindings.runtime->program->stage == ShaderType::Compute
+    const auto bind_point = bindings.runtime->module->info.stage == ShaderType::Compute
                                 ? vk::PipelineBindPoint::eCompute
                                 : vk::PipelineBindPoint::eGraphics;
     executor.CommitBindings(buffer, bind_point, pipeline, stages);
@@ -580,6 +581,47 @@ struct RenderExecutorTestAccess {
     return executor.m_bound_images.size() == 2 &&
            executor.m_bound_images[0] == first &&
            executor.m_bound_images[1] == second;
+  }
+};
+
+struct PipelineCacheTestAccess {
+  // Replaces each graphics pipeline whose stage ids name compiled modules with one created
+  // from only its key and those modules. The GPU must be idle. Returns how many it replaced.
+  static uint32_t RecreateGraphicsPipelines(PipelineCache &cache) {
+    const auto modules = cache.MapModules();
+    auto &device = cache.m_graphics.device;
+    uint32_t count = 0;
+    for (auto &[key, pipeline] : cache.m_graphics_pipelines) {
+      PipelineCache::Pipeline recreated;
+      // Test-owned modules are not in the cache.
+      if (!cache.CreateGraphicsPipeline(recreated, key, modules)) continue;
+      device.destroyPipeline(pipeline.pipeline, nullptr);
+      device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+      device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+      pipeline = recreated;
+      count++;
+    }
+    return count;
+  }
+
+  static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
+
+  static void StoreLayout(PipelineCache &cache, uint64_t key,
+                          const ShaderTessellationInputInfo &layout) {
+    cache.StoreLayout(key, layout);
+  }
+
+  // Holds the store thread until the cache is destroyed.
+  static void HoldStoreUntilExit(PipelineCache &cache) {
+    cache.m_store.Post([stop = cache.m_store.m_thread.get_stop_token()] {
+      while (!stop.stop_requested()) std::this_thread::yield();
+    });
+  }
+
+  static const auto &TessLayouts(const PipelineCache &cache) { return cache.m_tess_layouts; }
+
+  static std::array<size_t, 2> Pipelines(const PipelineCache &cache) {
+    return {cache.m_graphics_pipelines.size(), cache.m_compute_pipelines.size()};
   }
 };
 
@@ -1509,18 +1551,12 @@ void CheckRectListShaders() {
   program.info.inputs.push_back(
       {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
 
-  ShaderVertexInputInfo vertex{};
-  ShaderRecompiler::IR::CompiledShaderInfo vertex_program{.param_export_mask = 1u};
-  ShaderRecompiler::IR::ResourceSnapshot empty_snapshot;
-  vertex.stage.program = &vertex_program;
-  vertex.stage.resources = &empty_snapshot;
+  constexpr uint32_t param_export_mask = 1u;
   ShaderPixelInputInfo pixel{};
   pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
-  pixel.stage.program = &program;
-  pixel.stage.resources = &empty_snapshot;
   std::vector<uint32_t> perspective_specialization;
   BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
@@ -1539,7 +1575,8 @@ void CheckRectListShaders() {
           "duplicate pixel mappings must receive distinct effective output "
           "locations");
 
-  const auto shaders = BuildRectListShaders(vertex, &pixel);
+  const auto shaders =
+      BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
   Require(name, "SPIR-V version",
           shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
               shaders.evaluation.size() > 1 &&
@@ -1588,7 +1625,8 @@ void CheckRectListShaders() {
   for (const auto flat : {0u, 0x400u}) {
     pixel.interpolator_settings[0] = flat;
     pixel.interpolator_settings[1] = flat;
-    const auto shared = BuildRectListShaders(vertex, &pixel);
+    const auto shared =
+        BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
     ValidateSpirv(name, shared.control);
     ValidateSpirv(name, shared.evaluation);
     Require(name, "same-mode alias disassembly",
@@ -1604,7 +1642,7 @@ void CheckRectListShaders() {
             "the shared location in each rectangle-list stage");
   }
 
-  const auto position_only = BuildRectListShaders(vertex, nullptr);
+  const auto position_only = BuildRectListShaders({}, param_export_mask);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
 }
@@ -1659,6 +1697,17 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// The plan a restarted game loads from the shader cache, which saves back to the same bytes.
+ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
+                                                      const ShaderRecompiler::IR::Program &program) {
+  using namespace ShaderRecompiler::IR;
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
+  ResourcePlan plan;
+  Require(name, "resource plan cache", LoadResourcePlan(bytes, plan) && SaveResourcePlan(plan) == bytes,
+          "resource plan did not round-trip through its cache bytes");
+  return plan;
+}
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1691,8 +1740,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};
@@ -1879,8 +1927,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -2210,22 +2257,24 @@ public:
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
 
-    ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
+    ShaderModule vertex_module;
+    auto &vertex_program = vertex_module.info;
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.bindings.push_data_start_dword = 2;
     vertex_program.info.user_data_registers = {0, 1};
     vertex_program.bindings.memory_offset_dword = 2;
-    ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
+    ShaderModule pixel_module;
+    auto &pixel_program = pixel_module.info;
     pixel_program.stage = ShaderType::Pixel;
     pixel_program.bindings.push_data_start_dword = 0;
     pixel_program.info.user_data_registers = {0, 1};
     pixel_program.bindings.memory_offset_dword = 2;
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex_snapshot.user_data = {0x11111111u, 0x22222222u};
-    ShaderStageRuntime vertex_runtime{&vertex_program, &vertex_snapshot};
+    ShaderStageRuntime vertex_runtime{&vertex_module, &vertex_snapshot};
     ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
     pixel_snapshot.user_data = {0x33333333u, 0x44444444u};
-    ShaderStageRuntime pixel_runtime{&pixel_program, &pixel_snapshot};
+    ShaderStageRuntime pixel_runtime{&pixel_module, &pixel_snapshot};
     PreparedBindings vertex;
     PreparedBindings pixel;
     auto &executor = context.GetRenderExecutor();
@@ -5520,8 +5569,9 @@ public:
             "test HTile entries were not registered in their initial state");
 
     const auto MakeInput = [](uint64_t address, bool read, bool written,
-                              ShaderRecompiler::IR::CompiledShaderInfo &program,
+                              ShaderModule &module,
                               ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+      auto &program = module.info;
       program.stage = ShaderType::Compute;
       ShaderRecompiler::IR::BufferResource resource{};
       resource.read = read;
@@ -5541,14 +5591,14 @@ public:
       value.dword_count = 4;
       std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
       ShaderComputeInputInfo input{};
-      input.stage.program = &program;
+      input.stage.module = &module;
       snapshot.buffers.push_back(value);
       input.stage.resources = &snapshot;
       return input;
     };
     auto &executor = context.GetRenderExecutor();
     auto &command = scheduler.Current();
-    ShaderRecompiler::IR::CompiledShaderInfo read_only_program{};
+    ShaderModule read_only_program;
     ShaderRecompiler::IR::ResourceSnapshot read_only_snapshot;
     const auto read_only_input =
         MakeInput(read_only_meta, true, false, read_only_program,
@@ -5561,7 +5611,7 @@ public:
                 !texture_cache.IsMetaCleared(read_only_meta, 0),
             "a metadata read-only dispatch changed logical clear state");
 
-    ShaderRecompiler::IR::CompiledShaderInfo read_write_program{};
+    ShaderModule read_write_program;
     ShaderRecompiler::IR::ResourceSnapshot read_write_snapshot;
     const auto read_write_input =
         MakeInput(read_write_meta, true, true, read_write_program,
@@ -5574,7 +5624,7 @@ public:
                 !texture_cache.IsMetaCleared(read_write_meta, 0),
             "a metadata read/modify/write dispatch was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo write_only_program{};
+    ShaderModule write_only_program;
     ShaderRecompiler::IR::ResourceSnapshot write_only_snapshot;
     const auto write_only_input =
         MakeInput(write_only_meta, false, true, write_only_program,
@@ -11099,9 +11149,9 @@ public:
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), input);
-        if (original_id == 0) original_id = program.id;
+        if (original_id == 0) original_id = program->id;
         Require(name, "exact function identity",
-                (program.id == original_id) == (test.value == 41),
+                (program->id == original_id) == (test.value == 41),
                 "helper bytes were stale or identical relocated/restored code recompiled");
         Require(name, "current code dependency",
                 std::ranges::find(input.stage.resources->specialization_reads,
@@ -11191,9 +11241,9 @@ public:
             ShaderComputeInputInfo input{};
             const auto program = context.GetPipelineCache().GetComputeProgram(
                 shaders.GetCs(), input);
-            if (phase == 1) original_vector_id = program.id;
+            if (phase == 1) original_vector_id = program->id;
             if (phase >= 2)
-              Require(name, "ordered helper identity", (program.id == original_vector_id) == (phase == 3),
+              Require(name, "ordered helper identity", (program->id == original_vector_id) == (phase == 3),
                       "swapped helper targets reused stale code or restored targets recompiled");
             const auto& reads = input.stage.resources->specialization_reads;
             for (u32 i = 0; i < (call_count == 1 ? 1u : 2u); ++i)
@@ -11689,7 +11739,7 @@ public:
           Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
           {8, 1, 1}, 1, 4, 1);
       const auto image = textures.FindImage(image_desc);
-      ShaderProgram previous_program;
+      uint64_t previous_id = 0;
       for (const auto count : {3u, 7u}) {
         cache.FillBuffer(count_output, 16u * sizeof(u32), sentinel, false);
         shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
@@ -11734,11 +11784,11 @@ public:
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), input);
-        if (previous_program.id != 0) {
-          Require(name, "count permutation reuse", program.id == previous_program.id,
+        if (previous_id != 0) {
+          Require(name, "count permutation reuse", program->id == previous_id,
                   "a changing GPU count compiled a new shader permutation");
         }
-        previous_program = program;
+        previous_id = program->id;
         Require(name, "clean count repeat",
                 CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
                     scheduler.CurrentTick() == clean_tick,
@@ -11818,29 +11868,29 @@ public:
             shaders.GetCs(), input);
         Require(name, "workgroup table refresh and coalescing",
                 input.workgroup_counts[2] == test.groups &&
-                    input.stage.program->info.images.size() == 1 &&
-                    input.stage.program->info.images[0].indirect_resources.empty() &&
+                    input.stage.module->info.info.images.size() == 1 &&
+                    input.stage.module->info.info.images[0].indirect_resources.empty() &&
                     input.stage.resources->images.size() == 1 &&
                     std::equal(std::begin(sharp.fields), std::end(sharp.fields),
                                input.stage.resources->images[0].dwords.begin()) &&
-                    !input.stage.program->info.buffers.empty(),
+                    !input.stage.module->info.info.buffers.empty(),
                 "workgroup bounds, refreshed sharp, or live descriptor dimension reads were lost");
         Require(name, "workgroup table program reuse",
-                table_program_id == 0 || program.id == table_program_id,
+                table_program_id == 0 || program->id == table_program_id,
                 "changing the workgroup count or identical sharp values recompiled the shader");
-        table_program_id = program.id;
+        table_program_id = program->id;
         const auto *snapshot = input.stage.resources;
         const auto *image_storage = snapshot->images.data();
         const auto flattened_capacity = snapshot->flattened_srt.capacity();
         const auto repeated = context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), input);
         Require(name, "workgroup table cache-hit storage reuse",
-                repeated.id == program.id && input.stage.resources == snapshot &&
+                repeated->id == program->id && input.stage.resources == snapshot &&
                     snapshot->images.data() == image_storage &&
                     snapshot->flattened_srt.capacity() == flattened_capacity,
                 "a repeated descriptor table hit replaced its snapshot or storage");
         auto binding = RenderExecutorTestAccess::ResolveTexture(
-            context.GetRenderExecutor(), input.stage.program->info.images[0],
+            context.GetRenderExecutor(), input.stage.module->info.info.images[0],
             input.stage.resources->images[0]);
         const auto target = textures.FindImage(binding.desc);
         TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), target,
@@ -12073,11 +12123,11 @@ public:
         input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
         (void)context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), input);
-        const auto &info = input.stage.program->info;
+        const auto &info = input.stage.module->info.info;
         const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
           return buffer.indirect_resources.size() == material_rows;
         });
-        const auto &bindings = input.stage.program->bindings;
+        const auto &bindings = input.stage.module->info.bindings;
         const auto native_count = bindings.descriptor_counts[
             static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
         Require(name, "native material descriptor array",
@@ -14331,14 +14381,15 @@ public:
       };
       const auto make_buffer_program =
           [](ShaderType stage, ShaderRecompiler::IR::BufferResource resource) {
-            ShaderRecompiler::IR::CompiledShaderInfo program{};
+            ShaderModule module;
+            auto &program = module.info;
             program.stage = stage;
             resource.descriptor_index = 0;
             program.info.buffers.push_back(resource);
             program.bindings.descriptor_counts[0] = 1;
             program.bindings.descriptor_mask = 1;
             program.bindings.push_data_start_dword = 0;
-            return program;
+            return module;
           };
 
       {
@@ -14441,7 +14492,7 @@ public:
                 bindings.buffers[0].buffer == owner.Handle() &&
                     bindings.buffers[0].offset + 2 == owner.Offset(buffer_address) &&
                     bindings.buffers[0].range == 14 &&
-                    bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
+                    bindings.shader_data[buffer_program.info.bindings.memory_offset_dword] == 2,
                 "native binding lost the byte adjustment or rounded the final halfword range");
       }
 
@@ -14449,7 +14500,8 @@ public:
         constexpr uint64_t address = base + allocation_size - 0x4000 + 12;
         constexpr uint64_t mapped_tail = base + allocation_size - address;
         auto writer = make_buffer_program(ShaderType::Vertex, {.written = true});
-        ShaderRecompiler::IR::CompiledShaderInfo reader{};
+        ShaderModule reader_module;
+        auto &reader = reader_module.info;
         reader.stage = ShaderType::Pixel;
         ShaderRecompiler::IR::ResourceSnapshot writer_snapshot, reader_snapshot;
         ShaderBufferResource descriptor{};
@@ -14459,7 +14511,7 @@ public:
         std::copy_n(descriptor.fields, 4, value.dwords.begin());
         value.dword_count = 4;
         ShaderStageRuntime writer_runtime{&writer, &writer_snapshot};
-        ShaderStageRuntime reader_runtime{&reader, &reader_snapshot};
+        ShaderStageRuntime reader_runtime{&reader_module, &reader_snapshot};
         PreparedBindings writer_bindings, reader_bindings;
         const auto check_range = [&](uint64_t expected, const char *description) {
           executor.PrepareBindings(writer_runtime, writer_bindings);
@@ -14490,8 +14542,8 @@ public:
         value.dwords[2] = 0x300;
         check_range(0x300, "finite write preserves its declared range");
         value.dwords[2] = UINT32_MAX;
-        writer.info.buffers[0].written = false;
-        writer.info.buffers[0].read = true;
+        writer.info.info.buffers[0].written = false;
+        writer.info.info.buffers[0].read = true;
         check_range(mapped_tail, "read-only sentinel preserves mapped tail");
         auto &graphics = context.GetGraphics();
         auto &storage_limit = graphics.physical_device_properties.limits.maxStorageBufferRange;
@@ -14538,7 +14590,8 @@ public:
           texture_cache.MarkGpuWritten(depth_id);
           expected = 0xffff;
         }
-        ShaderRecompiler::IR::CompiledShaderInfo program{};
+        ShaderModule module;
+        auto &program = module.info;
         program.stage = ShaderType::Compute;
         ShaderRecompiler::IR::ResourceSnapshot snapshot;
         // PPSA24156 binds one-texel R8/R16 allocations as 3D, then 2D.
@@ -14560,7 +14613,7 @@ public:
               DstSel(4, 4, 4, 1) | (static_cast<u32>(type) << 28u),
               0, 0x00700000u, 0, 0};
         }
-        ShaderStageRuntime runtime{&program, &snapshot};
+        ShaderStageRuntime runtime{&module, &snapshot};
         PreparedBindings bindings;
         executor.PrepareBindings(runtime, bindings);
         Require(name, "overlapping dimension discovery",
@@ -14683,11 +14736,12 @@ public:
       null_program.info.images.back().mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
       null_program.info.images.back().mip_count = 3;
       set_image_bindings(null_program);
-      ShaderRecompiler::IR::CompiledShaderInfo null_info{};
+      ShaderModule null_module;
+      auto &null_info = null_module.info;
       null_info.stage = null_program.stage;
       null_info.info = std::move(null_program.info);
       null_info.bindings = std::move(null_program.bindings);
-      ShaderStageRuntime null_runtime{&null_info, &null_snapshot};
+      ShaderStageRuntime null_runtime{&null_module, &null_snapshot};
       PreparedBindings null_bindings;
       executor.PrepareBindings(null_runtime, null_bindings);
       executor.RebindImages(null_bindings);
@@ -14923,7 +14977,8 @@ public:
                   tail4 == std::vector<u32>{tail_backing_value},
               "expanding a shared mip tail lost GPU writes or the added mip's backing bytes");
       PreparedBindings mipped_prepared{};
-      ShaderRecompiler::IR::CompiledShaderInfo mipped_program{};
+      ShaderModule mipped_module;
+      auto &mipped_program = mipped_module.info;
       mipped_program.info.images.push_back(storage_resource);
       mipped_program.info.images.push_back(mipped_storage_resource);
       mipped_program.info.images.push_back(storage_resource);
@@ -14933,7 +14988,7 @@ public:
                                 mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor};
-      ShaderStageRuntime mipped_runtime{&mipped_program, &mipped_snapshot};
+      ShaderStageRuntime mipped_runtime{&mipped_module, &mipped_snapshot};
       mipped_prepared.runtime = &mipped_runtime;
       mipped_prepared.images.push_back(
           std::move(plain_mipped_storage_binding));
@@ -15114,7 +15169,8 @@ public:
                     views[2] != views[3] && views[1] == views.back(),
                 "different texture clamps aliased or identical clamped views "
                 "were not reused");
-        ShaderRecompiler::IR::CompiledShaderInfo gather_info{};
+        ShaderModule gather_module;
+        auto &gather_info = gather_module.info;
         gather_info.stage = ShaderType::Compute;
         gather_info.info = lod_program.program.info;
         gather_info.info.images[0].mip_mode =
@@ -15122,7 +15178,7 @@ public:
         gather_info.info.images[0].mip_count = 4;
         auto gather_snapshot = lod_program.resources;
         gather_snapshot.images[0] = lod_descriptor;
-        ShaderStageRuntime gather_runtime{&gather_info, &gather_snapshot};
+        ShaderStageRuntime gather_runtime{&gather_module, &gather_snapshot};
         PreparedBindings gather_bindings;
         executor.PrepareBindings(gather_runtime, gather_bindings);
         executor.RebindImages(gather_bindings);
@@ -15277,11 +15333,12 @@ public:
 
       ShaderRecompiler::IR::ResourceSnapshot storage_snapshot{};
       storage_snapshot.images.push_back(storage_descriptor);
-      ShaderRecompiler::IR::CompiledShaderInfo storage_info{};
+      ShaderModule storage_module;
+      auto &storage_info = storage_module.info;
       storage_info.stage = storage_program.stage;
       storage_info.info = std::move(storage_program.info);
       storage_info.bindings = std::move(storage_program.bindings);
-      ShaderStageRuntime storage_runtime{&storage_info, &storage_snapshot};
+      ShaderStageRuntime storage_runtime{&storage_module, &storage_snapshot};
       PreparedBindings storage_discovery;
       executor.PrepareBindings(storage_runtime, storage_discovery);
       const auto storage_id = storage_discovery.images[0].image_id;
@@ -15308,11 +15365,12 @@ public:
       set_image_bindings(sampled_program);
       ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
       sampled_snapshot.images.push_back(storage_descriptor);
-      ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
+      ShaderModule sampled_module;
+      auto &sampled_info = sampled_module.info;
       sampled_info.stage = sampled_program.stage;
       sampled_info.info = std::move(sampled_program.info);
       sampled_info.bindings = std::move(sampled_program.bindings);
-      ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
+      ShaderStageRuntime sampled_runtime{&sampled_module, &sampled_snapshot};
 
       constexpr uint64_t ordered_sampled_address = base + 0x10000;
       const uint32_t ordered_sampled_value = 0x89abcdefu;
@@ -15332,7 +15390,7 @@ public:
       ordered_descriptor.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot ordered_snapshot{};
       ordered_snapshot.images.push_back(ordered_descriptor);
-      ShaderStageRuntime ordered_sampled_runtime{sampled_runtime.program,
+      ShaderStageRuntime ordered_sampled_runtime{sampled_runtime.module,
                                                  &ordered_snapshot};
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
@@ -15387,23 +15445,25 @@ public:
       vertex_sampled_program.resource_tracking_complete = true;
       vertex_sampled_program.info.images.push_back(sampled_resource);
       set_image_bindings(vertex_sampled_program);
-      ShaderRecompiler::IR::CompiledShaderInfo vertex_sampled_info{};
+      ShaderModule vertex_sampled_module;
+      auto &vertex_sampled_info = vertex_sampled_module.info;
       vertex_sampled_info.stage = vertex_sampled_program.stage;
       vertex_sampled_info.info = std::move(vertex_sampled_program.info);
       vertex_sampled_info.bindings =
           std::move(vertex_sampled_program.bindings);
       ShaderStageRuntime vertex_sampled_runtime{
-          &vertex_sampled_info, sampled_runtime.resources};
+          &vertex_sampled_module, sampled_runtime.resources};
       ShaderRecompiler::IR::Program pixel_storage_program{};
       pixel_storage_program.stage = ShaderType::Pixel;
       pixel_storage_program.resource_tracking_complete = true;
       pixel_storage_program.info.images.push_back(storage_resource);
       set_image_bindings(pixel_storage_program);
-      ShaderRecompiler::IR::CompiledShaderInfo pixel_storage_info{};
+      ShaderModule pixel_storage_module;
+      auto &pixel_storage_info = pixel_storage_module.info;
       pixel_storage_info.stage = pixel_storage_program.stage;
       pixel_storage_info.info = std::move(pixel_storage_program.info);
       pixel_storage_info.bindings = std::move(pixel_storage_program.bindings);
-      ShaderStageRuntime pixel_storage_runtime{&pixel_storage_info,
+      ShaderStageRuntime pixel_storage_runtime{&pixel_storage_module,
                                                storage_runtime.resources};
       auto writable_alias_bindings =
           RenderExecutorTestAccess::PrepareGraphicsBindings(
@@ -15476,13 +15536,14 @@ public:
       split_ir.resource_tracking_complete = true;
       split_ir.info.images = {storage_resource, sampled_resource};
       set_image_bindings(split_ir);
-      ShaderRecompiler::IR::CompiledShaderInfo split_program{};
+      ShaderModule split_module;
+      auto &split_program = split_module.info;
       split_program.stage = split_ir.stage;
       split_program.info = std::move(split_ir.info);
       split_program.bindings = std::move(split_ir.bindings);
       PreparedBindings split_bindings{};
       ShaderRecompiler::IR::ResourceSnapshot split_snapshot;
-      ShaderStageRuntime split_runtime{&split_program, &split_snapshot};
+      ShaderStageRuntime split_runtime{&split_module, &split_snapshot};
       split_bindings.runtime = &split_runtime;
       split_bindings.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
@@ -15569,12 +15630,13 @@ public:
       depth_views_ir.resource_tracking_complete = true;
       depth_views_ir.info.images = {sampled_resource, sampled_resource};
       set_image_bindings(depth_views_ir);
-      ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
+      ShaderModule depth_views_module;
+      auto &depth_views_program = depth_views_module.info;
       depth_views_program.stage = depth_views_ir.stage;
       depth_views_program.info = std::move(depth_views_ir.info);
       depth_views_program.bindings = std::move(depth_views_ir.bindings);
       ShaderRecompiler::IR::ResourceSnapshot depth_views_snapshot;
-      ShaderStageRuntime depth_views_runtime{&depth_views_program, &depth_views_snapshot};
+      ShaderStageRuntime depth_views_runtime{&depth_views_module, &depth_views_snapshot};
       PreparedBindings depth_views_binding{};
       depth_views_binding.runtime = &depth_views_runtime;
       depth_views_binding.images.push_back(
@@ -15909,8 +15971,8 @@ public:
       registers.SetDepthClearValue(0.375f);
       ShaderRecompiler::IR::ResourceSnapshot bounds_snapshot;
       bounds_snapshot.images.push_back(sampled_depth_value);
-      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, &bounds_snapshot};
-      ShaderStageRuntime bounds_pixel{&sampled_info, &bounds_snapshot};
+      ShaderStageRuntime bounds_vertex{&vertex_sampled_module, &bounds_snapshot};
+      ShaderStageRuntime bounds_pixel{&sampled_module, &bounds_snapshot};
       const auto depth_texels = depth_only.desc.info.extent.width *
                                 depth_only.desc.info.extent.height;
       const auto depth_bytes = depth_texels * sizeof(uint32_t);
@@ -16326,9 +16388,9 @@ public:
       shared_depth_value.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot shared_depth_snapshot;
       shared_depth_snapshot.images.push_back(shared_depth_value);
-      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_info,
+      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_module,
                                               &shared_depth_snapshot};
-      ShaderStageRuntime shared_depth_pixel{&sampled_info,
+      ShaderStageRuntime shared_depth_pixel{&sampled_module,
                                              &shared_depth_snapshot};
       for (const bool stencil_write : {true, false}) {
         registers.SetDepthRenderTarget(phased_depth_target);
@@ -16500,7 +16562,8 @@ public:
           (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
       array_texture.fields[4] = 1;
 
-      ShaderRecompiler::IR::CompiledShaderInfo array_program{};
+      ShaderModule array_module;
+      auto &array_program = array_module.info;
       array_program.stage = ShaderType::Compute;
       ShaderRecompiler::IR::ImageResource array_resource{};
       array_resource.resource_class =
@@ -16517,7 +16580,7 @@ public:
       array_descriptor.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot array_snapshot{};
       array_snapshot.images.push_back(array_descriptor);
-      ShaderStageRuntime array_runtime{&array_program, &array_snapshot};
+      ShaderStageRuntime array_runtime{&array_module, &array_snapshot};
 
       PreparedBindings array_binding;
       executor.PrepareBindings(array_runtime, array_binding);
@@ -16684,7 +16747,8 @@ public:
                 std::end(colliding_msaa_texture.fields),
                 colliding_msaa_descriptor.dwords.begin());
       colliding_msaa_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo colliding_msaa_program{};
+      ShaderModule colliding_msaa_module;
+      auto &colliding_msaa_program = colliding_msaa_module.info;
       colliding_msaa_program.stage = ShaderType::Compute;
       auto colliding_msaa_resource = array_resource;
       colliding_msaa_resource.dimension =
@@ -16693,7 +16757,7 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot colliding_msaa_snapshot{};
       colliding_msaa_snapshot.images.push_back(colliding_msaa_descriptor);
       ShaderStageRuntime colliding_msaa_runtime{
-          &colliding_msaa_program, &colliding_msaa_snapshot};
+          &colliding_msaa_module, &colliding_msaa_snapshot};
       PreparedBindings colliding_msaa_binding;
       executor.PrepareBindings(colliding_msaa_runtime, colliding_msaa_binding);
       executor.RebindImages(colliding_msaa_binding);
@@ -16744,7 +16808,8 @@ public:
       std::copy(std::begin(msaa_texture.fields), std::end(msaa_texture.fields),
                 msaa_descriptor.dwords.begin());
       msaa_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo msaa_program{};
+      ShaderModule msaa_module;
+      auto &msaa_program = msaa_module.info;
       msaa_program.stage = ShaderType::Compute;
       auto msaa_resource = array_resource;
       msaa_resource.dimension =
@@ -16752,7 +16817,7 @@ public:
       msaa_program.info.images.push_back(msaa_resource);
       ShaderRecompiler::IR::ResourceSnapshot msaa_snapshot{};
       msaa_snapshot.images.push_back(msaa_descriptor);
-      ShaderStageRuntime msaa_runtime{&msaa_program, &msaa_snapshot};
+      ShaderStageRuntime msaa_runtime{&msaa_module, &msaa_snapshot};
       PreparedBindings msaa_binding;
       executor.PrepareBindings(msaa_runtime, msaa_binding);
       executor.RebindImages(msaa_binding);
@@ -16784,7 +16849,8 @@ public:
                 std::end(msaa_array_texture.fields),
                 msaa_array_descriptor.dwords.begin());
       msaa_array_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo msaa_array_program{};
+      ShaderModule msaa_array_module;
+      auto &msaa_array_program = msaa_array_module.info;
       msaa_array_program.stage = ShaderType::Compute;
       auto msaa_array_resource = array_resource;
       msaa_array_resource.dimension =
@@ -16792,7 +16858,7 @@ public:
       msaa_array_program.info.images.push_back(msaa_array_resource);
       ShaderRecompiler::IR::ResourceSnapshot msaa_array_snapshot{};
       msaa_array_snapshot.images.push_back(msaa_array_descriptor);
-      ShaderStageRuntime msaa_array_runtime{&msaa_array_program, &msaa_array_snapshot};
+      ShaderStageRuntime msaa_array_runtime{&msaa_array_module, &msaa_array_snapshot};
       PreparedBindings msaa_array_binding;
       executor.PrepareBindings(msaa_array_runtime, msaa_array_binding);
       executor.RebindImages(msaa_array_binding);
@@ -17033,7 +17099,8 @@ public:
           DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(linear) << 20u) |
           (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
 
-      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      ShaderModule module;
+      auto &program = module.info;
       program.stage = ShaderType::Compute;
       ShaderRecompiler::IR::ImageResource stencil_resource{};
       stencil_resource.resource_class =
@@ -17050,7 +17117,7 @@ public:
                 descriptor.dwords.begin());
       descriptor.dword_count = 8;
       snapshot.images.push_back(descriptor);
-      ShaderStageRuntime runtime{&program, &snapshot};
+      ShaderStageRuntime runtime{&module, &snapshot};
 
       PreparedBindings prepared;
       context.GetRenderExecutor().PrepareBindings(runtime, prepared);
@@ -17139,10 +17206,10 @@ public:
           "captured stencil shader could not resolve its clear byte");
       ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
-      ShaderRecompiler::IR::CompiledShaderInfo stencil_program{};
-      stencil_program.stage = ShaderType::Compute;
-      stencil_program.info = std::move(stencil_translated.program.info);
-      stencil_compute.stage.program = &stencil_program;
+      ShaderModule stencil_program;
+      stencil_program.info.stage = ShaderType::Compute;
+      stencil_program.info.info = std::move(stencil_translated.program.info);
+      stencil_compute.stage.module = &stencil_program;
       vk::ClearValue stencil_initial{};
       stencil_initial.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x91};
       TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), depth_id,
@@ -18294,19 +18361,20 @@ public:
     AppendEnd(&test.fragment_code);
     auto fragment = CompileFragmentCase(test);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
-    ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
-    ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
-    ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
-    vertex_program.stage = ShaderType::Vertex;
-    vertex_program.info.vertex_fetch_components[0] = 2;
-    vertex_program.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
-    ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
-    pixel_program.stage = ShaderType::Pixel;
-    pixel_program.info = fragment.program.info;
-    pixel_program.bindings = fragment.program.bindings;
+    ShaderModule vertex_shader{.id = 1, .module = CreateShaderModule(name, vertex_spirv)};
+    vertex_shader.info.stage = ShaderType::Vertex;
+    vertex_shader.info.info.vertex_fetch_components[0] = 2;
+    vertex_shader.info.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
+    // No narrower host format covers the components the stage reads from either attribute.
+    vertex_shader.vertex_formats = {VulkanFormat(Prospero::BufferFormat::k32_32Float),
+                                    VulkanFormat(color_format)};
+    ShaderModule pixel_shader{.id = 2, .module = CreateShaderModule(name, fragment.spirv)};
+    pixel_shader.info.stage = ShaderType::Pixel;
+    pixel_shader.info.info = fragment.program.info;
+    pixel_shader.info.bindings = fragment.program.bindings;
     ShaderVertexInputInfo vertex{};
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
-    vertex.stage.program = &vertex_program;
+    vertex.stage.module = &vertex_shader;
     vertex.stage.resources = &vertex_snapshot;
     vertex.resources_num = 2;
     vertex.buffers_num = 1;
@@ -18317,10 +18385,10 @@ public:
       vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) |
                                       (static_cast<uint32_t>(format) << 12u);
       vertex.resources_dst[i].registers_num =
-          i == 0 ? 2 : vertex_program.info.vertex_fetch_components[1];
+          i == 0 ? 2 : vertex_shader.info.info.vertex_fetch_components[1];
     }
     ShaderPixelInputInfo pixel{};
-    pixel.stage.program = &pixel_program;
+    pixel.stage.module = &pixel_shader;
     pixel.stage.resources = &fragment.resources;
 
     RenderColorInfo color{};
@@ -18368,8 +18436,6 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      state.vertex_info[0].stage.handle = &vertex_shader;
-      state.ps_input_info.stage.handle = &pixel_shader;
       return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
@@ -18723,8 +18789,6 @@ public:
            .code_size_bytes = static_cast<uint32_t>(native_pixel.size() * sizeof(u32))});
       shaders.SetEsShaderBase(vertex_address);
       shaders.SetPsShaderBase(pixel_address);
-      const auto owned_vertex_shader = vertex_shader;
-      const auto owned_pixel_shader = pixel_shader;
       depth.stencil_test_enable = false;
       registers.SetViewportTransformControl(0x300);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
@@ -18738,8 +18802,6 @@ public:
         const auto native = refresh();
         vertex = native.vertex_info[0];
         pixel = native.ps_input_info;
-        vertex_shader = *vertex.stage.handle;
-        pixel_shader = *pixel.stage.handle;
       };
       const auto silent = refresh();
       registers.SetDepthShaderControl({.shader_kill_enable = true});
@@ -18763,7 +18825,7 @@ public:
                   depth_writing.ps_active && depth_writing.mrt_mask == 0 &&
                   writing.ps_active && writing.mrt_mask == 1u && partial.mrt_mask == 1u &&
                   writing.VertexStages().size() == 1 &&
-                  writing.vertex_info[0].stage.handle != nullptr,
+                  writing.vertex_info[0].stage.module != nullptr,
               "pixel activity or its MRT mask ignored the color outputs or depth side effects");
       std::array<uint64_t, 2> wave_ids{};
       std::array<std::vector<u32>, 2> wave_keys;
@@ -18774,17 +18836,17 @@ public:
         registers.SetPsInControl(wave.control);
         native_programs();
         Require(name, "pixel wave metadata propagation",
-                pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
+                pixel.input_num == 8 && pixel.stage.module->info.wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
         const auto index = static_cast<uint32_t>(wave.width == 32);
         std::vector<u32> key;
         BuildStageStaticKey(pixel, key);
         if (wave_ids[index] != 0) {
           Require(name, "pixel wave cache reuse",
-                  pixel_shader.id == wave_ids[index] && key == wave_keys[index],
+                  pixel.stage.module->id == wave_ids[index] && key == wave_keys[index],
                   "restoring wave64 did not reuse its original program");
         }
-        wave_ids[index] = pixel_shader.id;
+        wave_ids[index] = pixel.stage.module->id;
         wave_keys[index] = std::move(key);
         draw(pipeline(true, 2, 2));
         const auto wave_pixels = read_color();
@@ -18832,8 +18894,8 @@ public:
                                    (wave == 32u ? 0x00400000u : 0u));
         native_programs();
         Require(name, "native NGG waterfall wave",
-                vertex.stage.program->stage == ShaderType::Vertex &&
-                    vertex.stage.program->wave_size == wave,
+                vertex.stage.module->info.stage == ShaderType::Vertex &&
+                    vertex.stage.module->info.wave_size == wave,
                 "NGG waterfall bypassed the native vertex path or lost its guest wave width");
         for (const u32 count : {3u, 6u, 33u}) {
           draw(pipeline(true, 2, 2), count);
@@ -18907,10 +18969,10 @@ public:
         auto &selected = pipeline(true, 2, 2);
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
-                  broadcast_program == 0 || (pixel_shader.id == broadcast_program &&
+                  broadcast_program == 0 || (pixel.stage.module->id == broadcast_program &&
                                               selected.pipeline == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
-          broadcast_program = pixel_shader.id;
+          broadcast_program = pixel.stage.module->id;
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
@@ -19333,6 +19395,13 @@ public:
         check("auto embedded fetch", fetch_vs, false, 4);
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
+        // Pipelines created from only their key and stage modules draw the same.
+        scheduler.Finish();
+        Require("PipelineFromKey", "vertex input pipelines",
+                PipelineCacheTestAccess::RecreateGraphicsPipelines(context.GetPipelineCache()) > 0,
+                "no cached graphics pipeline named only compiled modules");
+        check("recreated indexed embedded fetch", fetch_vs, true, 0);
+        check("recreated auto native fetch", vertex_address, false, 6);
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
@@ -19382,10 +19451,7 @@ public:
       registers.SetPsInputEna(2);
       registers.SetPsInputAddr(2);
       registers.SetPsInputSettings(0, 0);
-      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
-                                    Prospero::PrimitiveType::kRectListLegacy}) {
-        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
-                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
+      const auto check_rect = [&](Prospero::PrimitiveType primitive, const char *rect_name) {
         user_config.SetPrimitiveType(primitive);
         registers.SetModeControl({});
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
@@ -19409,7 +19475,14 @@ public:
             }
           }
         }
-      }
+      };
+      check_rect(Prospero::PrimitiveType::kRectList, "RectListThreeRecords");
+      check_rect(Prospero::PrimitiveType::kRectListLegacy, "LegacyRectListThreeRecords");
+      scheduler.Finish();
+      Require("PipelineFromKey", "rectangle-list pipelines",
+              PipelineCacheTestAccess::RecreateGraphicsPipelines(context.GetPipelineCache()) > 0,
+              "no cached graphics pipeline named only compiled modules");
+      check_rect(Prospero::PrimitiveType::kRectList, "PipelineFromKeyRectList");
       // Captured format30 uses uncompressed mode9 at MRT2. Keep a blended
       // floating-point MRT live beside it, including sparse export routing.
       constexpr uint64_t packed_address = depth_address + 0x28000;
@@ -19516,9 +19589,10 @@ public:
                 "packed conversion or rounding contaminated another MRT or followed a physical slot");
         if (test.slot == 2) {
           auto &id = test.truncate ? truncate_program : half_up_program;
-          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.id,
+          Require(name, "packed rounding program reuse",
+                  id == 0 || id == pixel.stage.module->id,
                   "restoring half-up rounding failed to reuse its program");
-          id = pixel_shader.id;
+          id = pixel.stage.module->id;
         }
         RenderColorInfo packed_target{}, float_target{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -19576,9 +19650,6 @@ public:
       DestroyBuffer(&packed_output);
       m_device.destroySampler(packed_sampler);
       DestroyBuffer(&stencil_readback);
-
-      vertex_shader = owned_vertex_shader;
-      pixel_shader = owned_pixel_shader;
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
@@ -25927,13 +25998,43 @@ TestCase Vop3CvtPkI16I32Captured() {
   TestCase test;
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
+  // Each half saturates: 98305 -> 0x7fff, -98306 -> 0x8000.
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
-  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
   test.ir_counts = {{" = BitFieldInsert ", 1}};
   test.required_spirv = {"OpBitFieldInsert"};
+  return test;
+}
+
+// V_CVT_PK_U16_U32 / V_CVT_PK_I16_I32 saturate each half: Min(src.u, 0xffff) and
+// Clamp(src.s, -0x8000, 0x7fff).
+TestCase Vop3CvtPk16Saturates() {
+  using O = ShaderOpcode;
+
+  TestCase test;
+  test.name = "Vop3CvtPk16Saturates";
+  test.initial = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                  0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                  0u,          0u,          0u,          0u};
+  test.expected = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                   0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                   0xffff1234u, 0xffffffffu, 0x80007fffu, 0x80007fffu};
+  auto &code = test.code;
+  for (u32 i = 0; i < 8u; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, i, 30);
+  }
+  AppendVop3(&code, 0x36a, 10, Vgpr(0), Vgpr(1)); // in range
+  AppendVop3(&code, 0x36a, 11, Vgpr(2), Vgpr(3)); // both clamp to 0xffff
+  AppendVop3(&code, 0x36b, 12, Vgpr(4), Vgpr(5)); // in range
+  AppendVop3(&code, 0x36b, 13, Vgpr(6), Vgpr(7)); // clamp to 0x7fff / 0x8000
+  for (u32 i = 0; i < 4u; i++) AppendStoreVgpr(&code, 10u + i, 8u + i);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PK_U16_U32,
+                  O::V_CVT_PK_I16_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -26989,7 +27090,7 @@ TestCase VectorLaneAndPackedOps() {
           {},
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
-           0x40000000u, 0xef015678u},
+           0x40000000u, 0xffffffffu},
           {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32,
            O::V_WRITELANE_B32, O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32,
            O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
@@ -27576,16 +27677,16 @@ TestCase VectorSpecialF16Ops() {
 TestCase VectorFractF16CapturedAndEdges() {
   using O = ShaderOpcode;
 
-  // RDNA2 section 12.8: x - floor(x), rounded to half precision.
+  // x - floor(x) rounded to half precision, clamped to 0x3bff below one.
   // Load at runtime to exercise the emitted operation, including half subnormals.
   const std::array<u32, 18> inputs{
       0x3d00u, 0xbd00u, 0x0000u, 0x8000u, 0x0001u, 0x8001u,
       0x03ffu, 0x83ffu, 0x7bffu, 0xfbffu, 0x3800u, 0xb800u,
       0x8c00u, 0x8c01u, 0x7c00u, 0xfc00u, 0x7e55u, 0x7d01u};
   const std::array<u32, 18> fractions{
-      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3c00u,
-      0x03ffu, 0x3c00u, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
-      0x3c00u, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
+      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3bffu,
+      0x03ffu, 0x3bffu, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
+      0x3bffu, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
   TestCase test;
   test.name = "VectorFractF16CapturedAndEdges";
   for (u32 bits : inputs) {
@@ -27613,6 +27714,37 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
+  return test;
+}
+
+// V_FRACT_F32 clamps to 0x3f7fffff where x - floor(x) rounds to 1.0, before output modifiers.
+TestCase VectorFractF32Edges() {
+  using O = ShaderOpcode;
+
+  constexpr std::array<std::array<u32, 3>, 4> cases{{
+      {0xb3800000u, 0, 0x3f7fffffu},   // -2^-24: exact
+      {0xb3000000u, 0, 0x3f7fffffu},   // -2^-25: the tie rounds to 1.0
+      {0xb3000000u, 1, 0x3fffffffu},   // omod *2 applies after the clamp
+      {0x7fc00001u, 0, 0x7fc00000u}}}; // Quiet NaN class
+  TestCase test;
+  test.name = "VectorFractF32Edges";
+  for (const auto &[source, omod, expected] : cases) test.initial.push_back(source);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 7, 30);
+    AppendVop3(&code, 0x1a0, 9, Vgpr(7), 0, 0, 0, 0, false, cases[i][1]);
+    if (i + 1u == cases.size()) {
+      code.push_back(EncodeVop2(0x1b, 9, 255u, 9));
+      code.push_back(0x7fc00000u);
+    }
+    AppendStoreVgpr(&code, 9, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(cases[i][2]);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F32,
+                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -27892,56 +28024,53 @@ TestCase VectorPermlanex16() {
   return test;
 }
 
-TestCase VectorPermlane16FetchInactiveZero() {
+TestCase VectorPermlane16InactiveSource(u32 op_sel, u32 wave_size) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code = {
-      EncodeVop1(0x01, 1, 0),
-      EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeVopc(0xc2, InlineU32(0), 0),
-      EncodeSop1(0x04, 126, 106),
-      EncodeSMovB32(0, InlineU32(1)),
-      EncodeSMovB32(1, InlineU32(0)),
-  };
-  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1);
-  AppendStoreVgpr(&code, 2, 0);
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  // Each lane reads its pair neighbour; the halves differ, so each needs its own EXEC.
+  // OP_SEL is 0 (keep the destination), 1 (FI) or 2 (BOUND_CTRL).
+  const u32 masks[] = {0x5f5ff5f5u, 0xf5f55f5fu};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendSMovLiteral(&code, 0, 0x67452301u);
+  AppendSMovLiteral(&code, 1, 0xefcdab89u);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
+  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, op_sel);
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "VectorPermlane16FetchInactiveZero";
-  test.code = code;
-  test.expected = {0};
-  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
-                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  return test;
-}
-
-TestCase VectorPermlane16FetchInactiveFi() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code = {
-      EncodeVop1(0x01, 1, Vgpr(0)),      EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeVopc(0xc2, InlineU32(0), 0), EncodeSop1(0x04, 126, 106),
-      EncodeSMovB32(0, InlineU32(1)),    EncodeSMovB32(1, InlineU32(0)),
-  };
-  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, 1);
-  AppendStoreVgpr(&code, 2, 0);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorPermlane16FetchInactiveFi";
-  test.code = code;
-  test.expected = {11};
-  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
-                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
+  const char *names[3][2] = {
+      {"VectorPermlane16InactiveSourceKeepsWave32",
+       "VectorPermlane16InactiveSourceKeepsWave64"},
+      {"VectorPermlane16InactiveSourceFiWave32",
+       "VectorPermlane16InactiveSourceFiWave64"},
+      {"VectorPermlane16InactiveSourceZeroWave32",
+       "VectorPermlane16InactiveSourceZeroWave64"}};
+  test.name = names[op_sel][wave_size == 64];
+  test.code = std::move(code);
+  test.expected.resize(wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) continue;
+    const u32 source = lane ^ 1u;
+    if (op_sel == 1 || (mask & (1u << (source % 32u))) != 0) {
+      test.expected[lane] = 100u + source;
+    } else if (op_sel == 2) {
+      test.expected[lane] = 0;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,  O::S_MOV_B32,
+                  O::V_PERMLANE16_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.forbidden_spirv = {"OpCopyObject"};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -28177,25 +28306,56 @@ TestCase VectorDppBankMaskPreservesDestination() {
   return test;
 }
 
-TestCase VectorDppBoundsControlZeroPreservesDestination() {
+TestCase VectorDppInactiveSource(bool row_shift, bool bound_ctrl, u32 wave_size) {
   using O = ShaderOpcode;
-
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  // Each half mixes active, EXEC-disabled and (for row_shr:1) vacated sources.
+  const u32 masks[] = {0x5f5ff5f5u, 0xf5f55f5fu};
   std::vector<u32> code;
-  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
   AppendVMovU32(&code, 1, 100);
-  code.push_back(EncodeVop2(0x25, 2, 250, 1));
-  code.push_back(EncodeVop2Dpp(0, 0x111));
-  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
-  AppendBufferStoreDword(&code, 2, 3);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovU32(&code, 7, 1000);
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
+  // v_add_nc_u32_dpp v2, v1, v7 with row_shr:1 or quad_perm:[3,2,1,0]; bit 19 is BOUND_CTRL.
+  code.push_back(EncodeVop2(0x25, 2, 250, 7));
+  code.push_back(EncodeVop2Dpp(1, row_shift ? 0x111u : 0x01bu) |
+                 (bound_ctrl ? 1u << 19 : 0u));
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "VectorDppBoundsControlZeroPreservesDestination";
-  test.code = code;
-  test.expected = {0xaaaaaaaau, 100, 101, 102, 103, 104, 105, 106};
-  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 8;
+  const char *names[2][2][2] = {
+      {{"VectorDppQuadPermInactiveSourceKeepsWave32",
+        "VectorDppQuadPermInactiveSourceKeepsWave64"},
+       {"VectorDppQuadPermInactiveSourceZeroWave32",
+        "VectorDppQuadPermInactiveSourceZeroWave64"}},
+      {{"VectorDppRowShrInactiveSourceKeepsWave32",
+        "VectorDppRowShrInactiveSourceKeepsWave64"},
+       {"VectorDppRowShrInactiveSourceZeroWave32",
+        "VectorDppRowShrInactiveSourceZeroWave64"}}};
+  test.name = names[row_shift][bound_ctrl][wave_size == 64];
+  test.code = std::move(code);
+  test.expected.resize(wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) continue;
+    const bool vacated = row_shift && lane % 16u == 0;
+    const u32 source = row_shift ? lane - 1u : (lane & ~3u) | (3u - (lane & 3u));
+    if (!vacated && (mask & (1u << (source % 32u))) != 0) {
+      test.expected[lane] = 1100u + source + lane;
+    } else if (bound_ctrl) {
+      test.expected[lane] = 1000u + lane;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,     O::V_ADD_NC_U32,       O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -29534,7 +29694,7 @@ TestCase VectorFractF64CapturedAndEdges() {
       {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
       {0, 0}, {0x8000000000000000ull, 0},
       {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
-      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      {1, 1}, {0x8000000000000001ull, 0x3fefffffffffffffull}, // Clamped below one.
       {0x000fffffffffffffull, 0x000fffffffffffffull},
       {0x7fefffffffffffffull, 0},
       {0x7ff0000000000000ull, 0x7ff8000000000000ull},
@@ -34046,6 +34206,8 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
        {0xc0003c00u, 0xdead3800u}, {0xc0003c00u, 0x00003800u}, 2, 0x86u},
       {"BufferStoreFormatD16XyzUint8", F::k8_8_8_8UInt,
        {0x00020001u, 0xdead0003u}, {0x00030201u}, 1, 0x86u},
+      {"BufferStoreFormatD16XyzFloat11_11_10", F::k11_11_10Float,
+       {0xc0003c7fu, 0xdead7bffu}, {0xf7c003c7u}, 1, 0x86u},
   };
   constexpr O formats[] = {O::BUFFER_STORE_FORMAT_D16_X, O::BUFFER_STORE_FORMAT_D16_XY,
                            O::BUFFER_STORE_FORMAT_D16_XYZ, O::BUFFER_STORE_FORMAT_D16_XYZW};
@@ -34174,6 +34336,16 @@ std::vector<TestCase> FormattedStoreConversionCases() {
        F::k8_8_8_8UScaled, 4, {nan, inf, -inf, -0.0f}, 0x0000ff00u},
       {{"BufferStoreSscaled8SpecialValues", "TBufferStoreSscaled8SpecialValues"},
        F::k8_8_8_8SScaled, 4, {nan, inf, -inf, -0.0f}, 0x00807f00u},
+      // Unsigned 11/10-bit floats truncate, clamp finite values and store negatives and NaN as 0.
+      {{"BufferStoreFloat11_11_10Truncates", "TBufferStoreFloat11_11_10Truncates"},
+       F::k11_11_10Float, 3, {1.0f, std::bit_cast<float>(0x3f87ffffu), 65520.0f}, 0xf7de1bc0u},
+      {{"BufferStoreFloat11_11_10Clamps", "TBufferStoreFloat11_11_10Clamps"},
+       F::k11_11_10Float, 3, {1e10f, -1.0f, inf}, 0xf80007bfu},
+      {{"BufferStoreFloat11_11_10Denormals", "TBufferStoreFloat11_11_10Denormals"},
+       F::k11_11_10Float, 3,
+       {nan, std::bit_cast<float>(0x35800000u), std::bit_cast<float>(0x38400000u)}, 0x06000800u},
+      {{"BufferStoreFloat10_11_11Truncates", "TBufferStoreFloat10_11_11Truncates"},
+       F::k10_11_11Float, 3, {std::bit_cast<float>(0x3f87ffffu), 1.0f, 65520.0f}, 0xf7ef01e1u},
   };
   constexpr O store_opcodes[2][4] = {
       {O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
@@ -43985,6 +44157,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3CvtPk16Saturates);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3F32ClampFlushesNaN);
@@ -44028,6 +44201,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
+  AddCase(VectorFractF32Edges);
   AddCase(VectorFractF16Modifiers);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
   AddCase(VectorSinF16SdwaAndEdges);
@@ -44036,8 +44210,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
-  AddCase(VectorPermlane16FetchInactiveZero);
-  AddCase(VectorPermlane16FetchInactiveFi);
+  for (const u32 op_sel : {0u, 1u, 2u})
+    for (const u32 wave_size : {32u, 64u})
+      cases.push_back(VectorPermlane16InactiveSource(op_sel, wave_size));
   cases.push_back(VectorDpp8Captured(false));
   for (const u32 wave_size : {32u, 64u})
     for (const bool fi : {false, true})
@@ -44053,7 +44228,10 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ComputeWave64Minimum(false));
   cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
-  AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  for (const bool row_shift : {false, true})
+    for (const bool bound_ctrl : {false, true})
+      for (const u32 wave_size : {32u, 64u})
+        cases.push_back(VectorDppInactiveSource(row_shift, bound_ctrl, wave_size));
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
@@ -44530,7 +44708,7 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   regs.cs_regs.num_thread_z = 1;
   regs.cs_regs.wave_size = 32;
   PipelineCache cache(graphics, nullptr);
-  ShaderProgram previous;
+  uint64_t previous_id = 0;
   uint16_t previous_units = 0;
   for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
                            uint16_t{112}, uint16_t{128}, uint16_t{128}}) {
@@ -44544,14 +44722,237 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
     Require(name, "pipeline creation",
             cache.GetComputePipeline(input).pipeline != nullptr,
             "full-size LDS shader did not create a Vulkan compute pipeline");
-    if (previous.id != 0) {
+    if (previous_id != 0) {
       Require(name, "guest-size cache identity",
-              (program.id == previous.id) == (units == previous_units),
+              (program->id == previous_id) == (units == previous_units),
               "different LDS sizes shared a shader, or repeating a size recompiled it");
     }
-    previous = program;
+    previous_id = program->id;
     previous_units = units;
   }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Module ids come from the module inputs, not from the order of compilation.
+void CheckStableProgramIds(VulkanHarness &vulkan) {
+  constexpr const char *name = "StableProgramIds";
+  const auto make_code = [](u32 value) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, value);
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    return code;
+  };
+  const std::array codes{make_code(7), make_code(9)};
+  for (const auto &code : codes)
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  // The first two share code and differ only in the buffer stride specialization.
+  struct Case { u32 code, stride; };
+  constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
+  const auto compile = [&](PipelineCache &cache, const Case &test) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[test.code].data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, test.stride << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    return cache.GetComputeProgram(regs, input)->id;
+  };
+  std::array<uint64_t, 3> forward{}, reverse{};
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
+    // One compute module per case and nothing else.
+    auto expected = PipelineCacheTestAccess::Compiled(cache);
+    expected.fill(0);
+    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
+    Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
+            "the per-stage compile counts missed or added a module");
+  }
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    for (size_t i = cases.size(); i-- > 0;) reverse[i] = compile(cache, cases[i]);
+  }
+  Require(name, "order independence", forward == reverse,
+          "a program's module id depended on the order it was compiled in");
+  const std::set<uint64_t> ids(forward.begin(), forward.end());
+  Require(name, "distinct modules", ids.size() == forward.size(),
+          "different code or specialization shared a module id");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// With a shader store a restart compiles nothing and creates every pipeline before the first
+// lookup. A damaged record and everything after it are dropped; a stale store starts over.
+void CheckShaderStore(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderStore";
+  constexpr uintptr_t base = 0x0000000205000000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  constexpr u32 value = 0x2a;
+  std::vector<u32> compute;
+  AppendVMovU32(&compute, 1, value);
+  compute.insert(compute.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&compute);
+  std::vector<u32> vertex;
+  AppendVMovU32(&vertex, 0, 0);
+  AppendVMovLiteral(&vertex, 1, 0x3f800000u);
+  vertex.insert(vertex.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 1)});
+  AppendEnd(&vertex);
+  std::vector<u32> pixel;
+  AppendVMovLiteral(&pixel, 0, 0x3f800000u);
+  pixel.insert(pixel.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+  AppendEnd(&pixel);
+  static ShaderUserData vertex_user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type,
+                      ShaderUserData *user_data = nullptr) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = type, .user_data = user_data,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(compute, Prospero::ShaderBinaryType::kCs);
+  map(vertex, Prospero::ShaderBinaryType::kGs, &vertex_user_data);
+  map(pixel, Prospero::ShaderBinaryType::kPs);
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "output memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "output allocation or mapping failed");
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_shader_store_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00000.shaders";
+
+  struct Session {
+    std::array<size_t, 2> prewarmed{}, pipelines{};
+    std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> compiled{};
+    u32 output = 0;
+    bool operator==(const Session &) const = default;
+  };
+  // Dispatches the compute program and creates the graphics pipeline.
+  const auto run = [&] {
+    std::memset(mapped, 0, allocation_size);
+    RenderContext context(vulkan.RuntimeContext(), store);
+    auto &pipelines = context.GetPipelineCache();
+    Session session{.prewarmed = PipelineCacheTestAccess::Pipelines(pipelines)};
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetViewportTransformControl(0x300);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(vertex.data()));
+      shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(pixel.data()));
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(compute.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      const ShaderBufferResource output{{static_cast<u32>(base), static_cast<u32>(base >> 32u),
+          4, DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+      for (u32 i = 0; i < 4; i++) shaders.SetCsUserSgpr(i, output.fields[i]);
+      context.MapMemory(base, allocation_size);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      auto &scheduler = context.GetCommandScheduler();
+      DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+      pipelines.GetGraphicsPrograms(scheduler.Current(), state);
+      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state);
+      context.GetBufferCache().ReadMemory(base, sizeof(u32));
+      (void)LibKernel::Memory::TryReadBacking(base, &session.output, sizeof(u32));
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    session.compiled = PipelineCacheTestAccess::Compiled(pipelines);
+    session.pipelines = PipelineCacheTestAccess::Pipelines(pipelines);
+    return session;
+  };
+  const auto flip = [&](uint64_t offset) {
+    Common::File file(store, Common::File::Mode::ReadWrite);
+    uint8_t byte = 0;
+    file.Seek(offset);
+    file.Read(&byte, 1);
+    byte ^= 0xffu;
+    file.Seek(offset);
+    file.Write(&byte, 1);
+  };
+
+  const auto cold = run();
+  const auto size = std::filesystem::file_size(store);
+  Require(name, "cold start",
+          cold.output == value && cold.prewarmed == std::array<size_t, 2>{} &&
+              cold.pipelines == std::array<size_t, 2>{1, 1} &&
+              cold.compiled[static_cast<size_t>(ShaderType::Compute)] == 1,
+          "the first run did not create its store, dispatch or pipelines");
+  auto warm = cold;
+  warm.prewarmed = cold.pipelines;
+  warm.compiled = {};
+  Require(name, "warm restart", run() == warm && std::filesystem::file_size(store) == size,
+          "a restart compiled a module, created a pipeline late or rewrote the store");
+  std::filesystem::resize_file(store, size + 3);
+  Require(name, "torn tail", run() == warm && std::filesystem::file_size(store) == size,
+          "a torn last record was kept");
+  // The graphics pipeline's record is the last one.
+  auto lost_pipeline = warm;
+  lost_pipeline.prewarmed[0] = 0;
+  std::filesystem::resize_file(store, size - 3);
+  Require(name, "truncated record",
+          run() == lost_pipeline && std::filesystem::file_size(store) == size,
+          "a cut record was not dropped and appended again, or took earlier records along");
+  // Flips the top checksum byte, just before the last zstd frame's magic 0xfd2fb528.
+  std::vector<uint8_t> bytes(size);
+  Common::File(store, Common::File::Mode::Read).Read(bytes.data(), static_cast<u32>(size));
+  const std::array<uint8_t, 4> zstd_magic{0x28, 0xb5, 0x2f, 0xfd};
+  flip(std::ranges::find_end(bytes, zstd_magic).begin() - bytes.begin() - 1);
+  Require(name, "damaged record",
+          run() == lost_pipeline && std::filesystem::file_size(store) == size,
+          "a damaged record was loaded or not replaced");
+  flip(0);
+  Require(name, "stale store", run() == cold && std::filesystem::file_size(store) == size,
+          "a store with another header was reused instead of started over");
+  // Reflecting a layout decodes LS and HS, so a restart takes it from the store. Records land
+  // while the cache lives; one still queued at its destruction lands before it is gone.
+  const ShaderTessellationInputInfo layout{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    auto &cache = context.GetPipelineCache();
+    PipelineCacheTestAccess::StoreLayout(cache, 1, layout);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::filesystem::file_size(store) <= size && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    Require(name, "background write", std::filesystem::file_size(store) > size,
+            "a record waited for the cache to be destroyed");
+    PipelineCacheTestAccess::HoldStoreUntilExit(cache);
+    PipelineCacheTestAccess::StoreLayout(cache, 2, layout);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    const auto &layouts = PipelineCacheTestAccess::TessLayouts(context.GetPipelineCache());
+    Require(name, "tessellation layout",
+            layouts.contains(1) && std::memcmp(&layouts.at(1), &layout, sizeof(layout)) == 0,
+            "a restart did not load the stored tessellation layout");
+    Require(name, "drain at exit", layouts.contains(2),
+            "a record still queued when the cache was destroyed was dropped");
+  }
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "output memory release failed");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -45234,10 +45635,10 @@ void CheckEmbeddedFetchVertexOffset() {
                           u32 index_offset) {
     ShaderVertexInputInfo vertex;
     vertex.fetch_embedded = true;
-    ShaderRecompiler::IR::CompiledShaderInfo program{};
-    program.user_data_base = result.program.user_data_base;
-    program.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
-    vertex.stage.program = &program;
+    ShaderModule module;
+    module.info.user_data_base = result.program.user_data_base;
+    module.info.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
+    vertex.stage.module = &module;
     vertex.stage.resources = &result.resources;
     return ResolveDrawOffsets(index_offset, vertex).first;
   };
@@ -45245,11 +45646,11 @@ void CheckEmbeddedFetchVertexOffset() {
   const auto ResolveInstance = [](const CompiledShader &result) {
     ShaderVertexInputInfo vertex;
     vertex.fetch_embedded = true;
-    ShaderRecompiler::IR::CompiledShaderInfo program{};
-    program.user_data_base = result.program.user_data_base;
-    program.info.instance_offset_sgpr =
+    ShaderModule module;
+    module.info.user_data_base = result.program.user_data_base;
+    module.info.info.instance_offset_sgpr =
         result.program.info.instance_offset_sgpr;
-    vertex.stage.program = &program;
+    vertex.stage.module = &module;
     vertex.stage.resources = &result.resources;
     return ResolveDrawOffsets(0, vertex).second;
   };
@@ -47875,17 +48276,17 @@ void CheckDynamicRenderingState() {
   Require("DynamicRenderingState", "layout identity", first != changed,
           "attachment layout did not participate in rendering identity");
 
-  PipelineRenderingState rgba{};
-  rgba.color_count = 1;
-  rgba.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
+  GraphicsPipelineKey rgba{};
+  rgba.rendering.color_count = 1;
+  rgba.rendering.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
   auto uint_color = rgba;
-  uint_color.color_formats[0] = vk::Format::eR8G8B8A8Uint;
+  uint_color.rendering.color_formats[0] = vk::Format::eR8G8B8A8Uint;
   Require("DynamicRenderingState", "pipeline color format identity",
           rgba != uint_color,
           "distinct dynamic-rendering formats can alias one pipeline key");
   auto depth = rgba;
-  depth.depth_format = vk::Format::eD32SfloatS8Uint;
-  depth.stencil_format = vk::Format::eD32SfloatS8Uint;
+  depth.rendering.depth_format = vk::Format::eD32SfloatS8Uint;
+  depth.rendering.stencil_format = vk::Format::eD32SfloatS8Uint;
   Require("DynamicRenderingState", "pipeline depth/stencil identity",
           rgba != depth,
           "depth/stencil formats did not participate in pipeline identity");
@@ -50176,6 +50577,16 @@ int main(int argc, char **argv) {
     CheckComputeThreadDimensions(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--program-id-only") == 0) {
+    VulkanHarness vulkan;
+    CheckStableProgramIds(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
+    VulkanHarness vulkan;
+    CheckShaderStore(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -50268,7 +50679,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(32));
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
-    RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    for (const bool row_shift : {false, true})
+      for (const bool bound_ctrl : {false, true})
+        for (const u32 wave_size : {32u, 64u})
+          RunCase(&vulkan, VectorDppInactiveSource(row_shift, bound_ctrl, wave_size));
+    for (const u32 op_sel : {0u, 1u, 2u})
+      for (const u32 wave_size : {32u, 64u})
+        RunCase(&vulkan, VectorPermlane16InactiveSource(op_sel, wave_size));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
@@ -50432,6 +50849,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--fract-f16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorFractF16CapturedAndEdges());
+    RunCase(&vulkan, VectorFractF32Edges());
+    RunCase(&vulkan, VectorFractF64CapturedAndEdges());
     RunCase(&vulkan, VectorFractF16Modifiers());
     RunCase(&vulkan, NativeAndSdwa16BitDestinationWrites());
     RunCase(&vulkan, VectorSpecialF16Ops());
@@ -50944,6 +51363,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    RunCase(&vulkan, Vop3CvtPk16Saturates());
+    RunCase(&vulkan, VectorLaneAndPackedOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
@@ -51335,6 +51756,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  CheckStableProgramIds(vulkan);
+  CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
