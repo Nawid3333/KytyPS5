@@ -403,6 +403,20 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		dynamic_state.SetDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
+	// Rect lists are drawn without culling.
+	vk::CullModeFlags cull_mode {};
+	if (!Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
+		if (mode.cull_front) {
+			cull_mode |= vk::CullModeFlagBits::eFront;
+		}
+		if (mode.cull_back) {
+			cull_mode |= vk::CullModeFlagBits::eBack;
+		}
+	}
+	dynamic_state.SetCullMode(cull_mode);
+	dynamic_state.SetFrontFace(mode.face ? vk::FrontFace::eClockwise
+	                                     : vk::FrontFace::eCounterClockwise);
+
 	dynamic_state.SetStencilTestEnabled(depth.stencil_test_enable);
 	if (depth.stencil_test_enable) {
 		const auto& front = depth.stencil_front;
@@ -843,6 +857,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
+	// compiled.
+	if (state.vertex_info[0].stage.module == nullptr) {
+		return false;
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -1156,7 +1175,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (mesh_active) {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
-			             emit.first_instance,
 			             index_source.guest_element_size,
 			             static_cast<uint32_t>(index_source.address),
 			             static_cast<uint32_t>(index_source.address >> 32u)};
@@ -1232,8 +1250,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-// Vulkan offsets for a prepared draw, or nullopt when its indirect records need CPU counts, as
-// mesh and quad-list draws do. Indirect records carry their own offsets.
+// Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU: mesh
+// and quad-list draws for counts, tessellation draws for patched SGPRs. Indirect records carry
+// their own offsets.
 static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
                                                    const ShaderVertexInputInfo& vs,
                                                    DrawOffsetSource             source,
@@ -1242,7 +1261,8 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
                                                    const DrawIndirectArgs&      indirect) {
 	if (indirect.address != 0) {
 		if (vs.stage.module->info.stage == ShaderType::Mesh ||
-		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
+		    vs.indirect_offsets != indirect.offsets) {
 			return std::nullopt;
 		}
 		return DrawEmitInfo {.indirect = indirect};
@@ -1306,7 +1326,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	hw_check(buffer);
 
-	DrawRenderState state {};
+	DrawRenderState state {.indirect_offsets = args.indirect.offsets};
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1411,7 +1431,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
-	DrawRenderState state {};
+	DrawRenderState state {.indirect_offsets = args.indirect.offsets};
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
@@ -1475,8 +1495,9 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
-	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
-	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	destination.Resolve(source,
+	                    {src.desc.view_info.base_level, 1, src.desc.view_info.base_layer, 1},
+	                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
 	return true;
 }
 

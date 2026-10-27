@@ -422,6 +422,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(info.user_clip_planes);
+	key.push_back(info.indirect_offsets.vertex | (uint32_t {info.indirect_offsets.instance} << 8u));
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -490,7 +491,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.object_primitive_id));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
-	key.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u));
+	key.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u) |
+	              (uint32_t {info.target_uint_mask} << 16u) |
+	              (uint32_t {info.target_sint_mask} << 24u));
 	const auto mask = info.target_shader_mask;
 	key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {

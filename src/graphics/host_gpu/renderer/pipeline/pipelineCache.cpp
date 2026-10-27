@@ -687,6 +687,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	if (!tess_active && !mesh_active) {
+		vertex_info[0].indirect_offsets = state.indirect_offsets;
+	}
 	if (object_primitive_id) {
 		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
 		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
@@ -711,8 +714,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
+				    vertex_params[0].hash));
+			}
+			return;
 		}
 	}
 	ShaderParams pixel_params;
@@ -736,6 +744,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			const auto& rt = context.GetRenderTarget(slot);
 			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
 			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
+				pixel_info.target_uint_mask |= 1u << export_index;
+			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
+				pixel_info.target_sint_mask |= 1u << export_index;
+			}
 			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
 			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
 			const auto mapping = pixel_info.target_export_mapping[export_index];
@@ -767,9 +780,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
 		                                     BlendFactorIsDualSource(blend.alpha_destblend))));
 		if (pixel_info.dual_source_blending) {
-			// MRT1 supplies the second blend source for target 0.
+			// MRT1 supplies the second blend source for target 0; blended targets are not integer.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+			pixel_info.target_uint_mask &= ~2u;
+			pixel_info.target_sint_mask &= ~2u;
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
@@ -991,15 +1006,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 	if (tessellation) {
-		static_params.patch_control_points =
-		    static_cast<uint8_t>(vs_input_info.tess.input_control_points);
+		static_params.patch_control_points = vs_input_info.tess.input_control_points;
 	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
 		// Rectangle lists expand through generated tessellation stages.
 		static_params.patch_control_points = 3;

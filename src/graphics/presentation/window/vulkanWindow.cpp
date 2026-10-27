@@ -51,6 +51,7 @@ struct VulkanExtensions {
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
 	features.storageBuffer16BitAccess = VK_TRUE;
+	features.shaderDrawParameters     = VK_TRUE;
 	return features;
 }
 
@@ -278,6 +279,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.samplerMirrorClampToEdge);
 		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
 		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features11.shaderDrawParameters, "shaderDrawParameters",
+		              WindowContext::RequiredVulkan11Features().shaderDrawParameters);
 		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
 		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
@@ -337,6 +340,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.shaderImageGatherExtended,
 		              "shaderImageGatherExtended");
+		check_feature(device_features2.features.shaderResourceMinLod, "shaderResourceMinLod");
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
@@ -636,6 +640,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderStorageImageMultisample        =
 	    supported_features2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
+	device_features.shaderResourceMinLod                 = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
