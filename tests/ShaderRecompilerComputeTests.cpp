@@ -50403,6 +50403,35 @@ void CheckReferenceClockScale() {
   std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
 }
 
+void CheckVideoOutCompression() {
+  constexpr uint64_t metadata = 0x206a00000ull;
+  struct Case {
+    const char *name;
+    bool compressed;
+    uint64_t metadata;
+    uint32_t dcc_control;
+    VideoOutCompression expected;
+  };
+  constexpr Case cases[] = {
+      {"uncompressed", false, 0, 0, VideoOutCompression::Uncompressed},
+      {"256B blocks", true, metadata, 0x00000048u, VideoOutCompression::Dcc256_256_0},
+      {"64B independent blocks", true, metadata, 0x00000208u, VideoOutCompression::Dcc256_64_64},
+      {"128B independent blocks", true, metadata, 0x00100024u,
+       VideoOutCompression::Dcc128_128_128},
+      {"64B and 128B independent blocks", true, metadata, 0x00100208u,
+       VideoOutCompression::Unsupported},
+      {"no metadata", true, 0, 0x00000208u, VideoOutCompression::Unsupported},
+      {"unaligned metadata", true, metadata + 0x10, 0x00000208u, VideoOutCompression::Unsupported},
+  };
+  for (const auto &test : cases) {
+    Require("VideoOutCompression", test.name,
+            ClassifyVideoOutCompression(test.compressed, test.metadata, test.dcc_control, 0) ==
+                test.expected,
+            "a video-out DCC layout was classified wrongly");
+  }
+  std::printf("[host]    %-32s ok\n", "VideoOutCompression");
+}
+
 void CheckClipControlDepthClipState() {
   HW::ClipControl clip;
   Require("ClipControlDepthClipState", "default", clip.IsZClipEnabled(),
@@ -53617,6 +53646,7 @@ int main(int argc, char **argv) {
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
+  CheckVideoOutCompression();
   CheckErrorDialogLifecycle();
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
