@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -2185,9 +2186,9 @@ public:
       VkMemoryPropertyFlags properties{};
       vmaGetAllocationMemoryProperties(graphics.allocator, image.allocation,
                                        &properties);
-      Require(name, "allocation policy",
+      Require(name, "small allocation preference",
               (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
-              "native image lost its device-local memory requirement");
+              "native image did not prefer available device-local memory");
 
       // A reused presentation image may still describe its previous recording.
       // No commands use this fixture; seed that bookkeeping before retirement.
@@ -20888,6 +20889,14 @@ public:
               std::swap(channels[0], channels[2]);
               std::memcpy(dst->data() + dst_offset, channels.data(),
                           sizeof(channels));
+            } else if (info.GetColorTransform() == ColorTransform::Rotate2_10_10_10) {
+              uint32_t packed = 0;
+              std::memcpy(&packed, src.data() + src_offset, sizeof(packed));
+              // The guest format stores the two-bit channel low; the host format stores it high.
+              const uint32_t alpha = to_tiled ? packed >> 30u : packed & 3u;
+              const uint32_t color = to_tiled ? packed & 0x3fffffffu : packed >> 2u;
+              packed = to_tiled ? (color << 2u) | alpha : color | (alpha << 30u);
+              std::memcpy(dst->data() + dst_offset, &packed, sizeof(packed));
             } else {
               std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
                           block.bytes_per_element);
@@ -21281,6 +21290,8 @@ public:
         convert_reference(false, &cpu, tiled, layout);
         gpu_detile(tiled, &gpu, total.size, total.size, layout);
         compare("format bytes", cpu, gpu);
+        if (layout.GetColorTransform() == ColorTransform::Rotate2_10_10_10)
+          check_round_trip("low-alpha packed format", total.size, layout);
         ++format_cases;
       }
     }
@@ -21824,6 +21835,8 @@ public:
     std::printf("[gpu]     %-32s ok (%u cases, %u format/mode pairs)\n", name,
                 case_index, format_cases);
   }
+
+#include "PssrGpuTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -46794,6 +46807,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
+  for (auto& test : TrinityBvhCases()) cases.push_back(std::move(test));
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 capacity : {8u, 16u, 31u}) cases.push_back(TrinityStack(wave, capacity));
+    cases.push_back(TrinityStack(wave, 8, true));
+  }
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
   for (bool barycentrics : {false, true}) {
@@ -51364,13 +51382,16 @@ void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
       static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
       0x80000000u, 1u,
   };
-  Pm4Execution execution;
   const bool handler_present =
       g_hw_uc_indirect_func[Pm4::UC_PARAMETER_OVERSUBSCRIPTION] != nullptr;
-  Require("Pm4IndirectUconfigRegisters", "indirect UCONFIG register stream",
-          handler_present &&
-              processor.Process(execution, command) == Pm4ProcessResult::Complete,
-          "UCONFIG register was rejected by SET_UCONFIG_REG_INDIRECT");
+  for (uint32_t mode = 0; mode <= 1; ++mode) {
+    command[0] = KYTY_PM4(5, Pm4::IT_SET_UCONFIG_REG_INDIRECT, mode);
+    Pm4Execution execution;
+    Require("Pm4IndirectUconfigRegisters", "indirect UCONFIG register stream",
+            handler_present &&
+                processor.Process(execution, command) == Pm4ProcessResult::Complete,
+            "UCONFIG register was rejected by SET_UCONFIG_REG_INDIRECT");
+  }
   std::printf("[host]    %-32s ok\n", "Pm4IndirectUconfigRegisters");
 }
 
@@ -53330,6 +53351,11 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
     VulkanHarness vulkan;
+    for (const auto& test : TrinityBvhCases()) RunCase(&vulkan, test);
+    for (const u32 wave : {32u, 64u}) {
+      for (const u32 capacity : {8u, 16u, 31u}) RunCase(&vulkan, TrinityStack(wave, capacity));
+      RunCase(&vulkan, TrinityStack(wave, 8, true));
+    }
     RunCase(&vulkan, FlatStackApertures(32));
     RunCase(&vulkan, FlatStackApertures(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));
@@ -53833,6 +53859,12 @@ int main(int argc, char **argv) {
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPssr();
+    CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-wait-only") == 0) {
