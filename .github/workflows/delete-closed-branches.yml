@@ -1,0 +1,56 @@
+# Fork-only housekeeping: delete branches whose pull requests are all merged or closed.
+# A branch is deleted only if at least one pull request (upstream or this fork) has it as head branch and none of
+# them is open; branches without a pull request and the default branch are kept. Deleting the head branch of an
+# open pull request would close it, so open ones are never touched. A deleted branch can be restored from its pull
+# request page ("Restore branch"); the run log lists each deleted branch with its head SHA.
+name: Delete branches of closed pull requests
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only list the branches that would be deleted"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  cleanup:
+    if: github.repository_owner == 'Nawid3333'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete fork branches whose pull requests are all merged or closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK: ${{ github.repository }}
+          UPSTREAM: KytyPS5/KytyPS5
+          OWNER: ${{ github.repository_owner }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          default=$(gh api "repos/$FORK" --jq .default_branch)
+          gh api --paginate "repos/$FORK/branches?per_page=100" --jq '.[] | [.name, .commit.sha] | @tsv' > branches.tsv
+          : > prs.tsv
+          for repo in "$UPSTREAM" "$FORK"; do
+            gh api --paginate "repos/$repo/pulls?state=all&per_page=100" \
+              --jq ".[] | select(.head.repo.owner.login == \"$OWNER\") | [.head.ref, .state, .number] | @tsv" >> prs.tsv
+          done
+          deleted=0
+          while IFS=$'\t' read -r branch sha; do
+            [ "$branch" = "$default" ] && continue
+            states=$(awk -F'\t' -v b="$branch" '$1 == b {print $2}' prs.tsv | sort -u)
+            [ -z "$states" ] && continue
+            grep -qx open <<<"$states" && continue
+            numbers=$(awk -F'\t' -v b="$branch" '$1 == b {printf "#%s ", $3}' prs.tsv)
+            echo "delete $branch ($sha) - pull requests ${numbers}all closed or merged"
+            if [ "$DRY_RUN" != "true" ]; then
+              gh api -X DELETE "repos/$FORK/git/refs/heads/$branch"
+              deleted=$((deleted + 1))
+            fi
+          done < branches.tsv
+          echo "deleted $deleted branch(es) (dry run: $DRY_RUN)"
