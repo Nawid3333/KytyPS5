@@ -27,6 +27,10 @@ void                     HideSplashScreen();
 void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
+bool                     LabSystemOverlayCapturesController();
+void                     LabPushOverlayButton(int sdl_button, bool down);
+void                     LabPushOverlayAxis(int sdl_axis, int value);
+bool                     LabIsOverlayEvent(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);

@@ -231,6 +231,7 @@ uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
 bool                         g_input_active               = false;
+std::atomic<bool>            g_lab_overlay_capture {false};
 bool                         g_input_controller           = false;
 bool                         g_input_keyboard             = false;
 bool                         g_input_multiline            = false;
@@ -692,6 +693,7 @@ void ShutdownSystemOverlayInput() {
 		g_missing_visibility_wakeups = 0;
 	}
 	g_input_active     = false;
+	g_lab_overlay_capture.store(false);
 	g_input_session    = {};
 	g_input_controller = false;
 	g_input_keyboard   = false;
@@ -716,6 +718,37 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	            PerformanceOverlayRevision()};
 }
 
+constexpr SDL_JoystickID LAB_OVERLAY_DEVICE = 0x7ab0;
+
+bool LabSystemOverlayCapturesController() {
+	return g_lab_overlay_capture.load();
+}
+
+void LabPushOverlayButton(int sdl_button, bool down) {
+	SDL_Event event {};
+	event.type           = down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+	event.gbutton.which  = LAB_OVERLAY_DEVICE;
+	event.gbutton.button = static_cast<Uint8>(sdl_button);
+	event.gbutton.down   = down;
+	SDL_PushEvent(&event);
+}
+
+void LabPushOverlayAxis(int sdl_axis, int value) {
+	SDL_Event event {};
+	event.type        = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+	event.gaxis.which = LAB_OVERLAY_DEVICE;
+	event.gaxis.axis  = static_cast<Uint8>(sdl_axis);
+	event.gaxis.value = static_cast<Sint16>(std::clamp(value, -32768, 32767));
+	SDL_PushEvent(&event);
+}
+
+bool LabIsOverlayEvent(const SDL_Event& event) {
+	if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+		return event.gbutton.which == LAB_OVERLAY_DEVICE;
+	}
+	return event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event.gaxis.which == LAB_OVERLAY_DEVICE;
+}
+
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
@@ -736,6 +769,7 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		g_input_controller      = update.capture_controller;
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
+		g_lab_overlay_capture.store(g_input_active && g_input_controller);
 		if (update.text_input) {
 			SDL_StartTextInput(g_input_window);
 		} else if (SDL_TextInputActive(g_input_window)) {

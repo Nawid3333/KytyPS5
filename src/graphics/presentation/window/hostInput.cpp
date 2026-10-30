@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "libs/controller.h"
 
 #include <algorithm>
@@ -1016,6 +1017,39 @@ uint32_t LabPadButton(std::string_view name) {
 	return 0;
 }
 
+int LabOverlayButton(std::string_view name) {
+	if (name == "cross") return SDL_GAMEPAD_BUTTON_SOUTH;
+	if (name == "circle") return SDL_GAMEPAD_BUTTON_EAST;
+	if (name == "square") return SDL_GAMEPAD_BUTTON_WEST;
+	if (name == "triangle") return SDL_GAMEPAD_BUTTON_NORTH;
+	if (name == "up") return SDL_GAMEPAD_BUTTON_DPAD_UP;
+	if (name == "down") return SDL_GAMEPAD_BUTTON_DPAD_DOWN;
+	if (name == "left") return SDL_GAMEPAD_BUTTON_DPAD_LEFT;
+	if (name == "right") return SDL_GAMEPAD_BUTTON_DPAD_RIGHT;
+	return SDL_GAMEPAD_BUTTON_INVALID;
+}
+
+void LabSetButton(std::string_view name, bool down) {
+	const int overlay_button = LabOverlayButton(name);
+	if (overlay_button != SDL_GAMEPAD_BUTTON_INVALID && LabSystemOverlayCapturesController()) {
+		LabPushOverlayButton(overlay_button, down);
+		if (down) {
+			return;
+		}
+	}
+	SetButton(LabPadButton(name), down);
+}
+
+void LabSetStick(std::string_view name, Controller::Axis axis, int raw) {
+	if ((name == "left_x" || name == "left_y") && LabSystemOverlayCapturesController()) {
+		LabPushOverlayAxis(name == "left_x" ? SDL_GAMEPAD_AXIS_LEFTX : SDL_GAMEPAD_AXIS_LEFTY, (raw - 128) * 258);
+		if (raw != 128) {
+			return;
+		}
+	}
+	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, raw);
+}
+
 bool LabAnyAxis(std::string_view name, Controller::Axis* axis) {
 	if (name == "l2") { *axis = Controller::Axis::TriggerLeft; return true; }
 	if (name == "r2") { *axis = Controller::Axis::TriggerRight; return true; }
@@ -1126,7 +1160,7 @@ void LabPlayScript(std::string path) {
 			continue;
 		}
 		if (event.kind == Kind::Down || event.kind == Kind::Up) {
-			SetButton(LabPadButton(event.name), event.kind == Kind::Down);
+			LabSetButton(event.name, event.kind == Kind::Down);
 			continue;
 		}
 		if (event.kind == Kind::Axis) {
@@ -1138,22 +1172,20 @@ void LabPlayScript(std::string path) {
 		}
 		if (event.kind == Kind::Press) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, ("press " + event.name).c_str());
-			const uint32_t button = LabPadButton(event.name);
-			SetButton(button, true);
+			LabSetButton(event.name, true);
 			sleep_secs(event.hold > 0.0 ? event.hold : 0.15);
-			SetButton(button, false);
+			LabSetButton(event.name, false);
 			continue;
 		}
 		if (event.kind == Kind::Mash) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, ("mash " + event.name).c_str());
-			const uint32_t button   = LabPadButton(event.name);
 			const double   every    = event.every > 0.0 ? event.every : 0.15;
 			const auto     mash_end = std::chrono::steady_clock::now() +
 			                      std::chrono::duration<double>(event.duration);
 			while (std::chrono::steady_clock::now() < mash_end) {
-				SetButton(button, true);
+				LabSetButton(event.name, true);
 				sleep_secs(std::min(every * 0.5, 0.15));
-				SetButton(button, false);
+				LabSetButton(event.name, false);
 				sleep_secs(every * 0.5);
 			}
 			continue;
@@ -1165,9 +1197,9 @@ void LabPlayScript(std::string path) {
 			const double value = std::clamp(event.value, -1.0, 1.0);
 			const int    raw =
 			    std::clamp(128 + static_cast<int>(std::lround(value * 127.0)), 0, 255);
-			Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, raw);
+			LabSetStick(event.name, axis, raw);
 			sleep_secs(event.duration);
-			Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, 128);
+			LabSetStick(event.name, axis, 128);
 			continue;
 		}
 	}
