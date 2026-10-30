@@ -9,6 +9,8 @@
 
 #include <fmt/format.h>
 
+#include <atomic>
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
 
@@ -50,7 +52,7 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED) {                                                                      \
+	if (PRINT_NAME_ENABLED || Libs::g_lab_trace_all.load(std::memory_order_relaxed)) {             \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}
 
@@ -59,6 +61,8 @@ class SymbolDatabase;
 } // namespace Loader
 
 namespace Libs {
+
+inline std::atomic<bool> g_lab_trace_all {false};
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
