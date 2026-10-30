@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "libs/controller.h"
+#include "libs/libs.h"
 
 #include <algorithm>
 #include <array>
@@ -1348,6 +1349,19 @@ LabInputEvent ParseLabInputLine(std::string_view line) {
 }
 
 void HostInputStartLabScript(const char* path) {
+	if (const char* trace = std::getenv("KYTY_LAB_TRACE_AT"); trace != nullptr) {
+		char*        end     = nullptr;
+		const double at      = std::strtod(trace, &end);
+		const double seconds = (end != nullptr && *end == ',') ? std::strtod(end + 1, nullptr) : 5.0;
+		std::thread([at, seconds] {
+			std::this_thread::sleep_for(std::chrono::duration<double>(at));
+			LOGF("[lab-trace] HLE names of all threads on for %.1f s\n", seconds);
+			Libs::g_lab_trace_all.store(true);
+			std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+			Libs::g_lab_trace_all.store(false);
+			LOGF("[lab-trace] off\n");
+		}).detach();
+	}
 	if (path == nullptr) {
 		return;
 	}
