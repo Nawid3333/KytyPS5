@@ -7,6 +7,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -676,6 +677,12 @@ struct CommandBufferState {
 		uint8_t  index;
 		uint32_t value;
 	};
+	struct WriteAddressFromCounterCommand {
+		uint64_t address = 0;
+		uint8_t  index   = 0;
+		bool     pair    = false;
+		bool     time    = false;
+	};
 	struct AmmMapCommand {
 		AmmCommandKind kind        = AmmCommandKind::MapAuto;
 		uint64_t       va          = 0;
@@ -686,7 +693,8 @@ struct CommandBufferState {
 		uint8_t        gpu_mask_id = 0;
 	};
 	using CommandData = std::variant<ReadFileCommand, KernelEventCommand, WriteAddressCommand,
-	                                 AmmMapCommand, WaitCommand, WriteCounterCommand>;
+	                                 AmmMapCommand, WaitCommand, WriteCounterCommand,
+	                                 WriteAddressFromCounterCommand>;
 	struct Command {
 		uint64_t record_offset;
 		CommandData data;
@@ -1229,6 +1237,16 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	} else if (const auto* command =
 	               std::get_if<CommandBufferState::WriteCounterCommand>(&entry.data)) {
 		g_counters[command->index].store(command->value, std::memory_order_release);
+	} else if (const auto* command =
+	               std::get_if<CommandBufferState::WriteAddressFromCounterCommand>(&entry.data)) {
+		uint64_t value = command->time
+		                     ? LibKernel::KernelGetProcessTimeCounter()
+		                     : g_counters[command->index].load(std::memory_order_acquire);
+		if (command->pair) {
+			value |= uint64_t {g_counters[command->index + 1].load(std::memory_order_acquire)} << 32u;
+		}
+		std::atomic_ref(*reinterpret_cast<uint64_t*>(command->address))
+		    .store(value, std::memory_order_release);
 	} else if (const auto* payload = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
 		const auto& command = *payload;
 		int         result  = OK;
@@ -2027,49 +2045,63 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buf
 	return AppendNoOpCommand(command_buffer, 0x20);
 }
 
+static int AppendWriteAddressFromCounterCommand(void* command_buffer, volatile uint64_t* address,
+                                                uint8_t index, bool pair, bool time) {
+	if (command_buffer == nullptr || address == nullptr ||
+	    (reinterpret_cast<uint64_t>(address) & 7) != 0 || index >= 128 || (pair && (index & 1) != 0)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
+	                           CommandBufferState::WriteAddressFromCounterCommand {
+	                               reinterpret_cast<uint64_t>(address), index, pair, time},
+	                           0x20)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
                                                                   volatile uint64_t* address,
                                                                   uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, 0, false, true);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, 0, false, true);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
-                                                              volatile uint64_t* address, uint8_t,
-                                                              uint32_t) {
+                                                              volatile uint64_t* address,
+                                                              uint8_t index, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, index, false, false);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t index) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, index, false, false);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
                                                                   volatile uint64_t* address,
-                                                                  uint8_t, uint32_t) {
+                                                                  uint8_t index, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, index, true, false);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t index) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
+	return AppendWriteAddressFromCounterCommand(command_buffer, address, index, true, false);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
