@@ -1714,6 +1714,61 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   }
 }
 
+void CheckAmprCounterWrites(Loader::SymbolDatabase &symbols) {
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AMPR counter write exports resolve");
+    return symbol->vaddr;
+  };
+  using Unary = void (KYTY_SYSV_ABI *)(void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
+                                           uint8_t, uint32_t);
+  using FromCounter = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint8_t, uint32_t);
+  using FromTime = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint32_t);
+  using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
+  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
+  const auto write_counter = reinterpret_cast<WriteCounter>(find("jK+yuYCI7MA"));
+  const auto from_counter = reinterpret_cast<FromCounter>(find("t4ExS+SwLjs"));
+  const auto from_pair = reinterpret_cast<FromCounter>(find("enZm-6GjWqw"));
+  const auto from_time = reinterpret_cast<FromTime>(find("bt3LHR9xjK4"));
+  const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
+  const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
+  std::array<uint64_t, 5> header {};
+  std::array<uint32_t, 256> data {};
+  construct(header.data());
+  construct_amm(header.data());
+  Check(set_buffer(header.data(), data.data(), sizeof(data)) == OK,
+        "initialize AMPR command buffer");
+  constexpr uint8_t Low = 6;
+  uint64_t before = ~uint64_t {0}, single = 0, pair = 0, time = 0, odd = 0;
+  Check(from_pair(header.data(), &odd, Low + 1, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            from_counter(header.data(), &single, 128, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            offset(header.data()) == 0,
+        "counter writes reject an odd pair and an index past the counters");
+  Check(write_counter(header.data(), Low, 1, 0x11111111, 0, 0) == OK &&
+            from_counter(header.data(), &before, Low, 0) == OK &&
+            write_counter(header.data(), Low, 1, 0x89abcdef, 0, 0) == OK &&
+            write_counter(header.data(), Low + 1, 1, 0x01234567, 0, 0) == OK &&
+            from_counter(header.data(), &single, Low, 0) == OK &&
+            from_pair(header.data(), &pair, Low, 0) == OK &&
+            from_time(header.data(), &time, 0) == OK,
+        "record counter writes around counter updates");
+  uint32_t id = 0;
+  Check(submit_amm(data.data(), static_cast<uint32_t>(offset(header.data())), 0, &id) == OK &&
+            wait_amm(id) == OK,
+        "run the counter writes");
+  Check(before == 0x11111111 && single == 0x89abcdef && pair == 0x0123456789abcdef && time != 0,
+        "counter writes store the counter value when the command runs");
+  destroy(header.data());
+}
+
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -1811,6 +1866,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
   CheckAmprOrdering(symbols, collision_ids[0]);
+  CheckAmprCounterWrites(symbols);
   FileSystem::Umount("/app0");
 }
 
