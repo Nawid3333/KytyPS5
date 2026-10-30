@@ -1174,7 +1174,7 @@ void LabPlayScript(std::string path) {
 		std::this_thread::sleep_until(start + std::chrono::duration<double>(event.t));
 		if (event.kind == Kind::End) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, "end");
-			return;
+			break;
 		}
 		if (event.kind == Kind::Wait) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, "wait");
@@ -1226,6 +1226,16 @@ void LabPlayScript(std::string path) {
 			continue;
 		}
 	}
+	for (const char* name: {"cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3",
+	                        "options", "touchpad", "up", "down", "left", "right"}) {
+		SetButton(LabPadButton(name), false);
+	}
+	for (const char* name: {"left_x", "left_y", "right_x", "right_y"}) {
+		Controller::Axis axis = Controller::Axis::LeftX;
+		LabAnyAxis(name, &axis);
+		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, 128);
+	}
+	LOGF("[lab-input] script finished: inputs released\n");
 }
 
 } // namespace
@@ -1256,12 +1266,12 @@ LabInputEvent ParseLabInputLine(std::string_view line) {
 		event.kind = LabInputEvent::Kind::Wait;
 		return event;
 	}
-	if (LabFindValue(line, "down", &value) || LabFindValue(line, "up", &value)) {
+	if (LabFindValue(line, "on", &value) || LabFindValue(line, "off", &value)) {
 		if (LabPadButton(value) == 0) {
 			return event;
 		}
-		std::string_view down;
-		event.kind = LabFindValue(line, "down", &down) ? LabInputEvent::Kind::Down : LabInputEvent::Kind::Up;
+		std::string_view on;
+		event.kind = LabFindValue(line, "on", &on) ? LabInputEvent::Kind::Down : LabInputEvent::Kind::Up;
 		event.name = std::string(value);
 		return event;
 	}

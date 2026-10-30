@@ -1143,7 +1143,7 @@ void LabRecordButton(uint32_t button, bool down) {
 		if ((button & bit) != 0) {
 			if (const char* name = LabButtonName(bit)) {
 				std::fprintf(g_lab_record.file, "{\"t\": %.3f, \"%s\": \"%s\"}\n", LabRecordTime(),
-				             down ? "down" : "up", name);
+				             down ? "on" : "off", name);
 			}
 		}
 	}
@@ -1157,14 +1157,12 @@ void LabRecordAxis(Axis axis, int value) {
 		return;
 	}
 	auto& last = g_lab_record.last_axis[index];
-	const bool edge = value == 0 || value == 128 || value == 255;
-	if (value == last || (!edge && std::abs(value - last) < 2)) {
+	if (value == last) {
 		return;
 	}
 	last = value;
 	std::fprintf(g_lab_record.file, "{\"t\": %.3f, \"axis\": \"%s\", \"raw\": %d}\n", LabRecordTime(),
 	             LAB_AXIS_NAMES[index], value);
-	std::fflush(g_lab_record.file);
 }
 
 } // namespace
@@ -1184,26 +1182,26 @@ void LabStartInputRecord(const char* path) {
 }
 
 void SetButton(int id, uint32_t button, bool down) {
-	LabRecordButton(button, down);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
+		LabRecordButton(button, down);
 		player->Button(id, button, down);
 	}
 }
 
 void SetAxis(int id, Axis axis, int value) {
-	LabRecordAxis(axis, value);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
+		LabRecordAxis(axis, value);
 		player->Axis(id, axis, value);
 	}
 }
 
 void SetRightStick(int id, int x, int y) {
-	LabRecordAxis(Axis::RightX, x);
-	LabRecordAxis(Axis::RightY, y);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
+		LabRecordAxis(Axis::RightX, x);
+		LabRecordAxis(Axis::RightY, y);
 		player->RightStick(id, x, y);
 	}
 }
