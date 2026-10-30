@@ -1458,6 +1458,12 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
+		static std::atomic<uint32_t> s_lab_past_end {0};
+		const auto n = s_lab_past_end.fetch_add(1) + 1;
+		if (n <= 20 || (n % 1000) == 0) {
+			std::printf("[lab-ampr] read past end %s off=0x%" PRIx64 " size=0x%" PRIx64 " file=0x%" PRIx64 " n=%u\n",
+			            Common::PathToString(host_path).c_str(), file_offset, size, static_cast<uint64_t>(file_size), n);
+		}
 		file.Close();
 		return OK;
 	}
@@ -1487,6 +1493,25 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		*bytes_read += read;
+	}
+	{
+		static std::atomic<uint32_t> s_lab_short {0};
+		static std::atomic<uint32_t> s_lab_clamped {0};
+		if (*bytes_read < readable) {
+			const auto n = s_lab_short.fetch_add(1) + 1;
+			std::printf("[lab-ampr] SHORT read %s off=0x%" PRIx64 " size=0x%" PRIx64 " readable=0x%" PRIx64
+			            " got=0x%" PRIx64 " file=0x%" PRIx64 " n=%u\n",
+			            Common::PathToString(host_path).c_str(), file_offset, size, readable, *bytes_read,
+			            static_cast<uint64_t>(file_size), n);
+		} else if (readable < size) {
+			const auto n = s_lab_clamped.fetch_add(1) + 1;
+			if (n <= 10 || (n % 1000) == 0) {
+				std::printf("[lab-ampr] clamped read %s off=0x%" PRIx64 " size=0x%" PRIx64 " file=0x%" PRIx64
+				            " n=%u\n",
+				            Common::PathToString(host_path).c_str(), file_offset, size,
+				            static_cast<uint64_t>(file_size), n);
+			}
+		}
 	}
 
 	file.Close();
