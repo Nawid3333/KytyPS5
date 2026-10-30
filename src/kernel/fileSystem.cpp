@@ -1,4 +1,10 @@
 #include "kernel/fileSystem.h"
+#include <unordered_map>
+#include <thread>
+#include <string>
+#include <mutex>
+#include <cstdlib>
+#include <chrono>
 
 #include "common/archive.h"
 #include "common/assert.h"
@@ -451,6 +457,35 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (std::getenv("KYTY_LAB_TRACE_ON_REOPEN") != nullptr) {
+		struct LabOpens {
+			uint32_t                              count = 0;
+			std::chrono::steady_clock::time_point since;
+		};
+		static std::mutex                                 lab_mutex;
+		static std::unordered_map<std::string, LabOpens> lab_opens;
+		static std::atomic<bool>                          lab_fired {false};
+		const auto                                        now = std::chrono::steady_clock::now();
+		bool                                              fire = false;
+		{
+			std::scoped_lock lock(lab_mutex);
+			auto&            entry = lab_opens[path];
+			if (entry.count == 0 || now - entry.since > std::chrono::seconds(5)) {
+				entry = {0, now};
+			}
+			fire = ++entry.count == 20;
+		}
+		if (fire && !lab_fired.exchange(true)) {
+			LOGF("[lab-trace] %s opened 20 times in 5 s: HLE names of all threads on for 4 s\n", path);
+			std::thread([] {
+				Libs::g_lab_trace_all.store(true);
+				std::this_thread::sleep_for(std::chrono::seconds(4));
+				Libs::g_lab_trace_all.store(false);
+				LOGF("[lab-trace] off\n");
+			}).detach();
+		}
 	}
 
 	auto flags_u = static_cast<uint32_t>(flags);
