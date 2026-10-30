@@ -52,8 +52,10 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED || Libs::g_lab_trace_all.load(std::memory_order_relaxed)) {             \
+	if (PRINT_NAME_ENABLED) {                                                                      \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
+	} else if (::Libs::g_lab_trace_all.load(std::memory_order_relaxed)) {                          \
+		Libs::LabPrintNameCaller(g_library, g_module, __func__, __builtin_return_address(0));       \
 	}
 
 namespace Loader {
@@ -63,6 +65,14 @@ class SymbolDatabase;
 namespace Libs {
 
 inline std::atomic<bool> g_lab_trace_all {false};
+
+[[gnu::noinline]] inline void LabPrintNameCaller(const char* library, const char* module, const char* function,
+                                                 const void* caller) {
+	const auto elapsed_ms = static_cast<unsigned long long>(Loader::Timer::GetTimeMs());
+	LOGF("[%d][%02llu:%02llu:%02llu.%03llu] %s::%s::%s() caller=0x%016llx\n", Common::Thread::GetThreadIdUnique(),
+	     elapsed_ms / 3600000, (elapsed_ms / 60000) % 60, (elapsed_ms / 1000) % 60, elapsed_ms % 1000, library, module,
+	     function, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller)));
+}
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
