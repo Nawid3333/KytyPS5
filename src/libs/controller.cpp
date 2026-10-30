@@ -17,7 +17,10 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <memory>
 #include <vector>
 
@@ -1091,7 +1094,96 @@ void CycleKeyboardPlayer() {
 	}
 }
 
+namespace {
+
+struct LabInputRecorder {
+	std::mutex                            mutex;
+	std::FILE*                            file = nullptr;
+	std::chrono::steady_clock::time_point start;
+	std::array<int, 6>                    last_axis {128, 128, 128, 128, 0, 0};
+};
+
+LabInputRecorder g_lab_record;
+
+const char* LabButtonName(uint32_t button) {
+	switch (button) {
+		case PAD_BUTTON_CROSS: return "cross";
+		case PAD_BUTTON_CIRCLE: return "circle";
+		case PAD_BUTTON_SQUARE: return "square";
+		case PAD_BUTTON_TRIANGLE: return "triangle";
+		case PAD_BUTTON_L1: return "l1";
+		case PAD_BUTTON_R1: return "r1";
+		case PAD_BUTTON_L2: return "l2";
+		case PAD_BUTTON_R2: return "r2";
+		case PAD_BUTTON_L3: return "l3";
+		case PAD_BUTTON_R3: return "r3";
+		case PAD_BUTTON_OPTIONS: return "options";
+		case PAD_BUTTON_TOUCH_PAD: return "touchpad";
+		case PAD_BUTTON_UP: return "up";
+		case PAD_BUTTON_DOWN: return "down";
+		case PAD_BUTTON_LEFT: return "left";
+		case PAD_BUTTON_RIGHT: return "right";
+		default: return nullptr;
+	}
+}
+
+constexpr std::array<const char*, 6> LAB_AXIS_NAMES = {"left_x", "left_y", "right_x", "right_y", "l2", "r2"};
+
+double LabRecordTime() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_lab_record.start).count();
+}
+
+void LabRecordButton(uint32_t button, bool down) {
+	std::scoped_lock lock(g_lab_record.mutex);
+	if (g_lab_record.file == nullptr) {
+		return;
+	}
+	for (uint32_t bit = 1; bit != 0; bit <<= 1u) {
+		if ((button & bit) != 0) {
+			if (const char* name = LabButtonName(bit)) {
+				std::fprintf(g_lab_record.file, "{\"t\": %.3f, \"%s\": \"%s\"}\n", LabRecordTime(),
+				             down ? "down" : "up", name);
+			}
+		}
+	}
+	std::fflush(g_lab_record.file);
+}
+
+void LabRecordAxis(Axis axis, int value) {
+	const auto index = static_cast<size_t>(axis);
+	std::scoped_lock lock(g_lab_record.mutex);
+	if (g_lab_record.file == nullptr || index >= LAB_AXIS_NAMES.size()) {
+		return;
+	}
+	auto& last = g_lab_record.last_axis[index];
+	const bool edge = value == 0 || value == 128 || value == 255;
+	if (value == last || (!edge && std::abs(value - last) < 2)) {
+		return;
+	}
+	last = value;
+	std::fprintf(g_lab_record.file, "{\"t\": %.3f, \"axis\": \"%s\", \"raw\": %d}\n", LabRecordTime(),
+	             LAB_AXIS_NAMES[index], value);
+	std::fflush(g_lab_record.file);
+}
+
+} // namespace
+
+void LabStartInputRecord(const char* path) {
+	std::scoped_lock lock(g_lab_record.mutex);
+	if (path == nullptr || g_lab_record.file != nullptr) {
+		return;
+	}
+	g_lab_record.file  = std::fopen(path, "w");
+	g_lab_record.start = std::chrono::steady_clock::now();
+	LOGF("[lab-input] recording to %s: %s\n", path, g_lab_record.file != nullptr ? "ok" : "cannot open");
+	if (g_lab_record.file != nullptr) {
+		std::fprintf(g_lab_record.file, "# KYTY_LAB_INPUT_RECORD: controller input as the game received it\n");
+		std::fflush(g_lab_record.file);
+	}
+}
+
 void SetButton(int id, uint32_t button, bool down) {
+	LabRecordButton(button, down);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->Button(id, button, down);
@@ -1099,6 +1191,7 @@ void SetButton(int id, uint32_t button, bool down) {
 }
 
 void SetAxis(int id, Axis axis, int value) {
+	LabRecordAxis(axis, value);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->Axis(id, axis, value);
@@ -1106,6 +1199,8 @@ void SetAxis(int id, Axis axis, int value) {
 }
 
 void SetRightStick(int id, int x, int y) {
+	LabRecordAxis(Axis::RightX, x);
+	LabRecordAxis(Axis::RightY, y);
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->RightStick(id, x, y);

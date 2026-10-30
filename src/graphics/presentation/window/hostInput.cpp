@@ -1086,6 +1086,16 @@ uint32_t LabPadButton(std::string_view name) {
 	return 0;
 }
 
+bool LabAnyAxis(std::string_view name, Controller::Axis* axis) {
+	if (name == "l2") { *axis = Controller::Axis::TriggerLeft; return true; }
+	if (name == "r2") { *axis = Controller::Axis::TriggerRight; return true; }
+	if (name == "left_x") { *axis = Controller::Axis::LeftX; return true; }
+	if (name == "left_y") { *axis = Controller::Axis::LeftY; return true; }
+	if (name == "right_x") { *axis = Controller::Axis::RightX; return true; }
+	if (name == "right_y") { *axis = Controller::Axis::RightY; return true; }
+	return false;
+}
+
 bool LabStickAxis(std::string_view name, Controller::Axis* axis) {
 	if (name == "left_x") { *axis = Controller::Axis::LeftX; return true; }
 	if (name == "left_y") { *axis = Controller::Axis::LeftY; return true; }
@@ -1170,6 +1180,17 @@ void LabPlayScript(std::string path) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, "wait");
 			continue;
 		}
+		if (event.kind == Kind::Down || event.kind == Kind::Up) {
+			SetButton(LabPadButton(event.name), event.kind == Kind::Down);
+			continue;
+		}
+		if (event.kind == Kind::Axis) {
+			Controller::Axis axis = Controller::Axis::LeftX;
+			LabAnyAxis(event.name, &axis);
+			Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis,
+			                    std::clamp(static_cast<int>(std::lround(event.value)), 0, 255));
+			continue;
+		}
 		if (event.kind == Kind::Press) {
 			LOGF("[lab-input] t=%.2f %s\n", event.t, ("press " + event.name).c_str());
 			const uint32_t button = LabPadButton(event.name);
@@ -1233,6 +1254,26 @@ LabInputEvent ParseLabInputLine(std::string_view line) {
 	}
 	if (LabFindValue(line, "wait", &value) && value == "true") {
 		event.kind = LabInputEvent::Kind::Wait;
+		return event;
+	}
+	if (LabFindValue(line, "down", &value) || LabFindValue(line, "up", &value)) {
+		if (LabPadButton(value) == 0) {
+			return event;
+		}
+		std::string_view down;
+		event.kind = LabFindValue(line, "down", &down) ? LabInputEvent::Kind::Down : LabInputEvent::Kind::Up;
+		event.name = std::string(value);
+		return event;
+	}
+	if (LabFindValue(line, "axis", &value)) {
+		Controller::Axis axis = Controller::Axis::LeftX;
+		std::string_view raw;
+		if (!LabAnyAxis(value, &axis) || !LabFindValue(line, "raw", &raw)) {
+			return event;
+		}
+		event.kind  = LabInputEvent::Kind::Axis;
+		event.name  = std::string(value);
+		event.value = LabToNumber(raw, 128.0);
 		return event;
 	}
 	if (LabFindValue(line, "press", &value)) {

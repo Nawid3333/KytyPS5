@@ -833,6 +833,9 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
+	if (const char* lab_record = std::getenv("KYTY_LAB_INPUT_RECORD"); lab_record != nullptr) {
+		Controller::LabStartInputRecord(lab_record);
+	}
 	if (const char* lab_script = std::getenv("KYTY_LAB_INPUT_SCRIPT"); lab_script != nullptr) {
 		HostInputStartLabScript(lab_script);
 	}
