@@ -1162,7 +1162,22 @@ void LabPlayScript(std::string path) {
 	};
 
 	std::string line;
-	while (std::getline(file, line)) {
+	const bool live = std::getenv("KYTY_LAB_INPUT_LIVE") != nullptr;
+	if (live) {
+		LOGF("[lab-input] live script: waiting for appended events\n");
+	}
+	for (;;) {
+		const auto position = file.tellg();
+		const bool got      = static_cast<bool>(std::getline(file, line));
+		if (live && (!got || file.eof())) {
+			file.clear();
+			file.seekg(position);
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			continue;
+		}
+		if (!got) {
+			break;
+		}
 		const LabInputEvent event = ParseLabInputLine(line);
 		if (event.kind == Kind::Comment) {
 			continue;
