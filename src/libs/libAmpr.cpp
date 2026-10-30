@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -1244,6 +1245,17 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		                     : g_counters[command->index].load(std::memory_order_acquire);
 		if (command->pair) {
 			value |= uint64_t {g_counters[command->index + 1].load(std::memory_order_acquire)} << 32u;
+		}
+		{
+			static std::atomic<uint32_t> s_lab_calls {0};
+			static std::atomic<uint32_t> s_lab_nonzero {0};
+			const auto calls   = s_lab_calls.fetch_add(1) + 1;
+			const auto nonzero = value != 0 ? s_lab_nonzero.fetch_add(1) + 1 : s_lab_nonzero.load();
+			if (calls <= 20 || (calls % 500) == 0) {
+				std::printf("[lab-ampr] write-from-%s idx=%u value=0x%016" PRIx64 " calls=%u nonzero=%u\n",
+				            command->time ? "time" : (command->pair ? "pair" : "counter"),
+				            static_cast<unsigned>(command->index), value, calls, nonzero);
+			}
 		}
 		std::atomic_ref(*reinterpret_cast<uint64_t*>(command->address))
 		    .store(value, std::memory_order_release);
