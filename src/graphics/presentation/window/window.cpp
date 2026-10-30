@@ -516,6 +516,9 @@ void WindowContext::ProcessEvent(double time_s) {
 	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
+	if (LabIsOverlayEvent(*event)) {
+		return;
+	}
 	if (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST) {
 		ProcessWindowEvent(event->window);
 		return;
