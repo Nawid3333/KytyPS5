@@ -680,7 +680,13 @@ void Validate(const ImageInfo& info) {
 			if (!GuestRange {info.metadata.range.address,
 			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
-				EXIT("invalid color metadata\n");
+				EXIT("invalid color metadata: kind=%u addr=0x%016llx size=0x%016llx compression=%u "
+				     "extent=%ux%u pixel_format=%u\n",
+				     static_cast<unsigned>(info.metadata.kind),
+				     static_cast<unsigned long long>(info.metadata.range.address),
+				     static_cast<unsigned long long>(info.metadata.range.size),
+				     static_cast<unsigned>(info.metadata.compression), info.extent.width, info.extent.height,
+				     static_cast<unsigned>(info.pixel_format));
 			}
 			break;
 	}
