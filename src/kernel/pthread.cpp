@@ -4439,6 +4439,10 @@ int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr
 
 } // namespace Posix
 
+bool LabGuestStack(uint64_t* stack_addr, uint64_t* stack_size) {
+	return LibKernel::PthreadGetGuestStack(LibKernel::PthreadSelf(), stack_addr, stack_size);
+}
+
 } // namespace Libs
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
