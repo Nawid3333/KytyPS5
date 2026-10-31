@@ -77,6 +77,8 @@ inline bool LabTraceStack(const char* function) {
 	return !names.empty() && names.find("," + std::string(function) + ",") != std::string::npos;
 }
 
+bool LabGuestStack(uint64_t* stack_addr, uint64_t* stack_size);
+
 [[gnu::noinline]] inline void LabScanStack(char* out, size_t size) {
 	uintptr_t stack_base  = 0;
 	uintptr_t stack_limit = 0;
@@ -86,8 +88,14 @@ inline bool LabTraceStack(const char* function) {
 #endif
 	const auto frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
 	if (frame < stack_limit || frame >= stack_base) {
-		snprintf(out, size, " stack=?");
-		return;
+		uint64_t guest_addr = 0;
+		uint64_t guest_size = 0;
+		if (!LabGuestStack(&guest_addr, &guest_size) || frame < guest_addr || frame >= guest_addr + guest_size) {
+			snprintf(out, size, " stack=?");
+			return;
+		}
+		stack_limit = guest_addr;
+		stack_base  = guest_addr + guest_size;
 	}
 	const uintptr_t end   = stack_base - frame > 0x10000 ? frame + 0x10000 : stack_base;
 	int             used  = snprintf(out, size, " stack=");
