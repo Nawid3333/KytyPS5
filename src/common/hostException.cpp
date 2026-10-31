@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/profiler.h"
 
 #include <atomic>
 #include <cstdio>
@@ -131,6 +132,22 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r15              = registers->R15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && info.type == ExceptionType::AccessViolation &&
+	    info.access_violation_type == AccessViolationType::Read) {
+		KYTY_PROFILER_BLOCK("LabHostException::ReadFault");
+		if (handler(info)) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	if (handler != nullptr && info.type == ExceptionType::AccessViolation &&
+	    info.access_violation_type == AccessViolationType::Write) {
+		KYTY_PROFILER_BLOCK("LabHostException::WriteFault");
+		if (handler(info)) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
