@@ -469,16 +469,21 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		static std::atomic<bool>                          lab_fired {false};
 		const auto                                        now = std::chrono::steady_clock::now();
 		bool                                              fire = false;
+		static const uint32_t lab_total = [] {
+			const auto value = std::strtoul(std::getenv("KYTY_LAB_TRACE_ON_REOPEN"), nullptr, 10);
+			return value > 1 ? static_cast<uint32_t>(value) : 0u;
+		}();
 		{
 			std::scoped_lock lock(lab_mutex);
 			auto&            entry = lab_opens[path];
-			if (entry.count == 0 || now - entry.since > std::chrono::seconds(5)) {
+			if (lab_total == 0 && (entry.count == 0 || now - entry.since > std::chrono::seconds(5))) {
 				entry = {0, now};
 			}
-			fire = ++entry.count == 20;
+			fire = ++entry.count == (lab_total != 0 ? lab_total : 20u);
 		}
 		if (fire && !lab_fired.exchange(true)) {
-			LOGF("[lab-trace] %s opened 20 times in 5 s: HLE names of all threads on for 4 s\n", path);
+			LOGF("[lab-trace] %s opened %u times: HLE names of all threads on for 4 s\n", path,
+			     lab_total != 0 ? lab_total : 20u);
 			std::thread([] {
 				Libs::g_lab_trace_all.store(true);
 				std::this_thread::sleep_for(std::chrono::seconds(4));

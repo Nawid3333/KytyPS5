@@ -10,6 +10,9 @@
 #include <fmt/format.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
@@ -66,12 +69,48 @@ namespace Libs {
 
 inline std::atomic<bool> g_lab_trace_all {false};
 
+inline bool LabTraceStack(const char* function) {
+	static const std::string names = [] {
+		const char* value = std::getenv("KYTY_LAB_TRACE_STACK");
+		return value != nullptr ? "," + std::string(value) + "," : std::string();
+	}();
+	return !names.empty() && names.find("," + std::string(function) + ",") != std::string::npos;
+}
+
+[[gnu::noinline]] inline void LabScanStack(char* out, size_t size) {
+	uintptr_t stack_base  = 0;
+	uintptr_t stack_limit = 0;
+#if defined(_WIN32)
+	asm volatile("movq %%gs:0x8, %0" : "=r"(stack_base));
+	asm volatile("movq %%gs:0x10, %0" : "=r"(stack_limit));
+#endif
+	const auto frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+	if (frame < stack_limit || frame >= stack_base) {
+		snprintf(out, size, " stack=?");
+		return;
+	}
+	const uintptr_t end   = stack_base - frame > 0x10000 ? frame + 0x10000 : stack_base;
+	int             used  = snprintf(out, size, " stack=");
+	int             found = 0;
+	for (uintptr_t p = frame; p + 8 <= end && found < 12 && used < static_cast<int>(size) - 20; p += 8) {
+		const auto value = *reinterpret_cast<const uint64_t*>(p);
+		if (value >= 0x900000000ull && value < 0xa00000000ull) {
+			used += snprintf(out + used, size - used, "%llx,", static_cast<unsigned long long>(value));
+			found++;
+		}
+	}
+}
+
 [[gnu::noinline]] inline void LabPrintNameCaller(const char* library, const char* module, const char* function,
                                                  const void* caller) {
 	const auto elapsed_ms = static_cast<unsigned long long>(Loader::Timer::GetTimeMs());
-	LOGF("[%d][%02llu:%02llu:%02llu.%03llu] %s::%s::%s() caller=0x%016llx\n", Common::Thread::GetThreadIdUnique(),
+	char       stack[256] = "";
+	if (LabTraceStack(function)) {
+		LabScanStack(stack, sizeof(stack));
+	}
+	LOGF("[%d][%02llu:%02llu:%02llu.%03llu] %s::%s::%s() caller=0x%016llx%s\n", Common::Thread::GetThreadIdUnique(),
 	     elapsed_ms / 3600000, (elapsed_ms / 60000) % 60, (elapsed_ms / 1000) % 60, elapsed_ms % 1000, library, module,
-	     function, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller)));
+	     function, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller)), stack);
 }
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
