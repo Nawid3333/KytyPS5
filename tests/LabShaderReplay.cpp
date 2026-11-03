@@ -3,6 +3,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <iterator>
 #include <string>
 #include <vector>
+#include <xxhash.h>
 
 namespace {
 
@@ -127,7 +129,11 @@ int main(int argc, char **argv) {
   std::fflush(stdout);
   const auto translate_start = std::chrono::steady_clock::now();
   auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-  std::printf("replay: translate_ms=%lld blocks=%zu\n", Ms(translate_start), translated.program.blocks.size());
+  const auto translate_ms = Ms(translate_start);
+  const auto plan = ShaderRecompiler::IR::SaveResourcePlan(translated.program);
+  std::printf("replay: translate_ms=%lld blocks=%zu plan_bytes=%zu plan_hash=%016llx\n", translate_ms,
+              translated.program.blocks.size(), plan.size(),
+              static_cast<unsigned long long>(XXH3_64bits(plan.data(), plan.size())));
   std::fflush(stdout);
   return 0;
 }
