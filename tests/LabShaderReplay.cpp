@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
   const auto translate_start = std::chrono::steady_clock::now();
   auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
   const auto translate_ms = Ms(translate_start);
-  const auto plan = ShaderRecompiler::IR::SaveResourcePlan(translated.program);
+  const auto plan = ShaderRecompiler::IR::SaveResourcePlan(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
   std::printf("replay: translate_ms=%lld blocks=%zu plan_bytes=%zu plan_hash=%016llx\n", translate_ms,
               translated.program.blocks.size(), plan.size(),
               static_cast<unsigned long long>(XXH3_64bits(plan.data(), plan.size())));
