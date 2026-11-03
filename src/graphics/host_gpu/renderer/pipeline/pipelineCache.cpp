@@ -117,6 +117,50 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// Lab: the compile options next to a dumped program, so tests/LabShaderReplay.cpp can recompile it without the game.
+struct LabCompileOptionsHeader {
+	char     magic[4]        = {'K', 'L', 'O', 'P'};
+	uint32_t version         = 1;
+	uint32_t stage           = 0;
+	uint32_t wave_size       = 0;
+	uint32_t user_data_base  = 0;
+	uint32_t input_size      = 0;
+	uint32_t user_data_count = 0;
+	uint32_t back_code_count = 0;
+	uint64_t hash            = 0;
+};
+
+template <typename InputInfo>
+void LabDumpCompileOptions(const ShaderRecompiler::CompileOptions& options, const InputInfo& input,
+                           std::span<const uint32_t> user_data, std::span<const uint32_t> back_code,
+                           uint64_t hash, const std::string& name) {
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+	LabCompileOptionsHeader header;
+	header.stage           = static_cast<uint32_t>(options.stage);
+	header.wave_size       = options.wave_size;
+	header.user_data_base  = options.user_data_base;
+	header.input_size      = static_cast<uint32_t>(sizeof(InputInfo));
+	header.user_data_count = static_cast<uint32_t>(user_data.size());
+	header.back_code_count = static_cast<uint32_t>(back_code.size());
+	header.hash            = hash;
+	std::vector<uint8_t> bytes(sizeof(header) + sizeof(InputInfo) + user_data.size_bytes() +
+	                           back_code.size_bytes());
+	auto* out = bytes.data();
+	std::memcpy(out, &header, sizeof(header));
+	std::memcpy(out + sizeof(header), static_cast<const void*>(&input), sizeof(InputInfo));
+	std::memcpy(out + sizeof(header) + sizeof(InputInfo), user_data.data(), user_data.size_bytes());
+	std::memcpy(out + sizeof(header) + sizeof(InputInfo) + user_data.size_bytes(), back_code.data(),
+	            back_code.size_bytes());
+	const auto path = Config::GetShaderLogFolder() / name;
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (!file.IsInvalid()) {
+		file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()));
+	}
+}
+
 void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
@@ -421,6 +465,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+		LabDumpCompileOptions(options, input_info, user_data, params.back_code, params.hash,
+		                      fmt::format("original/{}_{:016x}.opts",
+		                                  ShaderRecompiler::StageName(options.stage), params.hash));
 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
