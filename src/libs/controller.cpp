@@ -1183,6 +1183,7 @@ void LabRecordAxis(Axis axis, int value) {
 	last = value;
 	std::fprintf(g_lab_record.file, "{\"t\": %.3f, \"axis\": \"%s\", \"raw\": %d}\n", LabRecordTime(),
 	             LAB_AXIS_NAMES[index], value);
+	std::fflush(g_lab_record.file);
 }
 
 } // namespace
