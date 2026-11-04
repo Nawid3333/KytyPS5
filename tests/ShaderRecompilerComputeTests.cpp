@@ -16980,6 +16980,31 @@ public:
               "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
       DestroyBuffer(&bounds_readback);
 
+      // PPSA32236: a compression-disabled pass expands a pending HTile clear; without HTile it
+      // binds nothing.
+      registers.SetDepthRenderTarget(depth_only_target);
+      registers.SetDepthControl({});
+      registers.SetRenderControl({.depth_compress_disable = true});
+      (void)texture_cache.ClearMeta(depth_only_htile_address);
+      RenderDepthInfo decompress_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), decompress_depth);
+      const auto decompress_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, decompress_depth);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      auto uncompressed_target = depth_only_target;
+      uncompressed_target.z_info.htile_acceleration = false;
+      registers.SetDepthRenderTarget(uncompressed_target);
+      RenderDepthInfo uncompressed_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), uncompressed_depth);
+      Require(name, "in-place depth decompress",
+              decompress_depth.image_id == depth_only.image_id &&
+                  decompress_rendering.depth_stencil_attachment.depth_clear &&
+                  !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
+                  !uncompressed_depth.image_id,
+              "a compression-disabled pass did not expand its pending HTile clear");
+
       // Captured DB_DEPTH_VIEW selects one layer of an 87-layer HTile target.
       auto high_slice_target = depth_only_target;
       high_slice_target.z_read_base_addr = base + 0x800000;
@@ -33978,7 +34003,7 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
 }
 
 // Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
-// min(delta, 64). The profile period picks the host clock shift.
+// min(delta, 64). The profile period picks the host clock divisor.
 std::vector<TestCase> ScalarMemRealtimeCases() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
@@ -34011,14 +34036,18 @@ std::vector<TestCase> ScalarMemRealtimeCases() {
     ShaderProfile profile;
     std::vector<std::string> required, forbidden;
   } variants[] = {
-      {"ScalarMemRealtimeShiftsNanosecondClock",
+      {"ScalarMemRealtimeDividesNanosecondClockBy10",
        {.maintenance8 = true, .device_clock_period_ps = 1000},
-       {"OpShiftRightLogical %ulong", "%uint_3\n"},
+       {"OpUMulExtended", "%ulong_1844674407370955162\n"},
        {}},
       {"ScalarMemRealtimeKeeps100MHzClock",
        {.maintenance8 = true, .device_clock_period_ps = 10000},
        {"OpReadClockKHR %ulong %uint_1"},
-       {"OpShiftRightLogical %ulong"}}};
+       {"OpUMulExtended"}},
+      {"ScalarMemRealtimeKeeps19MHzClock",
+       {.maintenance8 = true, .device_clock_period_ps = 52083},
+       {"OpReadClockKHR %ulong %uint_1"},
+       {"OpUMulExtended"}}};
   std::vector<TestCase> tests;
   for (const auto &variant : variants) {
     TestCase test{variant.name, code, {}, {64},
