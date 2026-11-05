@@ -14499,6 +14499,50 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckSamplerFilterMode() {
+    constexpr const char *name = "SamplerFilterMode";
+    auto &context = RuntimeRenderer();
+    // Bilinear halfway between texels 0.0 and 1.0: blend, minimum and maximum.
+    auto image = CreateImage2D(name, 2, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {0u, 0x3f800000u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    for (const auto [mode, expected] : {std::pair{0u, 0x3f000000u}, std::pair{1u, 0u},
+                                        std::pair{2u, 0x3f800000u}}) {
+      ShaderSamplerResource sampler_descriptor{};
+      sampler_descriptor.fields[0] = mode << 29u;
+      sampler_descriptor.fields[2] = (1u << 20u) | (1u << 22u);
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      test.user_data[2] = 1u;
+      std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+      test.user_data[50] = sizeof(u32);
+      test.user_data[51] = 3u << 28u;
+      test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.5f));
+      AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.5f));
+      test.code.push_back(EncodeMimg0(0x20, 0x1));
+      test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+      AppendStoreVgpr(&test.code, 0, 0);
+      AppendEnd(&test.code);
+      test.expected = {expected};
+      const auto compiled = CompileCase(test, SubgroupSize());
+      auto output = CreateStorageBuffer(name, {}, 1);
+      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor, false);
+      Dispatch(test, compiled, output, nullptr, &image, nullptr, nullptr, sampler);
+      const auto actual = ReadBuffer(name, output, 1);
+      if (actual[0] != expected) {
+        Fail(name, "filtered sample", "mode=" + std::to_string(mode) +
+            " expected=" + std::to_string(expected) + " actual=" + std::to_string(actual[0]));
+      }
+      DestroyBuffer(&output);
+    }
+    DestroyImage(&image);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -22513,6 +22557,7 @@ private:
     m_runtime_context.r8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8Srgb);
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
+    m_runtime_context.sampler_filter_minmax_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
@@ -22769,6 +22814,7 @@ private:
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
+    device_features12.samplerFilterMinmax = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -52284,9 +52330,9 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 17> legacy_shader_slots{
+  constexpr std::array<uint32_t, 16> legacy_shader_slots{
       0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
-      0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
+      0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
       0x219u, 0x21au, 0x27du,
   };
   for (const auto offset : legacy_shader_slots) {
@@ -52335,7 +52381,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
 void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
-  std::array<uint32_t, 24> registers{
+  std::array<uint32_t, 34> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
       Pm4::SPI_SHADER_PGM_CHKSUM_HS, 0x12345678u,
       Pm4::SPI_SHADER_PGM_RSRC4_HS, 0x87654321u,
@@ -52348,6 +52394,11 @@ void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
       Pm4::SPI_SHADER_PGM_HI_PS, 0u,
       Pm4::SPI_SHADER_PGM_RSRC1_PS, 0x022c018du,
       Pm4::SPI_SHADER_PGM_RSRC2_PS, 0x0000003cu,
+      Pm4::SPI_SHADER_PGM_RSRC1_HS, 0x30000007u,
+      Pm4::SPI_SHADER_PGM_RSRC2_HS, 0x00000018u,
+      0x0000014au, 0x03000007u,
+      Pm4::SPI_SHADER_PGM_LO_LS, 0x11654288u,
+      Pm4::SPI_SHADER_PGM_HI_LS, 0u,
   };
   const auto address = reinterpret_cast<uint64_t>(registers.data());
   std::array<uint32_t, 5> command{
@@ -52375,6 +52426,11 @@ void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
               ps.data_addr == 0x500010400ull && ps.rsrc1.vgprs == 13u &&
               ps.rsrc2.user_sgpr == 30u,
           "GS-front metadata changed native GS state or prevented later PS writes");
+  Require("Pm4IndirectShaderRegisters", "HS state around front metadata",
+          vs.ls_regs.data_addr == 0x1165428800ull &&
+              vs.hs_regs.rsrc1.ls_vgpr_component_count == 3u &&
+              vs.hs_regs.rsrc2.user_sgpr == 12u,
+          "HS-front metadata changed HS state or prevented later LS writes");
   std::printf("[host]    %-32s ok\n", "Pm4IndirectShaderRegisters");
 }
 
@@ -55165,6 +55221,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     vulkan.CheckSamplerBorderColors();
+    vulkan.CheckSamplerFilterMode();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
@@ -55288,6 +55345,7 @@ int main(int argc, char **argv) {
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
+  vulkan.CheckSamplerFilterMode();
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
