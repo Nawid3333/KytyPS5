@@ -2308,11 +2308,14 @@ void TestFixedArenaChurnKeepsRangesExact() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestPartialUnmapPreservesHostPermissions() {
-	const char* test = "PartialUnmapPreservesHostPermissions";
+	const char* test     = "PartialUnmapPreservesHostPermissions";
+	const auto  mappings = Libs::LibKernel::Memory::TestFlexibleMappingCount();
 	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
 	                                   "unmap_host_permissions");
+	Check(test, Libs::LibKernel::Memory::TestFlexibleMappingCount() == mappings + 1,
+	      "the mapping is split into several backing views");
 	using Common::VirtualMemory::Mode;
 	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
 	      "could not protect the left survivor from writes");
@@ -2324,6 +2327,15 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(middle)");
 
+	ExpectHostReadOnly(test, base);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION right {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(base + SceKernelPageSize * 2), &right,
+	                   sizeof(right)) != 0 &&
+	          right.Protect == PAGE_NOACCESS,
+	      "partial unmap removed the right survivor's read protection");
+#else
 	// Probe actual host access without taking a signal or changing the page protections.
 	uint64_t value = 0;
 	iovec local {&value, sizeof(value)};
@@ -2331,10 +2343,9 @@ void TestPartialUnmapPreservesHostPermissions() {
 	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
 	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
 	      "partial unmap removed read access to the left survivor");
-	Check(test, process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1,
-	      "partial unmap removed the left survivor's write protection");
 	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
 	      "partial unmap removed the right survivor's read protection");
+#endif
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
 	        "KernelMunmap(left cleanup)");
@@ -3744,6 +3755,28 @@ void TestAutomaticMemoryFragmentedMap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMemoryPoolReserveInsideReservation() {
+	const char*        test  = "MemoryPoolReserveInsideReservation";
+	constexpr uint64_t len   = SceKernelMemoryPoolReserveLen;
+	void*              outer = nullptr;
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&outer, 5 * len, 0, len),
+	        "KernelReserveVirtualRange(outer)");
+	// Free gaps on both sides keep the outer reservation from merging with other ranges.
+	const auto base = reinterpret_cast<uint64_t>(outer) + len;
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base - len, len), "KernelMunmap(front)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 3 * len, len), "KernelMunmap(back)");
+	void* pool = reinterpret_cast<void*>(base + len);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(pool, len, 0, SceKernelMapFixed, &pool),
+	        "KernelMemoryPoolReserve(inside a reservation)");
+	ExpectRange(test, Query(test, base), base, base + len, 0, 0, 0, 0, 0, "anon");
+	ExpectRange(test, Query(test, base + len), base + len, base + 2 * len, 0, 0, 0, 1, 0, "anon");
+	ExpectRange(test, Query(test, base + 2 * len), base + 2 * len, base + 3 * len, 0, 0, 0, 0, 0,
+	            "anon");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, 3 * len), "KernelMunmap(outer)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMemoryPoolAlignmentContracts() {
 	const char* test = "MemoryPoolAlignmentContracts";
 	void*       addr = nullptr;
@@ -4060,11 +4093,44 @@ void TestMemoryPoolMultiRangeDecommit() {
 	          decommitted.is_pooled == 1 && decommitted.is_committed == 0,
 	      "multi-range decommit did not restore the reserved pool span");
 
+	const auto split_span = base + 2 * SceKernelMemoryPoolCommitLen;
+	const auto renamed    = split_span + SceKernelMemoryPoolCommitLen;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelSetVirtualRangeName(
+	            reinterpret_cast<void*>(renamed), SceKernelMemoryPoolCommitLen, "pool_renamed"),
+	        "KernelSetVirtualRangeName(pool tail)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(reinterpret_cast<void*>(split_span),
+	                                                        expand_len, SceKernelMtypeC,
+	                                                        SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit(renamed span)");
+	ExpectRange(test, Query(test, split_span), split_span, renamed, SceKernelProtCpuRw, 0, 0, 1, 1);
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, SceKernelProtCpuRw,
+	            0, 0, 1, 1, "pool_renamed");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolDecommit(reinterpret_cast<void*>(split_span),
+	                                                          expand_len, 0),
+	        "KernelMemoryPoolDecommit(renamed span)");
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, 0, 0, 0, 1, 0,
+	            "pool_renamed");
+
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(mixed span)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, expand_len, SceKernelMtypeC,
+	                                                      SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EBUSY,
+	      "commit accepted a span with committed pool memory");
+	ExpectRange(test, Query(test, base), base, base + SceKernelMemoryPoolCommitLen, 0, 0, 0, 1, 0);
+	const auto pool_end = base + SceKernelMemoryPoolReserveLen;
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	          reinterpret_cast<void*>(pool_end - SceKernelMemoryPoolCommitLen), expand_len,
+	          SceKernelMtypeC, SceKernelProtCpuRw, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "commit accepted a span past the pool reserve");
 	g_gpu_range_events.clear();
 	Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),
@@ -5826,7 +5892,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasRelease);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPartialUnmapPreservesHostPermissions);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -5854,6 +5920,7 @@ int main(int argc, char** argv) {
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAutomaticMemoryFragmentedMap);
+	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);
