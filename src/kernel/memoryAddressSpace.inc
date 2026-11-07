@@ -309,16 +309,6 @@ public:
 	}
 
 	bool UnmapOne(uint64_t vaddr, uint64_t size) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_backing_store_unmaps_before_failure == 0) {
-			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
-			return false;
-		}
-		if (g_test_backing_store_unmaps_before_failure != UINT32_MAX) {
-			g_test_backing_store_unmaps_before_failure--;
-		}
-#endif
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MapEntry old {};
 		{
@@ -661,8 +651,6 @@ public:
 		    });
 		return true;
 	}
-
-	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
@@ -1046,7 +1034,12 @@ private:
 			}
 
 			AddFreeUnlocked(start, size);
-			m_owned.emplace_back(start, size);
+			// Free ranges merge across region boundaries, so owned ranges do as well.
+			if (!m_owned.empty() && m_owned.back().first + m_owned.back().second == start) {
+				m_owned.back().second += size;
+			} else {
+				m_owned.emplace_back(start, size);
+			}
 		};
 
 		for (const auto& [region_start, region_end]: regions) {
