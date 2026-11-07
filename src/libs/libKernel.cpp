@@ -2478,7 +2478,12 @@ static std::mutex                                                 g_lab_fiber_st
 static std::unordered_map<const FiberObject*, std::pair<uint64_t, uint64_t>> g_lab_fiber_stacks;
 
 static uintptr_t LabFiberOwnStackTop(FiberObject* fiber) {
-	constexpr uint64_t Margin   = 64u * 1024u;
+	constexpr uint64_t SmallContext = 64u * 1024u;
+	constexpr uint64_t Margin   = 1024u * 1024u;
+	if (fiber->size_context >= SmallContext) {
+		return reinterpret_cast<uintptr_t>(fiber->addr_context) +
+		       static_cast<uintptr_t>(fiber->size_context);
+	}
 	constexpr uint64_t PageSize = 0x4000;
 	const uint64_t     size     = (fiber->size_context + Margin + PageSize - 1u) & ~(PageSize - 1u);
 	bool               fresh    = false;
