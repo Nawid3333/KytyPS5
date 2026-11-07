@@ -634,6 +634,12 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
+                                        ShaderVertexInputInfo &input) {
+    uint32_t push_data_cursor = 0;
+    return cache.GetProgram(params, input, push_data_cursor);
+  }
+
   static void StoreLayout(PipelineCache &cache, uint64_t key,
                           const ShaderTessellationInputInfo &layout) {
     cache.StoreLayout(key, layout);
@@ -16455,6 +16461,30 @@ public:
                     std::vector<uint32_t>{1, 1},
                 "query/store did not access the standalone 1x1 mip");
       }
+      {
+        // No Man's Sky compresses mip 1 through a T# that declares one level.
+        constexpr uint64_t address = base + 0x400000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc3e00000u, 0x003fc03fu, 0xd051102cu, 0, 0x00700000u, 0, 0};
+        descriptor.dword_count = 8;
+        const auto store =
+            RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, descriptor);
+        Require(name, "mip view past MAX_MIP",
+                store.desc.info.extent.width == 128 &&
+                    store.desc.info.extent.height == 128 &&
+                    store.desc.info.resources.levels == 1 &&
+                    store.desc.info.data.size == 0x20000 &&
+                    store.desc.view_info.base_level == 0,
+                "a view past MAX_MIP did not rebase to its own 128x128 chain");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        ExpectFatal("TailMipViewPastMaxMip", [&] {
+          auto tail = descriptor;
+          tail.dwords[3] = 0xd054402cu;
+          (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, tail);
+        });
+#endif
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);
@@ -20910,6 +20940,37 @@ public:
       }
       registers.SetTargetOutputMode(0, 4);
 
+      // An empty screen scissor resolves no target: No Man's Sky's last 0x0
+      // reduction pass draws to a mip past the target's last level.
+      registers.SetColorAttrib2(3, {.height = extent - 1, .width = extent - 1,
+                                    .num_mip_levels = 1});
+      registers.SetColorView(3, {.current_mip_level = 2});
+      registers.SetScreenScissor(0, 0, 0, 0);
+      RenderExecutorTestAccess::DrawAuto(
+          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      // Vertex-stage buffer writes still run, so that draw resolves the target.
+      ExpectFatal("EmptyScissorVertexBufferWrite", [&] {
+        auto code = native_vertex;
+        code.insert(code.end() - 1, {EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0)});
+        shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(code.data()));
+        ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetGsShaderResource2({.user_sgpr = 4});
+        shaders.SetGsUserSgpr(0, static_cast<u32>(index_address));
+        shaders.SetGsUserSgpr(1, static_cast<u32>(index_address >> 32u));
+        shaders.SetGsUserSgpr(2, 16);
+        shaders.SetGsUserSgpr(3, DstSel(4, 5, 6, 7) |
+                                     (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u));
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      });
+#endif
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetColorView(3, {});
+      registers.SetColorAttrib2(3, {.height = extent - 1, .width = extent - 1});
+
       // Indirect arguments also reach s8/s9. Native VS prologs must add them
       // exactly once, for both indexed and automatically generated indices.
       static const auto indirect_vertex = [&] {
@@ -24218,6 +24279,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMP_GT_F16:
   case Opcode::V_CMP_LG_F16:
   case Opcode::V_CMP_GE_F16:
+  case Opcode::V_CMP_U_F16:
   case Opcode::V_CMP_NGT_F16:
   case Opcode::V_CMP_NEQ_F16:
   case Opcode::V_CMP_NLT_F16:
@@ -29870,6 +29932,34 @@ TestCase VectorCvtF16U16ByteSource() {
   return test;
 }
 
+TestCase VectorCvtF16I16ByteSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 8, 0xa5a55a5au);
+  u32 index = 0;
+  for (u32 sext : {0u, 1u}) {
+    for (u32 input : {0x123456ffu, 0x12345680u, 0x1234567fu}) {
+      AppendSMovLiteral(&code, 106, input);
+      // Convert byte0 of vcc_lo, zero- then sign-extended, to FP16 word0 while
+      // preserving word1 of v8.
+      code.insert(code.end(), {0x7e10a2f9u, 0x0080146au | (sext << 19u)});
+      AppendStoreVgpr(&code, 8, index++);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCvtF16I16ByteSource";
+  test.code = std::move(code);
+  test.expected = {0xa5a55bf8u, 0xa5a55800u, 0xa5a557f0u,
+                   0xa5a5bc00u, 0xa5a5d800u, 0xa5a557f0u};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_CVT_F16_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertSToF"};
+  return test;
+}
+
 TestCase VectorCvtU16F16Sdwa() {
   using O = ShaderOpcode;
 
@@ -34370,6 +34460,93 @@ TestCase VectorVopcCmpNltF16CapturedSdwaAndEdges() {
                   O::V_CMP_NLT_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_CMP_NLT_F16", cases.size()}};
   test.required_spirv = {"OpFUnordGreaterThanEqual"};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVopcCmpUF16CapturedSdwaAndEdges() {
+  using O = ShaderOpcode;
+  enum Encoding { Captured, Compact, Vop3NegAbs, HighWord, SdwaNegAbs };
+  struct CompareCase {
+    u32 packed; // Two-operand forms compare low half against high half.
+    u32 expected;
+    Encoding encoding = Compact;
+    u32 exec = 1;
+  };
+  const std::array<CompareCase, 16> cases{{
+      {0x3c003c00u, 0}, // Equal
+      {0x3c007e00u, 1}, // Quiet NaN in src0
+      {0x7e003c00u, 1}, // Quiet NaN in src1
+      {0x3c007c01u, 1}, // Signaling NaN in src0
+      {0x7c013c00u, 1}, // Signaling NaN in src1
+      {0xfe007fffu, 1}, // NaN in both
+      {0xfc007c00u, 0}, // Infinities are ordered.
+      {0x03ff8001u, 0}, // Denormals are ordered.
+      {0x7e003c00u, 0, Captured}, // Self-compare ignores the upper half.
+      {0x3c007e00u, 1, Captured},
+      {0x3c007e00u, 0, Captured, 0}, // Inactive lane contributes no mask bit.
+      {0x3c00fe00u, 1, Vop3NegAbs}, // -abs(NaN) stays NaN.
+      {0x3c00bc00u, 0, Vop3NegAbs},
+      {0x7e003c00u, 1, HighWord},
+      {0x3c007e00u, 0, HighWord},
+      {0x3c00fe00u, 1, SdwaNegAbs},
+  }};
+  constexpr u32 sentinel = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpUF16CapturedSdwaAndEdges";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.packed);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  code.push_back(EncodeSMovB32(22, 2)); // Preserve the input buffer descriptor.
+  code.push_back(EncodeSMovB32(23, 3));
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    const bool writes_vcc = entry.encoding == Captured || entry.encoding == Compact;
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 23, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 1, entry.packed >> 16u);
+    for (u32 reg : {3u, 106u, 107u}) {
+      AppendSMovLiteral(&code, reg, sentinel);
+    }
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    switch (entry.encoding) {
+    case Captured: code.push_back(0x7dd02f17u); break; // v_cmp_u_f16 vcc, v23, v23
+    case Compact: code.push_back(EncodeVopc(0xe8, Vgpr(23), 1)); break;
+    case Vop3NegAbs:
+      AppendVop3(&code, 0xe8, 2, Vgpr(23), Vgpr(1), 0, 1, 0, false, 0, 1);
+      break;
+    case HighWord:
+      code.push_back(EncodeVopc(0xe8, 249, 23));
+      code.push_back(EncodeVopcSdwa(23, 2, 1, 5, 5));
+      break;
+    case SdwaNegAbs:
+      code.push_back(EncodeVopc(0xe8, 249, 1));
+      code.push_back(EncodeVopcSdwa(23, 2, 1, 6, 6, 0, 0, 1, 1));
+      break;
+    }
+    code.push_back(EncodeSMovB32(20, writes_vcc ? 106 : 2));
+    code.push_back(EncodeSMovB32(21, 3)); // Wave32 must preserve adjacent SGPR.
+    code.push_back(EncodeSMovB32(24, 126));
+    code.push_back(EncodeSMovB32(25, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    code.push_back(EncodeSMovB32(2, 22));
+    code.push_back(EncodeSMovB32(3, 23));
+    const u32 out = static_cast<u32>(cases.size()) + i * 6u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 24, out + 2u);
+    AppendStoreSgprPair(&code, 106, out + 4u);
+    test.expected.insert(test.expected.end(),
+                         {entry.expected, sentinel, entry.exec, 0u,
+                          writes_vcc ? entry.expected : sentinel, sentinel});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMP_U_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMP_U_F16", cases.size()}};
+  test.required_spirv = {"OpIsNan"};
   test.compute_info.wave_size = 32;
   test.has_compute_info = true;
   return test;
@@ -48266,6 +48443,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtF16U16ByteSource);
+  AddCase(VectorCvtF16I16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
@@ -48389,6 +48567,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxNeU16SdwaCompactVop3ExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
+  AddCase(VectorVopcCmpUF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
@@ -48838,6 +49017,76 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
     previous_id = program->id;
     previous_units = units;
   }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The HS wave runs the fused LS and HS and the GS wave runs the TES, so VGT_SHADER_STAGES_EN
+// gives each stage its wave size; a GS that amplifies tessellated primitives stays rejected.
+// The TES gates its vertices on GS_TG_INFO's group vertex count (PPSA02110's prologue) and
+// on the merged wave info's lane count.
+void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler;
+  constexpr const char *name = "TessellationWaveSizes";
+  const std::vector<u32> local{EncodeSop1(0x20, 0, 6), 0xffffffffu};
+  const std::vector<u32> control{EncodeSopp(0x01)};
+  const std::vector<u32> evaluation{
+      0x93ebff03u, 0x00040018u, 0x8f6a856bu, 0xd7650001u, 0x0000d4c1u, // v1: wave lane id
+      0x9381ff02u, 0x0009000cu, 0x7da80201u, // v_cmpx_gt_u32 s1 = GS_TG_INFO[20:12], v1
+      0x9380ff03u, 0x00080000u, 0x7da80200u, // v_cmpx_gt_u32 s0 = s3[7:0], v1
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01)};
+  static ShaderUserData user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = type, .user_data = &user_data,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(local, Prospero::ShaderBinaryType::kHsFront);
+  map(control, Prospero::ShaderBinaryType::kHsBack);
+  map(evaluation, Prospero::ShaderBinaryType::kGs);
+  HW::VertexShaderInfo regs{};
+  regs.ls_regs.data_addr = reinterpret_cast<uint64_t>(local.data());
+  regs.hs_regs.data_addr = reinterpret_cast<uint64_t>(control.data());
+  regs.hs_regs.user_data_addr = 1;
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(evaluation.data());
+  HW::Context context;
+  context.SetLsHsConfig(0x0001062au); // 42 patches, 6 input and 4 output control points
+  context.SetTfParam(0x00040042u);    // quads
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  // The captured draw sets HS_W32 (bit 21) and GS_W32 (bit 22).
+  for (const auto [stages, hs_wave, gs_wave] :
+       {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
+    context.SetShaderStages(stages);
+    std::array<ShaderVertexInputInfo, 3> info;
+    const auto params = PrepareTessellationPrograms(regs, context, info);
+    for (u32 i = 0; i < 3; i++) {
+      info[i].tess.ls_stride = info[i].tess.hs_stride = 16;
+      Require(name, "stage wave size",
+              PipelineCacheTestAccess::GetProgram(cache, params[i], info[i])->info.wave_size ==
+                  (i < 2 ? hs_wave : gs_wave),
+              "a tessellation stage did not run in its HS or GS wave size");
+    }
+    CompileOptions options{.stage = ShaderType::TessellationEvaluation, .wave_size = gs_wave};
+    options.input_info.vertex = &info[2];
+    const auto translated = TranslateProgram(evaluation, options);
+    u32 full_wave_gates = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
+          const auto count = inst.Arg(0).Resolve();
+          full_wave_gates += count.IsImmediate() && count.U32() == gs_wave;
+        }
+      }
+    }
+    Require(name, "TES vertex gates", full_wave_gates == 2,
+            "GS_TG_INFO or the merged wave info did not count one full TES wave");
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  context.SetShaderStages(0x0260212du);
+  ExpectFatal("TessellationGsAmplification", [&] {
+    std::array<ShaderVertexInputInfo, 3> info;
+    (void)PrepareTessellationPrograms(regs, context, info);
+  });
+#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -50932,6 +51181,16 @@ ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   return resource;
 }
 
+ShaderTextureResource Ppsa02110MinLodStorageTextureDescriptor() {
+  return {{0x13053000u, 0xc3e40000u, 0x003fc03fu, 0xd054402cu, 0x00000000u,
+           0x00700080u, 0x000000d1u, 0x00000000u}};
+}
+
+ShaderTextureResource Ppsa02110MipStatsStorageTextureDescriptor() {
+  return {{0x150f0000u, 0xc4b40000u, 0x003fc03fu, 0xd0544facu, 0x00000000u,
+           0x02700080u, 0x00000046u, 0x00000000u}};
+}
+
 ShaderTextureResource Ppsa02527R16FloatStorageTextureDescriptor() {
   return {{0x00ce3500u, 0xc0d00000u, 0x010dc1dfu, 0x91b00204u, 0x00000000u,
            0x00700000u, 0x00000000u, 0x00000000u}};
@@ -51574,6 +51833,27 @@ void CheckBasicStorageTextureDescriptor() {
 }
 #endif
 
+void CheckStorageTextureDescriptors() {
+  constexpr const char *name = "StorageTextureDescriptors";
+  const auto min_lod = Ppsa02110MinLodStorageTextureDescriptor();
+  Require(name, "PPSA02110 mip-four descriptor",
+          min_lod.BaseLevel() == 4 && min_lod.LastLevel() == 4 &&
+              min_lod.MinLod() == 4u << 8u &&
+              min_lod.Format() == Prospero::BufferFormat::k32_32UInt &&
+              min_lod.TileMode() == Prospero::TileMode::kStandard4KB,
+          "PPSA02110 MIN_LOD storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), min_lod,
+                         0xab000);
+  const auto mip_stats = Ppsa02110MipStatsStorageTextureDescriptor();
+  Require(name, "PPSA02110 mip-stats descriptor",
+          mip_stats.MipStatsCntEn() && mip_stats.MipStatsCntId() == 0x46 &&
+              mip_stats.Format() == Prospero::BufferFormat::k32_32_32_32UInt,
+          "PPSA02110 mip-stats storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_stats,
+                         0x156000);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckStorageTextureLinearUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k8_8_8_8UNorm;
   constexpr uint32_t width = 3840;
@@ -52050,6 +52330,13 @@ void CheckShaderRecompilerFatalContracts() {
     AppendEnd(&test.code);
     test.opcodes = {ShaderOpcode::DS_OR_B64, ShaderOpcode::S_ENDPGM};
     (void)CompileCase(test);
+  });
+
+  ExpectFatal("StorageTextureMinLodAboveBase", [] {
+    auto descriptor = Ppsa02110MinLodStorageTextureDescriptor();
+    descriptor.fields[1] += 1u << 8u;
+    ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), descriptor,
+                           0xab000);
   });
 
   {
@@ -54735,9 +55022,9 @@ void CheckPm4LodStats(RenderContext &renderer) {
 }
 
 // With --lod-stats, GET_LOD_STATS reports the counter of a bound T# as sampled at its BASE_LEVEL,
-// clamped when MIN_LOD lies above that level; image heap elements and other counters report no
-// samples. Bit 18 or 19 resets the counters after its report. Without --lod-stats no slot reports
-// samples.
+// clamped when MIN_LOD lies above that level; image heap elements, storage images and other
+// counters report no samples. Bit 18 or 19 resets the counters after its report. Without
+// --lod-stats no slot reports samples.
 void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
   constexpr const char *name = "Pm4LodStatsBoundTextures";
   constexpr uintptr_t base = 0x0000000205100000ull;
@@ -54788,12 +55075,14 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
       u32 base_level;
       u32 min_lod; // u4.8
       bool heap;
+      bool storage;
     };
     // Counter 7 combines levels 1, 0 and 2; only the level 0 T# has MIN_LOD above its level.
     const std::array bindings{Binding{3, true, 0, 0, false}, Binding{5, true, 1, 0x200, false},
                               Binding{7, true, 1, 0x100, false}, Binding{7, true, 0, 0x80, false},
                               Binding{7, true, 2, 0x200, false}, Binding{9, true, 0, 0x200, true},
-                              Binding{11, false, 0, 0x200, false}};
+                              Binding{11, false, 0, 0x200, false},
+                              Binding{13, true, 0, 0, false, true}};
     auto &executor = context.GetRenderExecutor();
     const auto bind = [&] {
       for (u32 index = 0; index < bindings.size(); index++) {
@@ -54812,10 +55101,13 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
         value.dword_count = 8;
         std::copy_n(descriptor.fields, 8, value.dwords.begin());
         ShaderRecompiler::IR::ImageResource resource{};
-        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.resource_class =
+            binding.storage ? ShaderRecompiler::IR::ImageResourceClass::Storage
+                            : ShaderRecompiler::IR::ImageResourceClass::Sampled;
         resource.numeric_class = Prospero::TextureNumericClass::Float;
         resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-        resource.read = true;
+        resource.read = !binding.storage;
+        resource.written = binding.storage;
         resource.heap = binding.heap;
         static_cast<void>(RenderExecutorTestAccess::ResolveTexture(executor, resource, value));
       }
@@ -55291,8 +55583,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--tessellation-only") == 0) {
+    VulkanHarness vulkan;
     CheckTessellationPrograms();
     CheckEmbeddedFetchVertexOffset();
+    CheckTessellationWaveSizes(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
@@ -55361,6 +55655,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, VectorVop3FloatCompareNegSourceModifier());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmp-u-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpUF16CapturedSdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmp-nlt-f16-only") == 0) {
@@ -56283,6 +56582,7 @@ int main(int argc, char **argv) {
   bool skipped_device_checks = false;
 #endif
   CheckImageSamplerSpecialization();
+  CheckStorageTextureDescriptors();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
@@ -56362,6 +56662,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
