@@ -25,6 +25,8 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -2472,10 +2474,39 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
+static std::mutex                                                 g_lab_fiber_stack_mutex;
+static std::unordered_map<const FiberObject*, std::pair<uint64_t, uint64_t>> g_lab_fiber_stacks;
+
+static uintptr_t LabFiberOwnStackTop(FiberObject* fiber) {
+	constexpr uint64_t Margin   = 64u * 1024u;
+	constexpr uint64_t PageSize = 0x4000;
+	const uint64_t     size     = (fiber->size_context + Margin + PageSize - 1u) & ~(PageSize - 1u);
+	bool               fresh    = false;
+	uint64_t           base     = 0;
+	{
+		std::lock_guard lock(g_lab_fiber_stack_mutex);
+		auto&           slot = g_lab_fiber_stacks[fiber];
+		if (slot.second < size) {
+			slot.first = LibKernel::Memory::AllocateGuestStackMemory(
+			    0, size, Common::VirtualMemory::Mode::ReadWrite, "lab fiber stack");
+			EXIT_IF(slot.first == 0);
+			slot.second = size;
+			fresh       = true;
+		}
+		base = slot.first;
+	}
+	if (fresh) {
+		LOGF("\t lab fiber own stack: %s, context = 0x%016" PRIx64 ", size = %" PRIu64
+		     ", stack = 0x%016" PRIx64 ", stack size = %" PRIu64 "\n",
+		     fiber->name, reinterpret_cast<uint64_t>(fiber->addr_context), fiber->size_context, base,
+		     size);
+	}
+	return static_cast<uintptr_t>(base + size);
+}
+
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
+	const auto      stack_top = LabFiberOwnStackTop(fiber);
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
