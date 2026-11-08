@@ -2460,7 +2460,9 @@ static void FiberReleaseStack(FiberObject* fiber) {
 	Common::LockGuard lock(g_fiber_stacks_mutex);
 	const auto        stack = g_fiber_stacks.find(fiber->stack_address);
 	if (stack != g_fiber_stacks.end() && stack->second == fiber) {
-		EXIT_IF(LibKernel::Memory::KernelMunmap(fiber->stack_address, fiber->stack_size) != OK);
+		const auto unmap_result =
+		    LibKernel::Memory::KernelMunmap(fiber->stack_address, fiber->stack_size);
+		EXIT_IF(unmap_result != OK);
 		g_fiber_stacks.erase(stack);
 	}
 	fiber->stack_address = 0;
@@ -2715,7 +2717,8 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
-	EXIT_IF(!FiberAcquireStack(fiber));
+	const bool stack_acquired = FiberAcquireStack(fiber);
+	EXIT_IF(!stack_acquired);
 
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
@@ -2766,7 +2769,8 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
-	EXIT_IF(!FiberAcquireStack(fiber));
+	const bool stack_acquired = FiberAcquireStack(fiber);
+	EXIT_IF(!stack_acquired);
 
 	auto* caller = context->current_fiber;
 

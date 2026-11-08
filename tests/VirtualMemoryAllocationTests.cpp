@@ -5699,6 +5699,80 @@ void TestFiberHostStack() {
 	}
 }
 
+void TestFiberStackExtents() {
+	const char*        test         = "FiberStackExtents";
+	constexpr uint64_t small_limit  = 64u * 1024u;
+	constexpr uint64_t host_reserve = 64u * 1024u;
+	constexpr uint64_t page         = 16u * 1024u;
+	const auto         owned_stack  = [](uint64_t rsp) {
+		std::pair<uint64_t, uint64_t> range {};
+		void*                         start = nullptr;
+		void*                         end   = nullptr;
+		if (Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(rsp), &start, &end) ==
+		    OK) {
+			range = {reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end)};
+		}
+		return range;
+	};
+	const auto run = [&](Libs::Fiber::FiberObject* fiber, FiberHostCall* data, uint64_t size,
+	                     const char* name) {
+		CheckOk(test,
+		        Libs::Fiber::FiberInitialize(fiber, name, FiberHostCallEntry,
+		                                     reinterpret_cast<uint64_t>(data), data->context, size,
+		                                     nullptr, FiberTestBuildVersion),
+		        "initialize fiber");
+		uint64_t value = 0;
+		CheckOk(test, Libs::Fiber::FiberRun(fiber, 0, &value), "yield from host call");
+		Check(test, value == FiberTestYieldValue, "lost yield argument");
+	};
+	for (const uint64_t size: {FiberTestSmallestContext, FiberTestLargestContext}) {
+		auto backing = std::make_unique<FiberTestBacking>();
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberHostCall data {backing->bytes.data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+		run(fiber, &data, size, "stack-extent");
+		const auto [start, end] = owned_stack(data.call_rsp);
+		Check(test, end - start == ((size + host_reserve + page - 1) & ~(page - 1)),
+		      "owned stack size differs from the context size + 64 KiB rounded to 16 KiB");
+		CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "finalize suspended fiber");
+	}
+	for (const uint64_t size: {small_limit - FiberTestStackAlignment, small_limit}) {
+		auto backing = std::make_unique<std::array<uint8_t, FiberTestGuardSize + small_limit>>();
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberHostCall data {backing->data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+		run(fiber, &data, size, "stack-threshold");
+		const auto base       = reinterpret_cast<uint64_t>(data.context);
+		const bool on_context = data.call_rsp >= base && data.call_rsp < base + size;
+		Check(test, on_context == (size >= small_limit),
+		      "the 64 KiB threshold does not decide where the fiber runs");
+		CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "finalize suspended fiber");
+	}
+	auto backing = std::make_unique<FiberTestBacking>();
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> copy_object {};
+	auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+	auto*         copy  = reinterpret_cast<Libs::Fiber::FiberObject*>(copy_object.data());
+	FiberHostCall data {backing->bytes.data() + FiberTestGuardSize, FiberTestSmallestContext,
+	                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+	run(fiber, &data, FiberTestSmallestContext, "stack-owner");
+	copy_object = object;
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(copy, "stack-copy", FiberHostCallEntry,
+	                                     reinterpret_cast<uint64_t>(&data), data.context,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize copied fiber");
+	Check(test, owned_stack(data.call_rsp).second != 0,
+	      "initializing a copy unmapped the original fiber's stack");
+	Check(test, Libs::Fiber::FiberRun(fiber, 0, nullptr) == FiberErrorState,
+	      "original fiber did not resume after its copy was initialized");
+	Check(test, owned_stack(data.call_rsp).second == 0,
+	      "original fiber kept its stack after returning");
+	CheckOk(test, Libs::Fiber::FiberFinalize(copy), "finalize copied fiber");
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 constexpr DWORD FiberTestExceptionCode      = 0xe0422162;
 constexpr DWORD FiberTestExceptionArguments = 1;
@@ -6141,6 +6215,7 @@ int main(int argc, char** argv) {
 		RunTest(TestFiberExceptionStack);
 #endif
 		RunTest(TestFiberHostStack);
+		RunTest(TestFiberStackExtents);
 		RunTest(TestFiberSwitchReturnStack);
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -6174,6 +6249,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFiberExceptionStack);
 #endif
 	RunTest(TestFiberHostStack);
+	RunTest(TestFiberStackExtents);
 	RunTest(TestFiberSwitchReturnStack);
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif
