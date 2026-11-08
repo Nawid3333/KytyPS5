@@ -208,6 +208,7 @@ public:
 		int              memory_type    = 0;
 		VirtualRangeType type           = VirtualRangeType::Reserved;
 		bool             disallow_merge = false;
+		bool             stack_guard    = false;
 		char             name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
@@ -336,10 +337,24 @@ public:
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
 	}
 
-	void Protect(uint64_t start, uint64_t size, int protection) {
+	void Protect(uint64_t start, uint64_t size, int protection, bool stack_guard = false) {
 		Common::LockGuard lock(m_mutex);
 
-		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
+		EditUnlocked(start, size, [protection, stack_guard](Range* r) {
+			r->protection = protection;
+			r->stack_guard = r->stack_guard || stack_guard;
+		});
+	}
+
+	std::vector<Range> GetStackRanges() {
+		Common::LockGuard lock(m_mutex);
+		std::vector<Range> ranges;
+		for (const auto& [_, range]: m_ranges) {
+			if (range.type == VirtualRangeType::Stack && !range.stack_guard) {
+				ranges.push_back(range);
+			}
+		}
+		return ranges;
 	}
 
 	bool Query(uint64_t addr, int flags, Range* out) {
@@ -444,7 +459,7 @@ private:
 		}
 
 		return left.type == right.type && left.protection == right.protection &&
-		       left.memory_type == right.memory_type &&
+		       left.memory_type == right.memory_type && left.stack_guard == right.stack_guard &&
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
 
@@ -1041,6 +1056,9 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 
 	for (const auto& [_, mapping]: g_pooled_memory->GetMappings()) {
 		g_alloc_callback(mapping.vaddr, mapping.size);
+	}
+	for (const auto& range: g_virtual_ranges->GetStackRanges()) {
+		g_alloc_callback(range.start, range.size);
 	}
 }
 
@@ -1849,7 +1867,7 @@ static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_r
 		                               range.name));
 	}
 
-	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
+	if (g_free_callback != nullptr && IsCommittedRangeType(range.type) && !range.stack_guard) {
 		g_free_callback(vaddr, len);
 	}
 	if (range.type == VirtualRangeType::Pooled) {
@@ -2848,11 +2866,30 @@ uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 }
 
 uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
-                                  const char* name) {
+                                  const char* name, uint64_t guard_size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	constexpr uint64_t GuestPageSize = 16u * 1024u;
+	if ((guard_size & (GuestPageSize - 1)) != 0 || (guard_size != 0 && guard_size >= size)) {
+		return 0;
+	}
 	const auto vaddr =
 	    AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Stack, false);
-	if (vaddr != 0 && g_alloc_callback != nullptr) {
-		g_alloc_callback(vaddr, size);
+	if (vaddr == 0) {
+		return 0;
+	}
+	const auto mapped_size = (size + GuestPageSize - 1) & ~(GuestPageSize - 1);
+	if (guard_size != 0) {
+		if (!g_guest_address_space->Protect(vaddr, guard_size, VirtualMemory::Mode::NoAccess)) {
+			UnmapGpuRange(vaddr, mapped_size);
+			EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
+			EXIT_IF(!g_virtual_ranges->Remove(vaddr, mapped_size));
+			return 0;
+		}
+		g_virtual_ranges->Protect(vaddr, guard_size,
+		                          ProgramProtection(VirtualMemory::Mode::NoAccess), true);
+	}
+	if (g_alloc_callback != nullptr) {
+		g_alloc_callback(vaddr + guard_size, mapped_size - guard_size);
 	}
 	return vaddr;
 }

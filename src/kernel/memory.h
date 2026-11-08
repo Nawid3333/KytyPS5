@@ -205,7 +205,8 @@ uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
                                bool fixed = false);
 uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
-                                  Common::VirtualMemory::Mode mode, const char* name);
+                                  Common::VirtualMemory::Mode mode, const char* name,
+                                  uint64_t guard_size = 0);
 bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.

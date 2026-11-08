@@ -737,6 +737,13 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	if((DEFINED CMAKE_OSX_ARCHITECTURES AND CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64") OR
+			(NOT DEFINED CMAKE_OSX_ARCHITECTURES AND
+			 CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"))
+		add_test(NAME fiber_host_stack
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --fiber-only)
+		set_tests_properties(fiber_host_stack PROPERTIES TIMEOUT 30)
+	endif()
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)

@@ -65,6 +65,10 @@
 
 namespace Libs {
 
+namespace Fiber {
+void ExitThread(void* value);
+}
+
 namespace LibcInternalExt {
 void RunThreadAtexitDestructors();
 } // namespace LibcInternalExt
@@ -628,6 +632,7 @@ thread_local Pthread        g_pthread_self           = nullptr;
 static Pthread              g_pthread_main           = nullptr;
 PThreadContext*             g_pthread_context        = nullptr;
 thread_local uintptr_t      g_guest_entry_return_rsp = 0;
+static thread_local bool    g_thread_destructors_started = false;
 static std::atomic<int32_t> g_pthread_thread_id      = 0;
 
 static Common::Mutex g_guest_stack_mutex;
@@ -3170,18 +3175,25 @@ int PthreadGetCurrentPriorityForKernel() {
 	return PthreadGetPriorityForKernel(g_pthread_self);
 }
 
-static void CleanupThread(void* arg) {
-	auto* thread = static_cast<Pthread>(arg);
-
+static void RunThreadDestructors() {
+	if (std::exchange(g_thread_destructors_started, true)) {
+		return;
+	}
 	LibcInternalExt::RunThreadAtexitDestructors();
 
-	auto thread_dtors = g_pthread_context->GetThreadDtors();
+	auto thread_dtors = g_pthread_context != nullptr ? g_pthread_context->GetThreadDtors() : nullptr;
 
 	if (thread_dtors != nullptr) {
 		thread_dtors();
 	}
 
 	DestructPthreadSpecific();
+}
+
+static void CleanupThread(void* arg) {
+	auto* thread = static_cast<Pthread>(arg);
+
+	RunThreadDestructors();
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
@@ -3203,6 +3215,7 @@ static void* RunThread(void* arg) {
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
+	g_thread_destructors_started = false;
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3539,6 +3552,9 @@ void KYTY_SYSV_ABI PthreadTestcancel() {
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
+
+	RunThreadDestructors();
+	Fiber::ExitThread(value);
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_guest_entry_return_rsp != 0) {
