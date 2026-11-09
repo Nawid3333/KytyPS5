@@ -29,6 +29,7 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	bool                                      fragment_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
@@ -96,6 +97,13 @@ struct GraphicContext {
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	[[nodiscard]] uint32_t RequiredFragmentSubgroupSize(uint32_t wave_size) const noexcept {
+		return fragment_subgroup_size_control_enabled && wave_size >= min_subgroup_size &&
+		               wave_size <= max_subgroup_size
+		           ? wave_size
+		           : 0u;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

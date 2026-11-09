@@ -1488,8 +1488,10 @@ struct GraphicsCase {
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
+  u32 height = 1;
   std::vector<u32> object_ids;
   std::vector<u32> gds_initial;
+  u32 wave_size = 64;
 };
 
 struct CompiledShader {
@@ -1970,6 +1972,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
+  pixel_info.wave_size = test.wave_size;
   pixel_info.input_num =
       test.pixel_interpolator_settings.empty()
           ? 1u
@@ -1998,6 +2001,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
+  options.wave_size = test.wave_size;
   options.profile = &Maintenance8Profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
@@ -21828,27 +21832,30 @@ public:
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
-    Image target =
-        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
-                      vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
-                      vk::ImageLayout::eGeneral, vk::ImageType::e2D,
-                      test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
-                      test.layers, 0, 0, test.samples);
+    Image target = CreateImageMips(
+        test.name, test.width, test.height, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+        vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+        test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+        test.layers, 0, 0, test.samples);
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
-      resolved = CreateImageMips(
-          test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
-          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
-          test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
-          test.layers);
+      resolved =
+          CreateImageMips(test.name, test.width, test.height, target.format,
+                          vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                          vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+                          test.layers > 1 ? vk::ImageViewType::e2DArray
+                                          : vk::ImageViewType::e2D,
+                          test.layers);
     }
     Image primitive_target;
     if (object_id) {
       primitive_target = CreateImageMips(
-          test.name, test.width, 1, vk::Format::eR32Uint,
+          test.name, test.width, test.height, vk::Format::eR32Uint,
           vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
           vk::ImageLayout::eGeneral, vk::ImageType::e2D,
-          test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+          test.layers > 1 ? vk::ImageViewType::e2DArray
+                          : vk::ImageViewType::e2D,
           test.layers);
     }
     const std::vector<u32> default_vertices = {
@@ -21934,6 +21941,14 @@ public:
     stages[1].stage = vk::ShaderStageFlagBits::eFragment;
     stages[1].module = fragment_module;
     stages[1].pName = "main";
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo
+        fragment_subgroup_size{};
+    fragment_subgroup_size.requiredSubgroupSize =
+        m_runtime_context.RequiredFragmentSubgroupSize(
+            fragment.program.wave_size);
+    if (fragment_subgroup_size.requiredSubgroupSize != 0) {
+      stages[1].pNext = &fragment_subgroup_size;
+    }
 
     vk::VertexInputBindingDescription vertex_binding{};
     vertex_binding.binding = 0;
@@ -21964,12 +21979,12 @@ public:
     viewport.x = 0.0f;
     viewport.y = 0.0f;
     viewport.width = static_cast<float>(test.width);
-    viewport.height = 1.0f;
+    viewport.height = static_cast<float>(test.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
     scissor.extent.width = test.width;
-    scissor.extent.height = 1;
+    scissor.extent.height = test.height;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
     viewport_state.viewportCount = 1;
@@ -22049,7 +22064,7 @@ public:
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {test.width, 1};
+    rendering.renderArea.extent = {test.width, test.height};
     rendering.layerCount = test.layers;
     rendering.colorAttachmentCount = color_blend.attachmentCount;
     rendering.pColorAttachments = colors.data();
@@ -23612,10 +23627,18 @@ private:
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_mesh;
     m_physical_device.getFeatures2(&available_features2);
+    vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_control{};
     vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+    robustness2_properties.pNext = &subgroup_control;
     vk::PhysicalDeviceProperties2 properties2{};
     properties2.pNext = &robustness2_properties;
     m_physical_device.getProperties2(&properties2);
+    m_runtime_context.min_subgroup_size = subgroup_control.minSubgroupSize;
+    m_runtime_context.max_subgroup_size = subgroup_control.maxSubgroupSize;
+    m_runtime_context.fragment_subgroup_size_control_enabled =
+        available_features13.subgroupSizeControl == VK_TRUE &&
+        (subgroup_control.requiredSubgroupSizeStages &
+         vk::ShaderStageFlagBits::eFragment);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
     Require("VulkanHarness", "dispatch",
@@ -23721,6 +23744,8 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    device_features13.subgroupSizeControl =
+        m_runtime_context.fragment_subgroup_size_control_enabled;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -47833,6 +47858,40 @@ GraphicsCase GraphicsSparseWaveReduction(bool bitwise_or) {
   return test;
 }
 
+GraphicsCase GraphicsWave32LaneIdentity() {
+  using O = ShaderOpcode;
+  GraphicsCase test;
+  test.name = "GraphicsWave32LaneIdentity";
+  test.wave_size = 32;
+  test.width = 16;
+  test.height = 16;
+  auto &code = test.fragment_code;
+  AppendVop3(&code, 0x365, 0, 193u, InlineU32(0));
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(64)));
+  code.push_back(EncodeVop1(0x01, 1, 250));
+  code.push_back(EncodeVop1Dpp(0, 0x0e4));
+  code.push_back(EncodeVop2(0x1d, 1, Vgpr(1), 0));
+  code.push_back(EncodeVop2(0x16, 0, InlineU32(5), 0));
+  code.push_back(EncodeVop2(0x1c, 0, Vgpr(0), 1));
+  code.push_back(EncodeVop2(0x13, 0, InlineU32(1), 0));
+  code.push_back(EncodeVop2(0x26, 0, InlineU32(1), 0));
+  code.push_back(EncodeVop1(0x06, 0, Vgpr(0)));
+  code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+  AppendEnd(&code);
+  test.expected_pixel.assign(test.width * test.height * 4u, 0x3f800000u);
+  test.opcodes = {O::V_MBCNT_LO_U32_B32,
+                  O::V_MOV_B32,
+                  O::V_XOR_B32,
+                  O::V_LSHRREV_B32,
+                  O::V_OR_B32,
+                  O::V_MIN_U32,
+                  O::V_SUB_NC_U32,
+                  O::V_CVT_F32_U32,
+                  O::EXP,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase ComputeWave64Reduction(bool masked, bool bitwise_or) {
   TestCase test;
   auto &code = test.code;
@@ -49206,6 +49265,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsSparseWaveReduction(false),
       GraphicsSparseWaveReduction(true),
+      GraphicsWave32LaneIdentity(),
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
@@ -55846,6 +55906,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(false));
     RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(true));
+    RunGraphicsCase(&vulkan, GraphicsWave32LaneIdentity());
     RunCase(&vulkan, ComputeWave64Reduction(false, false));
     RunCase(&vulkan, ComputeWave64Reduction(true, false));
     RunCase(&vulkan, ComputeWave64Reduction(false, true));

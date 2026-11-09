@@ -167,13 +167,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
 
-	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
-	uint32_t                          shader_stage_count = 0;
+	vk::PipelineShaderStageCreateInfo                     shader_stages[4] {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo fragment_subgroup_size {};
+	uint32_t                                              shader_stage_count = 0;
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
-			                                       .pName  = "main"};
+			auto& stage_info = shader_stages[shader_stage_count++];
+			stage_info       = {.stage  = NativeShaderStage(stage->info.stage),
+			                    .module = stage->module,
+			                    .pName  = "main"};
+			if (stage_info.stage == vk::ShaderStageFlagBits::eFragment) {
+				fragment_subgroup_size.requiredSubgroupSize =
+				    graphics.RequiredFragmentSubgroupSize(stage->info.wave_size);
+				if (fragment_subgroup_size.requiredSubgroupSize != 0) {
+					stage_info.pNext = &fragment_subgroup_size;
+				}
+			}
 		}
 	}
 	if (task_module) {

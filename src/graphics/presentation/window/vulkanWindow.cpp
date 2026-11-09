@@ -486,11 +486,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
+	graphics.fragment_subgroup_size_control_enabled =
+	    supported13.subgroupSizeControl == VK_TRUE &&
+	    (subgroup_stages & vk::ShaderStageFlagBits::eFragment);
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s "
+	     "fragment_size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(subgroup_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
+	     graphics.fragment_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
@@ -570,7 +575,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 
 	auto features13                = WindowContext::RequiredVulkan13Features();
 	features13.robustImageAccess   = supported13.robustImageAccess;
-	features13.subgroupSizeControl = graphics.compute_subgroup_size_control_enabled;
+	features13.subgroupSizeControl = graphics.compute_subgroup_size_control_enabled ||
+	                                 graphics.fragment_subgroup_size_control_enabled;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
