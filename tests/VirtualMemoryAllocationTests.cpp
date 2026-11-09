@@ -5773,6 +5773,95 @@ void TestFiberStackExtents() {
 	CheckOk(test, Libs::Fiber::FiberFinalize(copy), "finalize copied fiber");
 }
 
+struct FiberFpControls {
+	uint32_t mxcsr = 0;
+	uint16_t cw    = 0;
+};
+
+constexpr uint32_t        FiberTestMxcsrFlags = 0x3f;
+constexpr FiberFpControls FiberTestHostFp {0x1f80, 0x027f};
+constexpr FiberFpControls FiberTestGuestFp {0x9fc0, 0x037f};
+constexpr FiberFpControls FiberTestFirstFp {0xffc0, 0x0f7f};
+constexpr FiberFpControls FiberTestSecondFp {0xbfc0, 0x077f};
+
+FiberFpControls ReadFiberFp() {
+	FiberFpControls state;
+	asm volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(state.mxcsr), "=m"(state.cw));
+	return state;
+}
+
+void WriteFiberFp(FiberFpControls state) {
+	asm volatile("ldmxcsr %0\n\tfldcw %1" : : "m"(state.mxcsr), "m"(state.cw) : "memory");
+}
+
+bool FiberFpMatches(FiberFpControls state, FiberFpControls expected) {
+	return (state.mxcsr & ~FiberTestMxcsrFlags) == expected.mxcsr && state.cw == expected.cw;
+}
+
+struct FiberFpSwitch {
+	Libs::Fiber::FiberObject* first  = nullptr;
+	Libs::Fiber::FiberObject* second = nullptr;
+	FiberFpControls           second_entry {};
+	FiberFpControls           first_resumed {};
+	int32_t                   errors = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FiberFpFirstEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data = *reinterpret_cast<FiberFpSwitch*>(initial);
+	WriteFiberFp(FiberTestFirstFp);
+	data.errors |= Libs::Fiber::FiberSwitch(data.second, 0, nullptr);
+	data.first_resumed = ReadFiberFp();
+	for (;;) {
+		data.errors |= Libs::Fiber::FiberReturnToThread(0, nullptr);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI FiberFpSecondEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data        = *reinterpret_cast<FiberFpSwitch*>(initial);
+	data.second_entry = ReadFiberFp();
+	WriteFiberFp(FiberTestSecondFp);
+	for (;;) {
+		data.errors |= Libs::Fiber::FiberSwitch(data.first, 0, nullptr);
+	}
+}
+
+void TestFiberOwnStackFp() {
+	const char* test           = "FiberOwnStackFp";
+	auto        first_backing  = std::make_unique<FiberTestBacking>();
+	auto        second_backing = std::make_unique<FiberTestBacking>();
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> first_object {};
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> second_object {};
+	FiberFpSwitch data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+	                    reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(data.first, "fp-first", FiberFpFirstEntry,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     first_backing->bytes.data() + FiberTestGuardSize,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize first fiber");
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(data.second, "fp-second", FiberFpSecondEntry,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     second_backing->bytes.data() + FiberTestGuardSize,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize second fiber");
+	const auto saved = ReadFiberFp();
+	WriteFiberFp(FiberTestHostFp);
+	const auto run_result = Libs::Fiber::FiberRun(data.first, 0, nullptr);
+	const auto caller     = ReadFiberFp();
+	WriteFiberFp(saved);
+	CheckOk(test, run_result, "run first fiber");
+	Check(test, data.errors == 0, "switching between the fibers failed");
+	Check(test, FiberFpMatches(data.second_entry, FiberTestGuestFp),
+	      "a fiber on its own stack did not start with the console's FP environment");
+	Check(test, FiberFpMatches(data.first_resumed, FiberTestFirstFp),
+	      "a fiber on its own stack lost its FP controls across a switch");
+	Check(test, FiberFpMatches(caller, FiberTestHostFp),
+	      "the fibers' FP controls leaked to the thread that ran them");
+	CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first fiber");
+	CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second fiber");
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 constexpr DWORD FiberTestExceptionCode      = 0xe0422162;
 constexpr DWORD FiberTestExceptionArguments = 1;
@@ -6216,6 +6305,7 @@ int main(int argc, char** argv) {
 #endif
 		RunTest(TestFiberHostStack);
 		RunTest(TestFiberStackExtents);
+		RunTest(TestFiberOwnStackFp);
 		RunTest(TestFiberSwitchReturnStack);
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -6250,6 +6340,7 @@ int main(int argc, char** argv) {
 #endif
 	RunTest(TestFiberHostStack);
 	RunTest(TestFiberStackExtents);
+	RunTest(TestFiberOwnStackFp);
 	RunTest(TestFiberSwitchReturnStack);
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif
