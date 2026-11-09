@@ -51373,6 +51373,29 @@ void CheckDepthTextureEncoding() {
               IsSupportedDepthTextureEncoding(compressed_mip_stats_counter),
           "depth descriptor rejected its mip-stats counter id");
 
+  // Demon's Souls samples an uncompressed depth target whose T# keeps DCC
+  // settings with compression off.
+  const ShaderTextureResource dcc_settings{{
+      0x029b8100u,
+      0xc1600000u,
+      0x00b3c13fu,
+      0x91800924u,
+      0x00000000u,
+      0x00700000u,
+      0x77c00000u,
+      0x00000003u,
+  }};
+  // Every other setting a clear COMPRESSION_EN disables.
+  auto all_dcc_settings = disabled_metadata;
+  all_dcc_settings.fields[6] |= 0x00df8000u;
+  auto msaa_depth_flag = uncompressed_msaa;
+  msaa_depth_flag.fields[6] |= 1u << 10u;
+  Require("DepthTextureEncoding", "metadata settings without compression",
+          IsSupportedDepthTextureEncoding(dcc_settings) &&
+              IsSupportedDepthTextureEncoding(all_dcc_settings) &&
+              IsSupportedDepthTextureEncoding(msaa_depth_flag),
+          "uncompressed depth rejected inactive metadata settings");
+
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
       0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,
@@ -51392,16 +51415,13 @@ void CheckDepthTextureEncoding() {
   dcc_only_control.fields[6] |= 1u << 22u;
   auto non_msaa_iterate_256 = compressed_descriptor;
   non_msaa_iterate_256.fields[6] |= 1u << 10u;
-  auto uncompressed_dcc_control = pipe_aligned_metadata;
-  uncompressed_dcc_control.fields[6] |= 1u << 22u;
   Require(
       "DepthTextureEncoding", "invalid HTILE encoding",
       !IsSupportedDepthTextureEncoding(missing_metadata) &&
           !IsSupportedDepthTextureEncoding(out_of_range_metadata) &&
           !IsSupportedDepthTextureEncoding(unaligned_metadata) &&
           !IsSupportedDepthTextureEncoding(dcc_only_control) &&
-          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256) &&
-          !IsSupportedDepthTextureEncoding(uncompressed_dcc_control),
+          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256),
       "compressed sampled depth accepted an unsupported address or control");
 
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
@@ -54585,6 +54605,44 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   check_offsets(auto_packet, gs, {41, 7, 8}, "GPU records");
   indexed_packet[3] |= 1u << 28u;
   check_offsets(indexed_packet, gs, {17, 19, 61}, "first-index destination");
+
+  // Packets that differ only in data offsets, each drawing the record after the
+  // previous one, draw as one multi-draw; the SGPRs end as the last record's.
+  arguments = {0, 1, 2, 3, 4, 0, 1, 5, 6, 7, 0, 1, 8, 9, 10, 0, 1, 11, 12, 13};
+  std::array<uint32_t, 20> run{};
+  for (uint32_t i = 0; i < 4; i++) {
+    std::copy(indexed_packet.begin(), indexed_packet.end(),
+              run.begin() + i * 5);
+    run[i * 5 + 1] = i * 20;
+  }
+  const auto drawn = [&](std::array<uint32_t, 20> commands, uint32_t dw = 20) {
+    const auto payload_dw =
+        CpOpDrawIndirect(processor, commands[0], commands.data() + 1, dw, dw);
+    return payload_dw / 5 + 1;
+  };
+  Require("Pm4DrawIndirectMulti", "contiguous run",
+          drawn(run) == 4 &&
+              std::equal(gs + 9, gs + 12, std::array{12u, 13u, 11u}.begin()) &&
+              drawn(run, 19) == 3,
+          "a run of indirect draws was not drawn as one multi-draw");
+  auto predicated = run;
+  predicated[10] |= 1u;
+  auto other_initiator = run;
+  other_initiator[9] = 0x20;
+  auto overlapping = run;
+  overlapping[6] = 16;
+  auto gap = run;
+  gap[11] = 44;
+  // The next record past a 32-bit data offset of 0xffffffec is not at offset 0.
+  auto wrapped = run;
+  wrapped[1] = 0xffffffecu;
+  wrapped[6] = 0;
+  const bool ended = drawn(predicated) == 2 && drawn(other_initiator) == 1 &&
+                     drawn(overlapping) == 1 && drawn(gap) == 2;
+  processor.SetDrawIndirectArgsBaseAddress(
+      reinterpret_cast<uint64_t>(arguments.data()) - 0xffffffecu);
+  Require("Pm4DrawIndirectMulti", "run end", ended && drawn(wrapped) == 1,
+          "an indirect draw run took a packet that draws differently");
   processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
