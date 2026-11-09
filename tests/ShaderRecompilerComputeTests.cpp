@@ -44186,6 +44186,124 @@ void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
   }
 }
 
+void CheckManyBufferRoots(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  using O = ShaderOpcode;
+  constexpr u32 count = 70u;
+  constexpr u32 table = 0x1000u;
+  constexpr u32 inputs = 0x2000u;
+  constexpr u32 slot = 0x1000u;
+  constexpr u32 output = inputs + count * slot;
+  constexpr u32 sentinel = 0xdeadbeefu;
+
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32u ? "ManyBufferRoots32" : "ManyBufferRoots64";
+    test.initial.assign((output + slot) / 4u, sentinel);
+    test.has_user_data = test.has_compute_info = true;
+    test.user_data[0] = table;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+
+    for (u32 index = 0; index < count; ++index) {
+      auto descriptor = MakeStructuredStorageBufferData(4u, 1u);
+      descriptor[0] = inputs + index * slot;
+      std::copy_n(descriptor.begin(), 4u,
+                  test.initial.begin() + table / 4u + index * 4u);
+      test.initial[descriptor[0] / 4u] = index + 1u;
+    }
+    auto destination = MakeStructuredStorageBufferData(0u, wave * 12u);
+    destination[0] = output;
+    std::copy_n(destination.begin(), 4u,
+                test.initial.begin() + table / 4u + count * 4u);
+
+    auto &code = test.code;
+    AppendVMovU32(&code, 1, 0u);
+    AppendVMovU32(&code, 3, 0u);
+    for (u32 index = 0; index < count; ++index) {
+      code.insert(code.end(), {
+          EncodeSmem0(0x02, 8), EncodeSmem1(index * 16u, 125),
+          EncodeSopp(0x0c, 0),
+          EncodeMubuf0(0x0c, 0, false, false), EncodeMubuf1(2, 2, 0),
+          EncodeSopp(0x0c, 0),
+          EncodeVop2(0x25, 1, Vgpr(2), 1)});
+      AppendVMovU32(&code, 5, index + 1u);
+      AppendVop3(&code, 0x143, 3, Vgpr(2), Vgpr(5), Vgpr(3));
+    }
+    code.insert(code.end(), {
+        EncodeSmem0(0x02, 48), EncodeSmem1(count * 16u, 125),
+        EncodeSopp(0x0c, 0)});
+    AppendVop3(&code, 0x143, 4, Vgpr(0), InlineU32(12), InlineU32(0));
+    AppendBufferStoreDword(&code, 1, 4);
+    code.insert(code.end(), {
+        EncodeMubuf0(0x1c, 4), EncodeMubuf1(3, 12, 4),
+        EncodeMubuf0(0x1c, 8), EncodeMubuf1(2, 12, 4)});
+    AppendEnd(&code);
+    test.opcodes = {O::V_MOV_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT,
+                    O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
+                    O::V_MAD_U32_U24, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.decoded_counts = {{"S_LOAD_DWORDX4", 71u},
+                           {"BUFFER_LOAD_DWORD", 70u},
+                           {"BUFFER_STORE_DWORD", 3u}};
+
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    const auto &info = compiled.program.info;
+    const auto &bindings = compiled.program.bindings;
+    const auto buffer_count = bindings.descriptor_counts[
+        static_cast<size_t>(DescriptorBindingKind::Buffers)];
+    const auto shader_data_count = bindings.descriptor_counts[
+        static_cast<size_t>(DescriptorBindingKind::ShaderData)];
+    const auto descriptor_count = std::accumulate(
+        bindings.descriptor_counts.begin(), bindings.descriptor_counts.end(), 0u);
+    Require(test.name, "71 independent live native buffers",
+            info.buffers.size() == 71u &&
+                compiled.resources.buffers.size() == 71u &&
+                buffer_count == 71u &&
+                std::ranges::all_of(info.buffers, [](const auto &buffer) {
+                  return buffer.live &&
+                      buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+                      buffer.indirect_resources.empty();
+                }),
+            "buffer roots were dropped or replaced by indirect candidates");
+    Require(test.name, "89-word shader-data storage fallback",
+            info.user_data_registers.empty() && !info.uses_dispatch_threads &&
+                !info.uses_dma && !info.uses_flattened_srt &&
+                bindings.memory_offset_dword == 0u &&
+                bindings.ShaderDataDwords() == 89u &&
+                !bindings.UsesPushData() && shader_data_count == 1u &&
+                descriptor_count == 72u,
+            "unexpected runtime data or descriptor fallback");
+
+
+    for (const auto &value : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+      test.storage_buffer_ranges.emplace_back(
+          static_cast<u32>(descriptor.Base48()),
+          static_cast<u32>(descriptor.GetSize()));
+    }
+
+    test.expected = test.initial;
+    for (u32 lane = 0; lane < wave; ++lane) {
+      const auto word = output / 4u + lane * 3u;
+      test.expected[word] = 2485u;
+      test.expected[word + 1u] = 116795u;
+      test.expected[word + 2u] = 70u;
+    }
+    auto buffer = vulkan.CreateStorageBuffer(
+        test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer);
+    const auto actual = vulkan.ReadBuffer(
+        test.name, buffer, test.expected.size());
+    vulkan.DestroyBuffer(&buffer);
+    CompareWords(test, "sum, weighted bindings, last root and canaries",
+                 test.expected, actual);
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+}
+
 void CheckStorageBufferBindingOver2GiB(VulkanHarness &vulkan) {
   // OpArrayLength reads 0 for ranges of 2 GiB or more on NVIDIA; bounds use the pushed binding size.
   constexpr u32 bytes = 0x80000010u, end = bytes / 4u, last = end - 1u;
@@ -56167,12 +56285,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--many-buffer-roots-only") == 0) {
+    VulkanHarness vulkan;
+    CheckManyBufferRoots(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
     CheckFiniteBufferSelection(vulkan);
+    CheckManyBufferRoots(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
     CheckGpuSelectedRecordBufferAccess(vulkan);
@@ -56998,6 +57122,7 @@ int main(int argc, char **argv) {
   CheckGuardedWaterfallBufferRecords(vulkan);
   CheckGpuSelectedFormattedRecordStore(vulkan);
   CheckFiniteBufferSelection(vulkan);
+  CheckManyBufferRoots(vulkan);
   CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);

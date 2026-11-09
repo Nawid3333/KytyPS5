@@ -9047,10 +9047,11 @@ void TestLiveShaderDataCollection() {
 }
 
 void TestResourceLimitIsTransactional() {
+  constexpr uint32_t buffer_count = 70u;
   Fixture accepted;
   MemoryInfo accepted_memory;
   accepted_memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index < ShaderInfo::MaxBufferRoots; index++) {
+  for (uint32_t index = 0; index < buffer_count; ++index) {
     const auto handle = accepted.Buffer(
         {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
         index * 4u);
@@ -9059,35 +9060,53 @@ void TestResourceLimitIsTransactional() {
                   accepted.AddMemory(accepted_memory, index * 4u));
   }
   accepted.PlanAndTrack();
-  Check(accepted.program.info.buffers.size() == 64u &&
-            accepted.program.descriptor_sources.size() == 64u &&
-            accepted.program.memory_info.back().resource == 63u,
-        "compute shader did not retain all 64 distinct buffers");
+  Check(accepted.program.info.buffers.size() == buffer_count &&
+            accepted.program.descriptor_sources.size() == buffer_count,
+        "compute shader did not retain all 70 distinct buffers");
+  for (uint32_t index = 0; index < buffer_count; ++index) {
+    Check(accepted.program.memory_info[index].resource == index,
+          "buffer resource index was truncated or reassigned");
+  }
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(accepted.program, {.compute = &compute});
   Check(std::ranges::all_of(accepted.program.info.buffers,
-                          [](const auto &buffer) { return buffer.live; }),
-        "shader info truncated the 64 live buffers");
+                           [](const auto &buffer) { return buffer.live; }),
+        "shader info truncated the 70 live buffers");
 
   Fixture fixture;
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index <= ShaderInfo::MaxBufferRoots; index++) {
-    const auto handle = fixture.Buffer(
-        {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
-        index * 4u);
-    fixture.Emit(ValueOpcode::LoadBufferU32,
-                 {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-                 fixture.AddMemory(memory, index * 4u));
-  }
+  MemoryInfo buffer_memory;
+  buffer_memory.kind = ResourceKind::Buffer;
+  const auto buffer = fixture.Buffer(
+      {Value(0x1000u), Value(0u), Value(4u), Value(0u)}, 4u);
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer_memory, 4u));
 
+  MemoryInfo image_memory;
+  image_memory.kind = ResourceKind::Image;
+  image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  image_memory.image_address_components = 2u;
+  image_memory.dmask = 1u;
+  const auto address = fixture.ImageAddress();
+  for (uint32_t index = 0; index <= ShaderInfo::MaxImages; ++index) {
+    const auto pc = 8u + index * 4u;
+    const auto image = fixture.Image(
+        {Value(index + 1u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u)}, pc);
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {image, address, Value(true)},
+                 fixture.AddMemory(image_memory, pc));
+  }
+  const auto original_memory = fixture.program.memory_info;
   CheckFatal([&] { fixture.PlanAndTrack(); },
-             "buffer resource limit exceeded",
-             "resource-limit failure was not reported");
+             "image resource limit exceeded",
+             "image resource-limit failure was not reported");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "resource-limit failure partially mutated typed resource state");
+            fixture.program.info.images.empty() &&
+            fixture.program.descriptor_sources.empty() &&
+            fixture.program.memory_info == original_memory,
+        "image resource-limit failure partially committed resource state");
 }
 
 void TestMalformedMemoryKindsRejected() {

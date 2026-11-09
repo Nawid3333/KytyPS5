@@ -4075,9 +4075,6 @@ private:
 				return i;
 			}
 		}
-		if (m_info.buffers.size() >= ShaderInfo::MaxBufferRoots) {
-			return UINT32_MAX;
-		}
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
@@ -4267,9 +4264,6 @@ private:
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
-			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
-			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
 			return;
