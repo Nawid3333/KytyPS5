@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -2301,21 +2302,22 @@ struct FiberOptParam {
 };
 
 struct FiberCpuContext {
-	uint64_t rbx;
-	uint64_t rbp;
-	uint64_t rdi;
-	uint64_t rsi;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rsp;
-	uint64_t rip;
-	uint64_t stack_base;
-	uint64_t stack_limit;
+	uint64_t      rbx;
+	uint64_t      rbp;
+	uint64_t      rdi;
+	uint64_t      rsi;
+	uint64_t      r12;
+	uint64_t      r13;
+	uint64_t      r14;
+	uint64_t      r15;
+	uint64_t      rsp;
+	uint64_t      rip;
+	Common::FpEnv fp_env;
+	uint64_t      stack_base;
+	uint64_t      stack_limit;
 };
 
-static_assert(sizeof(FiberCpuContext) == 96);
+static_assert(sizeof(FiberCpuContext) == 104);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2488,8 +2490,8 @@ static bool FiberAcquireStack(FiberObject* fiber) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-static_assert(offsetof(FiberCpuContext, stack_base) == 80);
-static_assert(offsetof(FiberCpuContext, stack_limit) == 88);
+static_assert(offsetof(FiberCpuContext, stack_base) == 88);
+static_assert(offsetof(FiberCpuContext, stack_limit) == 96);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static_assert(offsetof(NT_TIB, StackBase) == 8);
 static_assert(offsetof(NT_TIB, StackLimit) == 16);
@@ -2510,11 +2512,13 @@ static_assert(offsetof(NT_TIB, StackLimit) == 16);
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %gs:8, %r11\n\t"
-	             "movq %r11, 80(%r10)\n\t"
-	             "movq %gs:16, %r11\n\t"
 	             "movq %r11, 88(%r10)\n\t"
+	             "movq %gs:16, %r11\n\t"
+	             "movq %r11, 96(%r10)\n\t"
 #endif
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
@@ -2533,10 +2537,20 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             "subq $8, %rsp\n\t"
+	             "stmxcsr (%rsp)\n\t"
+	             "movl (%rsp), %ecx\n\t"
+	             "andl $0x3f, %ecx\n\t"
+	             "movl 80(%r10), %edx\n\t"
+	             "andl $0xffffffc0, %edx\n\t"
+	             "orl %ecx, %edx\n\t"
+	             "movl %edx, (%rsp)\n\t"
+	             "ldmxcsr (%rsp)\n\t"
+	             "fldcw 84(%r10)\n\t"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "movq 80(%r10), %rdx\n\t"
-	             "movq %rdx, %gs:8\n\t"
 	             "movq 88(%r10), %rdx\n\t"
+	             "movq %rdx, %gs:8\n\t"
+	             "movq 96(%r10), %rdx\n\t"
 	             "movq %rdx, %gs:16\n\t"
 #endif
 	             "movq 64(%r10), %rsp\n\t"
@@ -2573,6 +2587,10 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
 	ctx.stack_base  = stack_top;
 	ctx.stack_limit = stack_start;
+	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
+		Common::WriteFpEnv(Common::GuestFpEnv);
+	}
+	ctx.fp_env = Common::ReadFpEnv();
 
 	FiberRestoreContext(&ctx, 1);
 }
