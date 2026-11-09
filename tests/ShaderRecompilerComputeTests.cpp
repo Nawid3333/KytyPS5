@@ -20253,7 +20253,7 @@ public:
       return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected,
+    const auto draw = [&](const PipelineCache::Pipeline &requested,
                           uint32_t vertex_count = 3,
                           std::array<u32, 4> clear_value = {}) {
       vk::ClearValue clear{};
@@ -20285,6 +20285,19 @@ public:
                                           ? vk::ImageAspectFlagBits::eDepth
                                           : vk::ImageAspectFlags{}),
               "feedback was not selected only for an overlapping fragment depth read/write");
+      const auto &selected = [&]() -> const PipelineCache::Pipeline & {
+        if (!depth_feedback) return requested;
+        DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
+                              .topology = vk::PrimitiveTopology::eTriangleList,
+                              .ps_active = true, .vertex_info = {vertex}, .ps_input_info = pixel};
+        return context.GetPipelineCache().GetGraphicsPipeline(
+            command, state, static_cast<bool>(feedback_aspects) || feedback_enabled);
+      }();
+      Require(name, "feedback pipeline cache",
+              !depth_feedback ||
+                  ((selected.pipeline == requested.pipeline) ==
+                   (!feedback_enabled || m_feedback_dynamic_state_enabled)),
+              "static feedback did not select a distinct pipeline or dynamic feedback recompiled it");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
@@ -20323,7 +20336,9 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_feedback_dynamic_state_enabled) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23404,6 +23419,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic_state_enabled = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -23451,6 +23467,8 @@ private:
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled =
+        m_feedback_dynamic_state_enabled;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23573,6 +23591,18 @@ private:
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
+    const auto extensions = m_physical_device.enumerateDeviceExtensionProperties();
+    RequireVk("VulkanHarness", "extensions", extensions.result,
+              "vkEnumerateDeviceExtensionProperties");
+    const auto has_extension = [&](std::string_view name) {
+      return std::ranges::any_of(extensions.value, [&](const auto &extension) {
+        return name == extension.extensionName.data();
+      });
+    };
+    const bool feedback_layout_extension =
+        has_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+    const bool feedback_dynamic_extension = feedback_layout_extension &&
+        has_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
     vk::PhysicalDeviceVulkan11Features available_features11{};
@@ -23593,9 +23623,16 @@ private:
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
     available_feedback_layout.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
-    available_feedback_dynamic.pNext = &available_feedback_layout;
+    void *feedback_features = &available_clip_control;
+    if (feedback_layout_extension) {
+      feedback_features = &available_feedback_layout;
+    }
+    if (feedback_dynamic_extension) {
+      available_feedback_dynamic.pNext = feedback_features;
+      feedback_features = &available_feedback_dynamic;
+    }
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
-    available_provoking_vertex.pNext = &available_feedback_dynamic;
+    available_provoking_vertex.pNext = feedback_features;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceMaintenance8FeaturesKHR available_maintenance8{};
@@ -23680,9 +23717,11 @@ private:
                                 available_features.fragmentStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
+                                feedback_layout_extension &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
+    m_feedback_dynamic_state_enabled = m_rasterization_supported &&
+        feedback_dynamic_extension && available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -23738,9 +23777,12 @@ private:
       clip_control.depthClipControl = true;
       feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
-      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.pNext = &feedback_layout;
+      if (m_feedback_dynamic_state_enabled) {
+        feedback_dynamic.pNext = &feedback_layout;
+        feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+        provoking_vertex.pNext = &feedback_dynamic;
+      }
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -23799,8 +23841,10 @@ private:
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic_state_enabled) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -55151,10 +55195,12 @@ void CheckDeviceCreation() {
                       features.get<vk::PhysicalDeviceShaderClockFeaturesKHR>().shaderDeviceClock) &&
               matches(graphics.mesh_shader_enabled, VK_EXT_MESH_SHADER_EXTENSION_NAME,
                       mesh.meshShader && mesh.taskShader) &&
-              graphics.attachment_feedback_loop_enabled ==
-                  (feedback &&
-                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
-                       .attachmentFeedbackLoopLayout &&
+              matches(graphics.attachment_feedback_loop_enabled,
+                      VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
+                      features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
+                          .attachmentFeedbackLoopLayout) &&
+              graphics.attachment_feedback_loop_dynamic_state_enabled ==
+                  (graphics.attachment_feedback_loop_enabled && feedback &&
                    features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
                        .attachmentFeedbackLoopDynamicState),
           "an enabled feature disagrees with the GPU");

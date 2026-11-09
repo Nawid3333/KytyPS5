@@ -77,6 +77,7 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	uint32_t                                             depth_stencil_feedback_loop = 0;
 };
 
 struct PipelineVertexInputState {
@@ -201,7 +202,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                              bool depth_feedback_loop = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:

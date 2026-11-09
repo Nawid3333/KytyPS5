@@ -1129,11 +1129,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	const bool depth_feedback_loop = static_cast<bool>(feedback_aspects) ||
+	                                 rendering.depth_stencil_attachment.image_layout ==
+	                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+	auto& pipeline =
+	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, depth_feedback_loop);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {

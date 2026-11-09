@@ -69,7 +69,9 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	}
 	Writer header;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize,
+	      graphics.attachment_feedback_loop_enabled,
+	      graphics.attachment_feedback_loop_dynamic_state_enabled);
 	return std::move(header.bytes);
 }
 
