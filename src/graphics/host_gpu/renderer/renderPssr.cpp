@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -10,6 +11,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <optional>
 
@@ -238,6 +240,36 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	         source_view.base_level == destination_view.base_level &&
 	         source_view.base_layer == destination_view.base_layer));
 
+	{
+		static std::atomic_uint64_t lab_requests = 0;
+		const auto n = lab_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 12 || n % 600 == 0) {
+			ShaderTextureResource lab_depth {}, lab_motion {}, lab_exposure {};
+			std::copy_n(request.depth, 8, lab_depth.fields);
+			std::copy_n(request.motion, 8, lab_motion.fields);
+			std::copy_n(request.exposure, 8, lab_exposure.fields);
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "lab-pssr: request={} context=0x{:x} render={}x{} at {},{} input_desc={}x{} fmt={} "
+			    "input_image={}x{} mips={} layers={} view_level={} view_layer={} vkfmt={} "
+			    "mutable={} output={}x{} vkfmt={} depth={} motion={} exposure={} flags=0x{:x} "
+			    "jitter={:.3f},{:.3f} mv_scale={:.1f},{:.1f} pre_exposure={:.3f} channels={}{}{} "
+			    "dlss={} fsr_available={} fsr_accepts={}\n",
+			    n, request.context, request.width, request.height, request.x, request.y,
+			    input_descriptor.Width5() + 1u, input_descriptor.Height5() + 1u,
+			    static_cast<uint32_t>(input_descriptor.Format()), source.backing.extent.width,
+			    source.backing.extent.height, source.backing.mip_levels, source.backing.layers,
+			    source_view.base_level, source_view.base_layer,
+			    static_cast<int>(source_view.format),
+			    (source.backing.flags & vk::ImageCreateFlagBits::eMutableFormat) ? 1 : 0,
+			    destination.backing.extent.width, destination.backing.extent.height,
+			    static_cast<int>(destination_view.format), lab_depth.IsNull() ? 0 : 1,
+			    lab_motion.IsNull() ? 0 : 1, lab_exposure.IsNull() ? 0 : 1, request.flags,
+			    request.jitter[0], request.jitter[1], request.motion_scale[0],
+			    request.motion_scale[1], request.pre_exposure, parameters.output_channels[0],
+			    parameters.output_channels[1], parameters.output_channels[2], dlss ? 1 : 0,
+			    Fsr::Available() ? 1 : 0, Fsr::Accepts(request) ? 1 : 0));
+		}
+	}
 	buffer.EndRendering();
 	const auto command = buffer.Handle();
 	const auto range   = [](const ImageViewInfo& view) {
