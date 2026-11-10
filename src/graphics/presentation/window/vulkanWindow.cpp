@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/fsr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -439,6 +440,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
+	const auto fsr = Fsr::AppendDeviceExtensions(physical_device, device_extensions,
+	                                             available_extensions);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -452,6 +455,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
+	features12.shaderFloat16 = fsr.float16;
+	features12.shaderInt8 = fsr.int8;
+	features12.shaderSubgroupExtendedTypes = fsr.subgroup_extended_types;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -567,12 +573,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
+	device_features.shaderInt16 = fsr.int16;
 	device_features.shaderFloat64 =
 	    supported2.features.shaderFloat64 && float_controls.shaderSignedZeroInfNanPreserveFloat64;
 
 	auto features13                = WindowContext::RequiredVulkan13Features();
 	features13.robustImageAccess   = supported13.robustImageAccess;
 	features13.subgroupSizeControl = graphics.compute_subgroup_size_control_enabled;
+	features13.shaderIntegerDotProduct = fsr.integer_dot_product;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -605,7 +613,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {.cooperativeMatrix = fsr.cooperative_matrix},
+	    vk::PhysicalDeviceShaderFloat8FeaturesEXT {
+	        .shaderFloat8 = fsr.float8, .shaderFloat8CooperativeMatrix = fsr.float8_cooperative_matrix}};
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}
@@ -619,6 +630,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 #endif
 	if (!graphics.mesh_shader_enabled) create.unlink<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
+	if (!fsr.cooperative_matrix) create.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+	if (!fsr.float8) create.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
 	if (!graphics.attachment_feedback_loop_enabled) {
 		create.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>();
 		create.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
@@ -820,6 +833,7 @@ void WindowContext::CreateVulkan() {
 
 	Vr::OpenXrInit();
 	Dlss::Load();
+	Fsr::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -947,6 +961,7 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -984,6 +999,7 @@ WindowContext::~WindowContext() {
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 	Dlss::Shutdown();
+	Fsr::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");

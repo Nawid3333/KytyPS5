@@ -5,12 +5,14 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/fsr.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <chrono>
 #include <span>
 #include <vector>
 
@@ -197,12 +199,21 @@ private:
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
 	                                  Dlss::Inputs& inputs);
+	[[nodiscard]] bool        UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& request,
+	                                     const Fsr::Inputs& inputs);
 
 	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
 	struct DlssContext {
 		uint64_t       context;
 		Dlss::Creation creation;
 		Dlss::Feature* feature;
+	};
+
+	struct FsrContext {
+		uint64_t                              context;
+		Fsr::Creation                         creation;
+		Fsr::Context*                         handle;
+		std::chrono::steady_clock::time_point last;
 	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
@@ -224,6 +235,7 @@ private:
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<DlssContext>              m_dlss_contexts;
+	std::vector<FsrContext>               m_fsr_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

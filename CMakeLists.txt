@@ -349,6 +349,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
+	${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/Kits/FidelityFX
 )
 
 if (KYTY_CLANG_CL)
@@ -646,6 +647,12 @@ add_executable(dlss_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/dlss.cpp")
 target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
 target_include_directories(dlss_tests PRIVATE ${inc_headers})
+
+add_executable(fsr_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FsrTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/fsr.cpp")
+target_link_libraries(fsr_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+target_include_directories(fsr_tests PRIVATE ${inc_headers})
 
 add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
