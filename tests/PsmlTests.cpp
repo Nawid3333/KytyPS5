@@ -30,8 +30,6 @@ namespace Gpu = Libs::Graphics::Prospero;
 namespace Pm4 = Libs::Graphics::Pm4;
 namespace Pssr = Libs::Graphics::Pssr;
 
-constexpr uint32_t MFSR2_REQUEST = 1u << 4;
-
 constexpr int ERROR_ALREADY_INITIALIZED = static_cast<int>(0x8a810002u);
 constexpr int ERROR_TOO_MANY_CONTEXTS = static_cast<int>(0x8a810004u);
 constexpr int ERROR_INVALID_CONTEXT = static_cast<int>(0x8a810005u);
@@ -501,7 +499,7 @@ TEST_F(PsmlTest, DispatchRejectsOutputsOnlyMfsr2Takes) {
   ASSERT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params), 0);
   Pssr::Request request;
   std::memcpy(&request, command.data() + 1, sizeof(request));
-  EXPECT_EQ(request.flags & MFSR2_REQUEST, 0u);
+  EXPECT_EQ(request.flags & Pssr::kFromMfsr2, 0u);
   for (const auto format : {Gpu::BufferFormat::k16_16_16_16Float,
                             Gpu::BufferFormat::k10_11_11Float}) {
     output = WithFormat(Texture(960, 540, 0x10000), format);
@@ -789,23 +787,24 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
   EXPECT_EQ(std::to_array(request.motion_scale),
             std::to_array(params.motion_scale));
   EXPECT_EQ(request.pre_exposure, 0.5f);
-  EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
+  EXPECT_EQ(request.flags,
+            Pssr::kFromMfsr2 | Pssr::kReset | Pssr::kReverseDepth);
 
   params.reset = 0;
   params.flags = 1u << 1;
   params.motion = nullptr;
   request = dispatch();
-  EXPECT_EQ(request.flags, Pssr::kAutoExposure);
+  EXPECT_EQ(request.flags, Pssr::kFromMfsr2 | Pssr::kAutoExposure);
   EXPECT_EQ(std::to_array(request.motion), decltype(motion){});
   params.flags = 0;
   params.encoding = 1;
-  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  EXPECT_EQ(dispatch().flags, Pssr::kFromMfsr2 | Pssr::kSpatialOnly);
   params.encoding = 0;
   params.flags = 1u << 2;
-  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  EXPECT_EQ(dispatch().flags, Pssr::kFromMfsr2 | Pssr::kSpatialOnly);
   params.flags = 0;
   params.motion_offset[0] = 1.0f;
-  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  EXPECT_EQ(dispatch().flags, Pssr::kFromMfsr2 | Pssr::kSpatialOnly);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 
@@ -829,7 +828,7 @@ TEST_F(PsmlMfsr2Test, DispatchMarksItsRequestAndTakesEveryUpscalerOutput) {
     return request;
   };
   const uint32_t game_flags =
-      MFSR2_REQUEST | Pssr::kReverseDepth | Pssr::kSpatialOnly;
+      Pssr::kFromMfsr2 | Pssr::kReverseDepth | Pssr::kSpatialOnly;
   EXPECT_EQ(dispatch().flags, game_flags);
   output = WithFormat(output, Gpu::BufferFormat::k10_11_11Float);
   output[3] &= ~(0x1fu << 20);
