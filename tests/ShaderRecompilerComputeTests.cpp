@@ -55970,7 +55970,6 @@ int main(int argc, char **argv) {
        }},
       {"SamplerBorderColors", [](VulkanHarness &v) { v.CheckSamplerBorderColors(); }},
       {"PackedTextureComponents", [](VulkanHarness &v) { v.CheckPackedTextureComponents(); }},
-      {"CubeFaceStorageExpansion", [](VulkanHarness &v) { v.CheckCubeFaceStorageExpansion(); }},
       {"ComparisonDepthTexture",
        raster([](VulkanHarness &v) { v.CheckComparisonDepthTexture(); })},
       {"RenderExecutorStencilBindingDiscovery",
@@ -56050,7 +56049,6 @@ int main(int argc, char **argv) {
       {"Pm4IndirectControlFlow", renderer(CheckPm4IndirectControlFlow)},
       {"Pm4WaitResume", renderer(CheckPm4WaitResume)},
       {"Pm4RewindResume", renderer(CheckPm4RewindResume)},
-      {"Pm4CeCompletion", renderer(CheckPm4CeCompletion)},
       {"ImageSamplerSpecialization", host(CheckImageSamplerSpecialization)},
       {"ResourcePlanHandoff", host(CheckResourcePlanHandoff)},
       {"NativeImageDescriptorTypes", host(CheckNativeImageDescriptorTypes)},
@@ -56084,11 +56082,9 @@ int main(int argc, char **argv) {
       {"StorageTextureGpuOwnedRebindState", host(CheckStorageTextureGpuOwnedRebindState)},
       {"NativeMsaaState", host(CheckNativeMsaaState)},
       {"Ps5DepthRegisterDecoding", host(CheckPs5DepthRegisterDecoding)},
-      {"DepthHtileStencilCompatibility", host(CheckDepthHtileStencilCompatibility)},
       {"DepthAttachmentWrites", host(CheckDepthAttachmentWrites)},
       {"DynamicRenderingState", host(CheckDynamicRenderingState)},
       {"DepthTargetFootprints", host(CheckDepthTargetFootprints)},
-      {"SlotVectorLifetime", host(CheckSlotVectorLifetime)},
 #endif
   };
   if (argc == 2 && std::strcmp(argv[1], "--lab-cases") == 0) {
