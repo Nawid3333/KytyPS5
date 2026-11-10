@@ -1059,8 +1059,8 @@ void TestFullRegionGpuUnmarkBatching() {
 std::chrono::nanoseconds CurrentThreadCpuTime() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   FILETIME created{}, exited{}, kernel{}, user{};
-  Check(GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel,
-                       &user) != 0,
+  Check(GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) !=
+            0,
         "GetThreadTimes failed");
   const auto kernel_ticks =
       (uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime;
@@ -1082,33 +1082,45 @@ void TestTrackingLockWaiterSleeps() {
   constexpr auto hold_time = std::chrono::milliseconds(500);
   constexpr auto waiter_cpu_limit = std::chrono::milliseconds(100);
   constexpr auto timeout = std::chrono::seconds(30);
-  Libs::Graphics::TrackingSpinLock lock;
-  std::binary_semaphore waiting{0};
-  std::binary_semaphore finished{0};
-  std::chrono::nanoseconds waiter_cpu_time{};
-  uint32_t guarded = 0;
-  uint32_t seen = 0;
-  lock.lock();
-  std::thread waiter([&] {
-    const auto begin = CurrentThreadCpuTime();
-    waiting.release();
+  constexpr int attempts = 5;
+  bool waited_through_the_hold = false;
+  for (int attempt = 0; attempt < attempts && !waited_through_the_hold;
+       ++attempt) {
+    Libs::Graphics::TrackingSpinLock lock;
+    std::binary_semaphore waiting{0};
+    std::binary_semaphore finished{0};
+    std::chrono::nanoseconds waiter_cpu_time{};
+    std::chrono::steady_clock::duration waited{};
+    uint32_t guarded = 0;
+    uint32_t seen = 0;
     lock.lock();
-    waiter_cpu_time = CurrentThreadCpuTime() - begin;
-    seen = guarded;
+    std::thread waiter([&] {
+      const auto cpu_begin = CurrentThreadCpuTime();
+      const auto begin = std::chrono::steady_clock::now();
+      waiting.release();
+      lock.lock();
+      waited = std::chrono::steady_clock::now() - begin;
+      waiter_cpu_time = CurrentThreadCpuTime() - cpu_begin;
+      seen = guarded;
+      lock.unlock();
+      finished.release();
+    });
+    Check(waiting.try_acquire_for(timeout),
+          "tracking lock waiter did not start");
+    std::this_thread::sleep_for(hold_time);
+    Check(!finished.try_acquire(), "tracking lock waiter entered a held lock");
+    guarded = 1;
     lock.unlock();
-    finished.release();
-  });
-  Check(waiting.try_acquire_for(timeout), "tracking lock waiter did not start");
-  std::this_thread::sleep_for(hold_time);
-  Check(!finished.try_acquire(), "tracking lock waiter entered a held lock");
-  guarded = 1;
-  lock.unlock();
-  Check(finished.try_acquire_for(timeout),
-        "tracking lock waiter was not woken by the unlock");
-  waiter.join();
-  Check(seen == 1, "tracking lock waiter did not see the holder's write");
-  Check(waiter_cpu_time < waiter_cpu_limit,
-        "tracking lock waiter used CPU time while the holder kept the lock");
+    Check(finished.try_acquire_for(timeout),
+          "tracking lock waiter was not woken by the unlock");
+    waiter.join();
+    Check(seen == 1, "tracking lock waiter did not see the holder's write");
+    Check(waiter_cpu_time < waiter_cpu_limit,
+          "tracking lock waiter used CPU time while the holder kept the lock");
+    waited_through_the_hold = waited >= hold_time / 2;
+  }
+  Check(waited_through_the_hold,
+        "tracking lock waiter never waited for the holder");
 }
 
 void TestTrackingLockContention() {
