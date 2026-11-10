@@ -2,6 +2,8 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
+#include <cstddef>
+#include <memory>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <condition_variable>
@@ -25,6 +27,22 @@ int GetThreadIdUnique();
 } // namespace Thread
 
 // Recursive.
+struct ThreadWithStackPrivate;
+
+class ThreadWithStack {
+public:
+	using func_t = void (*)(void*);
+	ThreadWithStack(func_t func, void* arg, size_t stack_size);
+	~ThreadWithStack();
+
+	void Join();
+
+	KYTY_CLASS_NO_COPY(ThreadWithStack);
+
+private:
+	std::unique_ptr<ThreadWithStackPrivate> m_thread;
+};
+
 class Mutex {
 public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
