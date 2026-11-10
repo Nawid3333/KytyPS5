@@ -31,28 +31,49 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		auto       state  = Free;
+		if (!m_state.compare_exchange_strong(state, Held, std::memory_order_acquire,
+		                                     std::memory_order_relaxed)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			// Wait on reads, so the holder's cache line is not written until the lock is free.
-			while (m_lock.test(std::memory_order_relaxed)) {
-#if defined(__x86_64__) || defined(_M_X64)
-				_mm_pause();
-#elif defined(_M_ARM64)
-				__yield();
-#elif defined(__aarch64__)
-				asm volatile("yield");
-#endif
-			}
+			LockContended();
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		if (m_state.exchange(Free, std::memory_order_release) == HeldWithSleeper) {
+			m_state.notify_one();
+		}
 	}
 
 private:
+	static constexpr uint32_t Free             = 0;
+	static constexpr uint32_t Held             = 1;
+	static constexpr uint32_t HeldWithSleeper  = 2;
+	static constexpr uint32_t SpinsBeforeSleep = 2000;
+
+	void LockContended() noexcept {
+		for (uint32_t spin = 0; spin < SpinsBeforeSleep; ++spin) {
+			auto state = Free;
+			if (m_state.load(std::memory_order_relaxed) == Free &&
+			    m_state.compare_exchange_weak(state, Held, std::memory_order_acquire,
+			                                  std::memory_order_relaxed)) {
+				return;
+			}
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
+		}
+		while (m_state.exchange(HeldWithSleeper, std::memory_order_acquire) != Free) {
+			m_state.wait(HeldWithSleeper, std::memory_order_relaxed);
+		}
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
@@ -69,7 +90,7 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	std::atomic_uint32_t m_state {Free};
 	std::atomic_uint32_t m_owner {0};
 };
 
