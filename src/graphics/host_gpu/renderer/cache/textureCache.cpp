@@ -20,18 +20,72 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
 namespace {
+
+void LabNoteUpload(const ImageInfo& info, bool cpu_dirty, bool buffer_modified) {
+	struct Tally {
+		uint64_t count = 0, bytes = 0, cpu_dirty = 0, buffer_modified = 0;
+		uint32_t width = 0, height = 0, layers = 0, levels = 0, guest_format = 0, tiled = 0;
+	};
+	static std::mutex                          lab_mutex;
+	static std::unordered_map<uint64_t, Tally> lab_tallies;
+	static auto                                lab_since  = std::chrono::steady_clock::now();
+	static uint64_t                            lab_window = 0;
+	std::scoped_lock                           lock(lab_mutex);
+	auto&                                      tally = lab_tallies[info.data.address];
+	tally.count++;
+	tally.bytes += info.data.size;
+	tally.cpu_dirty += cpu_dirty ? 1 : 0;
+	tally.buffer_modified += buffer_modified ? 1 : 0;
+	tally.width        = info.extent.width;
+	tally.height       = info.extent.height;
+	tally.layers       = info.resources.layers;
+	tally.levels       = info.resources.levels;
+	tally.guest_format = static_cast<uint32_t>(info.guest_format);
+	tally.tiled        = info.IsTiled() ? 1 : 0;
+	const auto now     = std::chrono::steady_clock::now();
+	if (now - lab_since < std::chrono::seconds(5)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, Tally>> sorted(lab_tallies.begin(), lab_tallies.end());
+	std::sort(sorted.begin(), sorted.end(),
+	          [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+	uint64_t total_bytes = 0;
+	uint64_t total_count = 0;
+	for (const auto& [address, entry]: sorted) {
+		total_bytes += entry.bytes;
+		total_count += entry.count;
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lab_since).count();
+	LOGF("[lab-upload] window %" PRIu64 ": %" PRIu64 " uploads, %" PRIu64 " MiB in %lld ms, %zu images\n",
+	     lab_window, total_count, total_bytes >> 20, static_cast<long long>(ms), sorted.size());
+	for (size_t i = 0; i < sorted.size() && i < 10; i++) {
+		const auto& [address, entry] = sorted[i];
+		LOGF("[lab-upload]   0x%016" PRIx64 " %ux%u l%u m%u fmt%u tiled%u: %" PRIu64 " x %" PRIu64
+		     " KiB (cpu_dirty %" PRIu64 ", buffer_modified %" PRIu64 ")\n",
+		     address, entry.width, entry.height, entry.layers, entry.levels, entry.guest_format,
+		     entry.tiled, entry.count, entry.count != 0 ? (entry.bytes / entry.count) >> 10 : 0,
+		     entry.cpu_dirty, entry.buffer_modified);
+	}
+	lab_tallies.clear();
+	lab_since = now;
+	lab_window++;
+}
 
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
@@ -982,6 +1036,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		if (std::getenv("KYTY_LAB_UPLOAD_LOG") != nullptr) {
+			LabNoteUpload(image.info, image.IsCpuDirty(), image.IsBufferModified());
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
