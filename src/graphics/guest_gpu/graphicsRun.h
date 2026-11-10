@@ -92,7 +92,7 @@ private:
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
-	std::jthread    m_thread;
+	std::unique_ptr<Common::ThreadWithStack> m_thread;
 
 	friend class CommandProcessor;
 };

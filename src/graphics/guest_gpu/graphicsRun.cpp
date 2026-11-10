@@ -34,6 +34,8 @@
 
 namespace Libs::Graphics {
 
+constexpr size_t GpuThreadStackSize = size_t {64} << 20u;
+
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
@@ -49,7 +51,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
-	m_thread = std::jthread(ThreadRun, this);
+	m_thread = std::make_unique<Common::ThreadWithStack>(ThreadRun, this, GpuThreadStackSize);
 }
 
 GuestGpu::~GuestGpu() {
@@ -67,8 +69,8 @@ void GuestGpu::Shutdown() {
 		m_stopping  = true;
 		m_work_available.SignalAll();
 	}
-	if (m_thread.joinable()) {
-		m_thread.join();
+	if (m_thread) {
+		m_thread->Join();
 	}
 	m_shutdown_complete = true;
 }
