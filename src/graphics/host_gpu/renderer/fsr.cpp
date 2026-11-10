@@ -162,6 +162,11 @@ FfxApiResource MakeResource(const Resource* resource) {
 	if (resource->depth) {
 		result.description.usage |= FFX_API_RESOURCE_USAGE_DEPTHTARGET;
 	}
+	if (resource->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+	    resource->format == VK_FORMAT_D24_UNORM_S8_UINT ||
+	    resource->format == VK_FORMAT_D16_UNORM_S8_UINT) {
+		result.description.usage |= FFX_API_RESOURCE_USAGE_STENCILTARGET;
+	}
 	if ((resource->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0) {
 		result.description.usage |= FFX_API_RESOURCE_USAGE_UAV;
 	}
@@ -187,7 +192,8 @@ void SetDispatch(ffxDispatchDescUpscale& desc, VkCommandBuffer command,
 	desc.color                   = MakeResource(&inputs.color);
 	desc.depth                   = MakeResource(&inputs.depth);
 	desc.motionVectors           = MakeResource(&inputs.motion);
-	desc.exposure                = MakeResource(inputs.exposure);
+	desc.exposure                = MakeResource(
+	                   (request.flags & Pssr::kAutoExposure) != 0 ? nullptr : inputs.exposure);
 	desc.output                  = MakeResource(&inputs.output);
 	desc.jitterOffset            = {-request.jitter[0], -request.jitter[1]};
 	desc.motionVectorScale       = {request.motion_scale[0], request.motion_scale[1]};

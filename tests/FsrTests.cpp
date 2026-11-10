@@ -139,6 +139,12 @@ TEST(FsrTest, ResourcesDescribeWholeImages) {
 	const auto depth       = Fsr::MakeResource(&depth_image);
 	EXPECT_EQ(depth.description.format, uint32_t {FFX_API_SURFACE_FORMAT_R32_FLOAT});
 	EXPECT_EQ(depth.description.usage, uint32_t {FFX_API_RESOURCE_USAGE_DEPTHTARGET});
+	auto stencil_image   = depth_image;
+	stencil_image.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+	const auto stencil   = Fsr::MakeResource(&stencil_image);
+	EXPECT_EQ(stencil.description.format, uint32_t {FFX_API_SURFACE_FORMAT_R32_FLOAT});
+	EXPECT_EQ(stencil.description.usage,
+	          uint32_t {FFX_API_RESOURCE_USAGE_DEPTHTARGET | FFX_API_RESOURCE_USAGE_STENCILTARGET});
 	const auto output_image = Image(VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1440, true);
 	const auto output       = Fsr::MakeResource(&output_image);
 	EXPECT_EQ(output.description.usage, uint32_t {FFX_API_RESOURCE_USAGE_UAV});
@@ -175,6 +181,9 @@ TEST(FsrTest, DispatchNegatesTheJitterAndPassesTheRequest) {
 	EXPECT_TRUE(desc.reset);
 	EXPECT_FALSE(desc.enableSharpening);
 	EXPECT_EQ(desc.exposure.resource, reinterpret_cast<void*>(exposure.image));
+	request.flags = Pssr::kAutoExposure;
+	Fsr::SetDispatch(desc, command, request, inputs, true, 8.0f);
+	EXPECT_EQ(desc.exposure.resource, nullptr);
 	EXPECT_EQ(desc.reactive.resource, nullptr);
 	EXPECT_EQ(desc.transparencyAndComposition.resource, nullptr);
 	EXPECT_GT(desc.cameraFar, desc.cameraNear);

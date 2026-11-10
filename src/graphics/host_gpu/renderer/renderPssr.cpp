@@ -243,6 +243,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	const auto range   = [](const ImageViewInfo& view) {
 		return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
 	};
+	const auto whole_range = [&](ImageId id) {
+		const auto& image = cache.GetImage(id);
+		return ImageSubresourceRange {0, image.backing.mip_levels, 0, image.backing.layers};
+	};
 	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, range(source_view),
 	               command);
 	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
@@ -280,13 +284,15 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			for (const auto* binding: {&input, &*dlss_bindings[0], &*dlss_bindings[1]}) {
 				cache.GetImage(binding->image_id)
 				    .Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
-				             range(binding->desc.view_info), command);
+				             whole_range(binding->image_id), command);
 			}
 			if (dlss_bindings[2]) {
 				cache.GetImage(dlss_bindings[2]->image_id)
 				    .Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
-				             range(dlss_bindings[2]->desc.view_info), command);
+				             whole_range(dlss_bindings[2]->image_id), command);
 			}
+			destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+			                    whole_range(output.image_id), command);
 			const Fsr::Inputs inputs {*color, *depth, *motion, exposure ? &*exposure : nullptr,
 			                         *target};
 			if (UpscaleFsr(command, request, inputs)) {
