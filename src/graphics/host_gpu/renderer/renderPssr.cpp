@@ -163,6 +163,18 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		        descriptor.Type() == Prospero::ImageType::kColor2DArray) &&
 		       descriptor.TileMode() != Prospero::TileMode::kDepth;
 	};
+	if (static std::atomic_uint64_t lab_checks = 0; lab_checks.fetch_add(1) < 8) {
+		const auto lab_desc = [](const ShaderTextureResource& d) {
+			return fmt::format("null={} type={} fmt={} tile={} w={} h={} base={} last={} max={} arr={} depth={}",
+			                   d.IsNull() ? 1 : 0, static_cast<uint32_t>(d.Type()),
+			                   static_cast<uint32_t>(d.Format()), static_cast<uint32_t>(d.TileMode()),
+			                   d.Width5() + 1u, d.Height5() + 1u, d.BaseLevel(), d.LastLevel(), d.MaxMip(),
+			                   d.BaseArray5(), d.Depth());
+		};
+		Log::WriteToConsoleAndLog(fmt::format("lab-pssr-check: request {}x{} input [{}] output [{}]\n",
+		                                      request.width, request.height, lab_desc(input_descriptor),
+		                                      lab_desc(output_descriptor)));
+	}
 	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
 	        !Pssr::IsColorFormat(input_descriptor.Format()) ||
 	        output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
