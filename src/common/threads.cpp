@@ -1,5 +1,7 @@
 #include "common/threads.h"
 
+#include "common/assert.h"
+
 #include <atomic>
 #include <cerrno>
 #include <chrono> // IWYU pragma: keep
