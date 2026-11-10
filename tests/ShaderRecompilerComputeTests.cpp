@@ -4046,6 +4046,85 @@ public:
                                                           clean_copy_words[1]},
             "host-memory fill/copy did not update the clean cached mirror");
 
+    {
+      constexpr uintptr_t register_alias_base = 0x0000000200030000ull;
+      constexpr uint64_t register_alias_size = 0x4000;
+      constexpr uint32_t skipped_register = 0x3022cu;
+      constexpr uint64_t register_alias_dst =
+          register_alias_base + (skipped_register & 0xffffu);
+      constexpr uint64_t register_alias_src = register_alias_base + 0x100;
+      constexpr uint32_t sentinel = 0xccccccccu;
+      constexpr uint32_t filled_value = 0x5eed1234u;
+      constexpr uint32_t copied_value = 0x0bad5eedu;
+      constexpr uint8_t memory_dst_sel = 0;
+      constexpr uint8_t l2_memory_sel = 3;
+      constexpr uint8_t immediate_src_sel = 2;
+      constexpr uint32_t register_dst_no_increment = (1u << 27u) | (1u << 29u);
+      constexpr uint32_t register_dma_bytes = 1u << 21u;
+      static_assert(static_cast<uint32_t>(register_alias_dst) ==
+                    skipped_register);
+      int64_t register_alias_offset = -1;
+      Require("GpuCommandLane", "register-alias direct allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                  register_alias_size, register_alias_size, 0,
+                  &register_alias_offset) == 0,
+              "register-alias direct-memory allocation failed");
+      void *register_alias_memory =
+          reinterpret_cast<void *>(register_alias_base);
+      Require("GpuCommandLane", "register-alias direct mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &register_alias_memory, register_alias_size, 0x3, 0x10,
+                  register_alias_offset, register_alias_size) == 0 &&
+                  register_alias_memory ==
+                      reinterpret_cast<void *>(register_alias_base),
+              "register-alias fixed direct-memory mapping failed");
+      resources.MapMemory(register_alias_base, register_alias_size);
+      const std::array<uint32_t, 3> untouched{sentinel, sentinel, sentinel};
+      std::memcpy(reinterpret_cast<void *>(register_alias_dst - 4),
+                  untouched.data(), sizeof(untouched));
+      std::memcpy(reinterpret_cast<void *>(register_alias_src), &copied_value,
+                  sizeof(copied_value));
+      const auto read_alias = [&] {
+        std::array<uint32_t, 3> words{};
+        std::memcpy(words.data(),
+                    reinterpret_cast<const void *>(register_alias_dst - 4),
+                    sizeof(words));
+        return words;
+      };
+
+      dma_cursor = 0;
+      append_dma(memory_dst_sel, skipped_register, l2_memory_sel, 0,
+                 register_dma_bytes, register_dst_no_increment);
+      append_dma(memory_dst_sel, register_alias_dst, immediate_src_sel,
+                 filled_value, sizeof(filled_value));
+      gpu.Submit(std::span<const uint32_t>(dma_commands).first(dma_cursor));
+      gpu.WaitForIdle();
+      Require("GpuCommandLane", "DMA_DATA fill at a register-alias address",
+              read_alias() ==
+                  std::array<uint32_t, 3>{sentinel, filled_value, sentinel},
+              "a memory fill whose low address word is 0x3022c was dropped");
+
+      dma_cursor = 0;
+      append_dma(l2_memory_sel, register_alias_dst, l2_memory_sel,
+                 register_alias_src, sizeof(copied_value));
+      gpu.Submit(std::span<const uint32_t>(dma_commands).first(dma_cursor));
+      gpu.WaitForIdle();
+      Require("GpuCommandLane", "DMA_DATA copy to a register-alias address",
+              read_alias() ==
+                  std::array<uint32_t, 3>{sentinel, copied_value, sentinel},
+              "a MemoryUsingL2 copy whose low address word is 0x3022c was "
+              "dropped");
+
+      resources.UnmapMemory(register_alias_base, register_alias_size);
+      Require("GpuCommandLane", "register-alias release",
+              Libs::LibKernel::Memory::KernelMunmap(register_alias_base,
+                                                    register_alias_size) == 0 &&
+                  Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                      register_alias_offset, register_alias_size) == 0,
+              "register-alias direct-memory release failed");
+    }
+
     gpu.SendCommandSync([&] {
       Require("GpuCommandLane", "GPU memory invalidation",
               resources.InvalidateMemory(fault_base, sizeof(uint32_t)),
