@@ -2,11 +2,15 @@
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/shader/shaderBindings.h"
 #include "libs/errno.h"
+#include "common/logging/log.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <string>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +19,24 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+
+namespace {
+std::string LabFloats(const void* data, size_t bytes) {
+	std::string text;
+	for (size_t i = 0; i + 4 <= bytes; i += 4) {
+		uint32_t word = 0;
+		float    value = 0.0f;
+		std::memcpy(&word, static_cast<const uint8_t*>(data) + i, 4);
+		std::memcpy(&value, &word, 4);
+		text += fmt::format(" {:x}:{:08x}/{:g}", i, word, value);
+	}
+	return text;
+}
+bool LabDue(std::atomic_uint64_t& counter) {
+	const auto n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	return n <= 6 || n % 900 == 0;
+}
+} // namespace
 
 namespace Libs::LibPsml {
 
@@ -402,6 +424,15 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
 		flags |= Pssr::kSpatialOnly;
 	}
+	if (static std::atomic_uint64_t lab_calls = 0; LabDue(lab_calls)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lab-psml1: {}x{} at {},{} flags=0x{:x} reset={} motion_offset={:g},{:g} gamma={:g} "
+		    "prev_depth={} unused0:{} | unused1:{}\n",
+		    params->width, params->height, params->x, params->y, params->flags, params->reset,
+		    params->motion_offset[0], params->motion_offset[1], params->motion_gamma,
+		    params->previous_depth != nullptr ? 1 : 0, LabFloats(params->unused0, sizeof(params->unused0)),
+		    LabFloats(params->unused1, sizeof(params->unused1))));
+	}
 	WritePacket(*space, MakeRequest(context, *params, flags,
 	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
@@ -708,6 +739,17 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
+	}
+	if (static std::atomic_uint64_t lab_calls = 0; LabDue(lab_calls)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "lab-psml2: {}x{} at {},{} flags=0x{:x} reset={} encoding={} particle_mask={} "
+		    "particle_bits=0x{:x} reserved={} depth_range={:g},{:g} motion_offset={:g},{:g} "
+		    "jitter={:g},{:g} motion_scale={:g},{:g} pre_exposure={:g}\n",
+		    params->width, params->height, params->x, params->y, params->flags, params->reset,
+		    params->encoding, params->particle_mask != nullptr ? 1 : 0, params->particle_bits,
+		    params->reserved, params->depth_range[0], params->depth_range[1],
+		    params->motion_offset[0], params->motion_offset[1], params->jitter[0], params->jitter[1],
+		    params->motion_scale[0], params->motion_scale[1], params->pre_exposure));
 	}
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
