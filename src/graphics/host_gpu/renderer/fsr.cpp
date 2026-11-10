@@ -144,6 +144,9 @@ uint32_t CreationFlags(const Pssr::Request& request, bool exposure) {
 	if ((request.flags & Pssr::kReverseDepth) != 0) {
 		flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
 	}
+	if (std::getenv("KYTY_LAB_FSR_DEBUG") != nullptr) {
+		flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+	}
 	if ((request.flags & Pssr::kAutoExposure) != 0 || !exposure) {
 		flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 	}
