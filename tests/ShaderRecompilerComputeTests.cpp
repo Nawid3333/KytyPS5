@@ -316,20 +316,17 @@ struct TextureCacheTestAccess {
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
                                          uint64_t size) {
     std::lock_guard lock(cache.m_lock);
-    const auto found = cache.FindImagesInRegion(address, size);
     std::vector<ImageId> result;
-    result.reserve(found.size());
-    for (const auto id : found) {
-      result.push_back(id);
-    }
+    cache.ForEachImageInRegion(
+        address, size, [&](ImageId id, Image &) { result.push_back(id); });
     return result;
   }
 
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
-    const auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
+    const auto *bucket = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
-    return owners == nullptr ? 0 : owners->size();
+    return bucket == nullptr ? 0 : bucket->entries.size();
   }
 
   static size_t OwnedPageCount(TextureCache &cache, uint64_t address,
@@ -341,9 +338,11 @@ struct TextureCacheTestAccess {
     }
     size_t count = 0;
     for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-      const auto *owners = cache.m_image_page_table.Find(page);
-      count += owners != nullptr &&
-               std::find(owners->begin(), owners->end(), id) != owners->end();
+      const auto *bucket = cache.m_image_page_table.Find(page);
+      count += bucket != nullptr &&
+               std::ranges::find(bucket->entries, id,
+                                 &TextureCache::BucketEntry::id) !=
+                   bucket->entries.end();
     }
     return count;
   }
@@ -423,6 +422,10 @@ struct RenderExecutorTestAccess {
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     return executor.DrawAuto(command, args);
+  }
+
+  static uint32_t ColorTargetCount(const RenderExecutor &executor) {
+    return executor.m_targets.color_count;
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -6942,8 +6945,15 @@ public:
           TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
       const auto spanning_results = TextureCacheTestAccess::FindImages(
           texture_cache, spanning_info.data.address, spanning_info.data.size);
+      // Regions starting in the image's second page and before its first.
+      const auto spanning_tail = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.End() - 1, 1);
+      const auto spanning_cover = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.address - 0x100000, 0x300000);
       Require(name, "one-MiB cross-page deduplication",
               spanning && IsOnlyImage(spanning_results, spanning) &&
+                  IsOnlyImage(spanning_tail, spanning) &&
+                  IsOnlyImage(spanning_cover, spanning) &&
                   TextureCacheTestAccess::PageOwnerCount(
                       texture_cache, spanning_info.data.address) == 1 &&
                   TextureCacheTestAccess::PageOwnerCount(
@@ -7007,7 +7017,6 @@ public:
                   texture_cache, large_info.data.address, large_info.data.size,
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
-
 
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
@@ -8376,6 +8385,17 @@ public:
                       ms_depth_image,
               "CPU invalidation left a reused stencil image write-protected");
       memory[second_stencil_offset] = 0x5a;
+
+      // Another image at the plane's range is not adopted while the depth
+      // keeps its own plane record.
+      const auto other_image = TextureCacheTestAccess::InsertImage(
+          texture_cache, stencil_storage_desc.info);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "stencil re-association keeps its plane record",
+              !texture_cache.GetImage(other_image).depth_id,
+              "re-association adopted another image at the stencil range");
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_image);
 
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;
@@ -17446,12 +17466,13 @@ public:
       phased_depth_control.z_write_enable = true;
       registers.SetDepthControl(phased_depth_control);
       registers.SetRenderControl({});
-      RenderDepthInfo disabled_depth{};
+      // The executor reuses one depth slot, so a draw without depth state must clear it.
+      RenderDepthInfo disabled_depth{.depth_test_enable = true, .image_id = disjoint_depth_id};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), disabled_depth);
       Require(name, "disabled tests with stale depth write enable",
-              !disabled_depth.image_id,
-              "a dormant depth write bit bound a depth attachment");
+              !disabled_depth.image_id && !disabled_depth.depth_test_enable,
+              "a dormant depth write bit bound an attachment or kept the old slot");
       phased_depth_control.z_enable = true;
       registers.SetDepthControl(phased_depth_control);
       HW::RenderControl phased_render_control{};
@@ -20247,10 +20268,10 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
-                            .topology = topology, .ps_active = true,
+      DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
+      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -21228,6 +21249,9 @@ public:
                   "native vertex or instance offset was applied twice");
         }
       }
+      Require("NativeIndirectDrawOffsets", "color slots per draw",
+              RenderExecutorTestAccess::ColorTargetCount(executor) == 1,
+              "a draw kept the previous draw's color targets");
       // With back faces culled, the triangle draws for exactly one winding.
       const auto draws_with_back_cull = [&](bool clockwise) {
         registers.SetModeControl({.cull_back = true, .face = clockwise});
@@ -49498,7 +49522,7 @@ void CheckShaderStore(VulkanHarness &vulkan) {
       auto &scheduler = context.GetCommandScheduler();
       DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
       pipelines.GetGraphicsPrograms(scheduler.Current(), state);
-      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state);
+      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state, {});
       context.GetBufferCache().ReadMemory(base, sizeof(u32));
       (void)LibKernel::Memory::TryReadBacking(base, &session.output, sizeof(u32));
       context.UnmapMemory(base, allocation_size);
@@ -55283,6 +55307,79 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A flip rate is the shortest flip interval, counted from the last flip.
+void CheckFlipRate() {
+  namespace EventQueue = LibKernel::EventQueue;
+  using Common::DebugCounters::Counter;
+  constexpr const char *name = "FlipRate";
+  constexpr std::chrono::duration<double> period{1.0 / 30};
+  Config::Load({.vblank_frequency = 30,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window =
+      SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  Require(name, "setup",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, nullptr) == 0 &&
+              VideoOut::VideoOutSetFlipRate(handle, 1) == 0,
+          "video-out setup failed");
+  const auto flip = [&] {
+    EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 2'000'000;
+    Require(name, "flip",
+            VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == 0 &&
+                EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                             &timeout) == 0 &&
+                count == 1,
+            "the flip did not complete");
+    return std::chrono::steady_clock::now();
+  };
+
+  // At rate 1 a frame submitted after its slot flips at the next vblank, 3
+  // vblanks after the last flip, and the frame after it waits 2 vblanks again.
+  // The first present of the port is slow, so the timed flips follow a warm-up
+  // and one idle vblank that settles its lateness count.
+  Common::DebugCounters::SetEnabled(true);
+  flip();
+  std::this_thread::sleep_for(period);
+  const auto late_vblanks = Common::DebugCounters::Get(Counter::LateVblanks);
+  const auto first = flip();
+  std::this_thread::sleep_until(first + period * 2.4);
+  const auto late = flip();
+  const auto next = flip();
+  Require(name, "pacing",
+          Common::DebugCounters::Get(Counter::LateVblanks) == late_vblanks,
+          "the present thread fell behind the vblank rate");
+  Common::DebugCounters::SetEnabled(false);
+  const double next_gap = (next - late) / period;
+  Require(name, "late flip", (late - first) / period < 3.5,
+          "a late frame did not flip at the next vblank");
+  Require(name, "interval", next_gap > 1.5 && next_gap < 2.5,
+          "the frame after a late flip did not wait 2 vblanks");
+
+  renderer.GetGpu().WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
 
@@ -56463,6 +56560,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
+    CheckFlipRate();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {
