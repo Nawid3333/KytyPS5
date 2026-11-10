@@ -1934,6 +1934,62 @@ void TestNggVertexEntryState() {
   }
 }
 
+void TestVertexEntryMaskCoversRunningLanes() {
+  constexpr uint32_t exec = 126;
+  constexpr uint32_t vcc_lo = 106;
+  constexpr uint32_t zero = 128;
+  constexpr uint32_t one = 129;
+  constexpr uint32_t all_ones = 193;
+  constexpr uint32_t s_sub_i32 = 0x03;
+  constexpr uint32_t s_lshr_b64 = 0x21;
+  constexpr uint32_t s_mov_b64 = 0x04;
+  constexpr uint32_t v_mov_b32 = 0x01;
+  constexpr uint32_t packed_vertex_count = 3;
+  constexpr uint32_t one_float = 242;
+  static_assert(EncodeSop2(s_sub_i32, vcc_lo, zero, packed_vertex_count) ==
+                0x81ea0380u);
+  static_assert(EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo) == 0x90fe6ac1u);
+  const auto compile = [&](uint32_t wave_size, uint32_t count_base,
+                           uint32_t value,
+                           std::initializer_list<uint32_t> later_exec = {}) {
+    std::vector<uint32_t> shader = {
+        0xbefe04c1u,
+        0x906a8803u,
+        0x81ea6a80u,
+        0x90fe6ac1u,
+        EncodeSop2(s_sub_i32, vcc_lo, count_base, packed_vertex_count),
+        EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo)};
+    shader.insert(shader.end(), later_exec);
+    shader.insert(shader.end(),
+                  {EncodeVop1(v_mov_b32, 0, value), EncodeExp0(0x0c, 0xf),
+                   EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)});
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.wave_size = wave_size;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  const auto reads_lane = [](const std::string &source) {
+    return source.find("gl_SubgroupInvocationID") != std::string::npos;
+  };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    const auto captured = compile(wave_size, zero, one_float);
+    Check(!reads_lane(captured) &&
+              captured.find("OpGroupNonUniform") == std::string::npos,
+          "a running vertex lane stayed predicated by the entry mask of its "
+          "own lane bound");
+    Check(compile(wave_size, zero, packed_vertex_count)
+                  .find("OpGroupNonUniformBallotFindMSB") != std::string::npos,
+          "the packed vertex count lost its lane bound");
+    Check(reads_lane(compile(wave_size, one, one_float)),
+          "an entry mask one lane short of the lane bound was taken as "
+          "covering it");
+    Check(reads_lane(compile(wave_size, zero, one_float,
+                             {EncodeSop1(s_mov_b64, exec, one)})),
+          "an EXEC write after the vertex entry mask stopped predicating");
+  }
+}
+
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
   // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT. The S_DCACHE_INV
@@ -13532,6 +13588,7 @@ int main() {
   TestVertexBufferGrouping();
   TestShaderProgramHash();
   TestNggVertexEntryState();
+  TestVertexEntryMaskCoversRunningLanes();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
