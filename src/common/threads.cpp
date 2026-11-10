@@ -7,8 +7,13 @@
 #include <memory>
 #include <thread>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <pthread.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <process.h>
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
@@ -150,6 +155,69 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	return m_cv.wait_for(mutex->m_mutex, std::chrono::microseconds(micros)) ==
 	       std::cv_status::no_timeout;
 #endif
+}
+
+struct ThreadWithStackPrivate {
+	ThreadWithStackPrivate(ThreadWithStack::func_t f, void* a): func(f), arg(a) {}
+
+	ThreadWithStack::func_t func;
+	void*                   arg;
+	bool                    joined = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE handle = nullptr;
+
+	static unsigned __stdcall Run(void* data) {
+		auto* t = static_cast<ThreadWithStackPrivate*>(data);
+		t->func(t->arg);
+		return 0;
+	}
+#else
+	pthread_t thread {};
+
+	static void* Run(void* data) {
+		auto* t = static_cast<ThreadWithStackPrivate*>(data);
+		t->func(t->arg);
+		return nullptr;
+	}
+#endif
+};
+
+ThreadWithStack::ThreadWithStack(func_t func, void* arg, size_t stack_size)
+    : m_thread(std::make_unique<ThreadWithStackPrivate>(func, arg)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	m_thread->handle = reinterpret_cast<HANDLE>(
+	    _beginthreadex(nullptr, static_cast<unsigned>(stack_size), ThreadWithStackPrivate::Run,
+	                   m_thread.get(), STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+	EXIT_IF(m_thread->handle == nullptr);
+#else
+	pthread_attr_t attr;
+	const int      init = pthread_attr_init(&attr);
+	EXIT_IF(init != 0);
+	const int stack = pthread_attr_setstacksize(&attr, stack_size);
+	EXIT_IF(stack != 0);
+	const int created =
+	    pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get());
+	EXIT_IF(created != 0);
+	pthread_attr_destroy(&attr);
+#endif
+}
+
+ThreadWithStack::~ThreadWithStack() {
+	Join();
+}
+
+void ThreadWithStack::Join() {
+	if (m_thread->joined) return;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(GetThreadId(m_thread->handle) == GetCurrentThreadId());
+	const auto waited = WaitForSingleObject(m_thread->handle, INFINITE);
+	EXIT_IF(waited != WAIT_OBJECT_0);
+	CloseHandle(m_thread->handle);
+#else
+	const int error = pthread_join(m_thread->thread, nullptr);
+	EXIT_IF(error != 0);
+#endif
+	m_thread->joined = true;
 }
 
 } // namespace Common
