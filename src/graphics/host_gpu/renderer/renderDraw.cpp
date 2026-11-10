@@ -1110,55 +1110,50 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	// lab #1929: acquire the indirect arguments before the buffer bindings are final (as the
-	// compute path does); an acquisition that joins cache buffers re-resolves the bindings.
+	PreparedVertexBuffers        vertex_bindings;
+	PreparedIndexBuffer          index_binding;
+	vk::DeviceAddress            mesh_indices = 0;
 	std::pair<Buffer*, uint64_t> args_buffer {};
-	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                : sizeof(vk::DrawIndirectCommand));
+	// lab #1929: an acquisition after the bindings can join cache buffers that the bindings or an
+	// earlier acquisition hold; resolve everything again until a pass joins nothing.
+	for (uint32_t pass = 0;; ++pass) {
 		const auto joins_before = m_context.GetBufferCache().LabJoinCount();
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
-		EXIT_IF((args_buffer.second & 3u) != 0);
-		const auto joins = m_context.GetBufferCache().LabJoinCount() - joins_before;
-		if (joins != 0) {
-			static std::atomic_uint64_t lab_events = 0;
-			static std::atomic_uint64_t lab_joins  = 0;
-			const auto events = lab_events.fetch_add(1, std::memory_order_relaxed) + 1;
-			const auto total  = lab_joins.fetch_add(joins, std::memory_order_relaxed) + joins;
-			if (events <= 32 || events % 256 == 0) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "lab1929: indirect args acquisition joined {} cache buffer(s) after binding "
-				    "(draws={} size={} event={} joins_total={}); bindings re-resolved\n",
-				    joins, emit.indirect.count, size, events, total));
-			}
+		if (pass != 0) {
 			for (auto* stage: stages) {
 				RebindBuffers(*stage);
 			}
 		}
-	}
-	PreparedVertexBuffers vertex_bindings;
-	PreparedIndexBuffer   index_binding;
-	vk::DeviceAddress     mesh_indices = 0;
-	const auto            joins_before_inputs = m_context.GetBufferCache().LabJoinCount();
-	if (!mesh_active) {
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
-	} else if (draw.indexed) {
-		const auto [indices, offset] =
-		    m_context.GetBufferCache().ObtainBuffer(index_begin, index_end - index_begin, false);
-		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
-	}
-	if (const auto joins = m_context.GetBufferCache().LabJoinCount() - joins_before_inputs;
-	    joins != 0) {
-		static std::atomic_uint64_t lab_input_events = 0;
-		const auto events = lab_input_events.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (!mesh_active) {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		} else if (draw.indexed) {
+			const auto [indices, offset] = m_context.GetBufferCache().ObtainBuffer(
+			    index_begin, index_end - index_begin, false);
+			mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
+		}
+		uint64_t args_size = 0;
+		if (emit.indirect.address != 0) {
+			args_size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+			            (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+			                          : sizeof(vk::DrawIndirectCommand));
+			args_buffer =
+			    m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
+			EXIT_IF((args_buffer.second & 3u) != 0);
+		}
+		const auto joins = m_context.GetBufferCache().LabJoinCount() - joins_before;
+		if (joins == 0) {
+			break;
+		}
+		static std::atomic_uint64_t lab_events = 0;
+		const auto events = lab_events.fetch_add(1, std::memory_order_relaxed) + 1;
 		if (events <= 32 || events % 256 == 0) {
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "lab1929: vertex/index acquisition joined {} cache buffer(s) after binding "
-			    "(indirect={} event={})\n",
-			    joins, emit.indirect.address != 0 ? emit.indirect.count : 0u, events));
+			    "lab1929: draw acquisitions joined {} cache buffer(s) after binding (pass={} "
+			    "indirect_draws={} args_size={} event={}); resolving again\n",
+			    joins, pass, emit.indirect.address != 0 ? emit.indirect.count : 0u, args_size,
+			    events));
 		}
+		EXIT_IF(pass >= 8);
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
