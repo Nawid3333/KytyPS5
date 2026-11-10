@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/labSync.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -30,8 +31,12 @@ namespace Libs::Graphics {
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
-		const auto thread = CurrentThread();
+		const auto thread    = CurrentThread();
+		uint64_t   lab_start = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
+			if (lab_start == 0) {
+				lab_start = LabSync::NowNs();
+			}
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			// Wait on reads, so the holder's cache line is not written until the lock is free.
 			while (m_lock.test(std::memory_order_relaxed)) {
@@ -45,6 +50,9 @@ public:
 			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		if (lab_start != 0) {
+			LabSync::AddSpin(LabSync::NowNs() - lab_start);
+		}
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
@@ -140,7 +148,12 @@ private:
 	template <bool track, bool is_read>
 	void UpdateProtection(RegionBits& changed) {
 		if (!changed.None()) {
+			const auto lab_start = LabSync::tl_in_sync ? LabSync::NowNs() : 0;
 			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+			if (lab_start != 0) {
+				LabSync::g_protect_ns.fetch_add(LabSync::NowNs() - lab_start, std::memory_order_relaxed);
+				LabSync::g_protect_count.fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 	}
 

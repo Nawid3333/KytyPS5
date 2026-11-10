@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/labSync.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -411,18 +413,113 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+namespace {
+
+struct LabSyncTotals {
+	uint64_t window_begin_ns = LabSync::NowNs();
+	bool     log             = std::getenv("KYTY_LAB_BLOCKED_LOG") != nullptr;
+	uint64_t prepares        = 0;
+	uint64_t prepare_ns      = 0;
+	uint64_t ranges          = 0;
+	uint64_t range_bytes     = 0;
+	uint64_t bda_buffers     = 0;
+	uint64_t bda_ns          = 0;
+	uint64_t sync_calls      = 0;
+	uint64_t sync_ns         = 0;
+	uint64_t sync_bytes      = 0;
+	uint64_t walk_ns         = 0;
+	uint64_t upload_ns       = 0;
+	uint64_t copies          = 0;
+	uint64_t upload_bytes    = 0;
+	uint64_t max_sync_ns     = 0;
+	uint64_t max_sync_bytes  = 0;
+};
+
+LabSyncTotals& LabTotals() {
+	static LabSyncTotals totals;
+	return totals;
+}
+
+struct LabSyncScope {
+	uint64_t begin    = LabSync::NowNs();
+	bool     previous = std::exchange(LabSync::tl_in_sync, true);
+	uint64_t bytes;
+	explicit LabSyncScope(uint64_t size): bytes(size) {}
+	~LabSyncScope() {
+		LabSync::tl_in_sync = previous;
+		auto&      totals   = LabTotals();
+		const auto ns       = LabSync::NowNs() - begin;
+		totals.sync_calls++;
+		totals.sync_ns += ns;
+		totals.sync_bytes += bytes;
+		if (ns > totals.max_sync_ns) {
+			totals.max_sync_ns    = ns;
+			totals.max_sync_bytes = bytes;
+		}
+	}
+};
+
+} // namespace
+
+} // namespace Libs::Graphics
+
+void LabSync::PrepareDone(uint64_t prepare_ns, uint64_t ranges, uint64_t range_bytes) {
+	auto& totals = Libs::Graphics::LabTotals();
+	totals.prepares++;
+	totals.prepare_ns += prepare_ns;
+	totals.ranges += ranges;
+	totals.range_bytes += range_bytes;
+	const auto now = NowNs();
+	if (now - totals.window_begin_ns < 5'000'000'000ull) {
+		return;
+	}
+	const auto ms = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	const auto mb = [](uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+	if (totals.log) {
+		LOGF("[lab-sync] window_ms=%.0f prepares=%" PRIu64 " prepare_ms=%.1f ranges=%" PRIu64
+		     " range_mb=%.1f bda_buffers=%" PRIu64 " bda_ms=%.1f sync_calls=%" PRIu64
+		     " sync_ms=%.1f sync_mb=%.1f walk_ms=%.1f upload_ms=%.1f copies=%" PRIu64
+		     " upload_mb=%.1f spin_ms=%.1f spin_n=%" PRIu64 " spin_max_ms=%.2f protect_ms=%.1f protect_n=%" PRIu64
+		     " other_spin_ms=%.1f other_spin_n=%" PRIu64 " max_sync_ms=%.2f max_sync_mb=%.1f\n",
+		     ms(now - totals.window_begin_ns), totals.prepares, ms(totals.prepare_ns), totals.ranges,
+		     mb(totals.range_bytes), totals.bda_buffers, ms(totals.bda_ns), totals.sync_calls,
+		     ms(totals.sync_ns), mb(totals.sync_bytes), ms(totals.walk_ns), ms(totals.upload_ns),
+		     totals.copies, mb(totals.upload_bytes), ms(g_spin_ns.exchange(0)), g_spin_count.exchange(0),
+		     ms(g_spin_max_ns.exchange(0)), ms(g_protect_ns.exchange(0)), g_protect_count.exchange(0),
+		     ms(g_other_spin_ns.exchange(0)), g_other_spin_count.exchange(0), ms(totals.max_sync_ns),
+		     mb(totals.max_sync_bytes));
+	}
+	const auto log         = totals.log;
+	totals                 = {};
+	totals.log             = log;
+	totals.window_begin_ns = now;
+}
+
+namespace Libs::Graphics {
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	LabSyncScope                lab_scope(size);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	const auto                  lab_walk_begin = LabSync::NowNs();
+	uint64_t                    lab_upload_ns  = 0;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    const auto lab_upload_begin = LabSync::NowNs();
+		    source                      = UploadCopies(buffer, copies, total_size);
+		    lab_upload_ns               = LabSync::NowNs() - lab_upload_begin;
+	    });
+	LabTotals().walk_ns += LabSync::NowNs() - lab_walk_begin - lab_upload_ns;
+	LabTotals().upload_ns += lab_upload_ns;
+	LabTotals().copies += copies.size();
+	LabTotals().upload_bytes += total_size;
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -717,8 +814,9 @@ RangeSet BufferCache::TakeBdaSync() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
+	const auto lab_begin = LabSync::NowNs();
+	const auto end       = vaddr + size;
+	auto       it        = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
 		--it;
 	}
@@ -727,9 +825,11 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
+			LabTotals().bda_buffers++;
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+	LabTotals().bda_ns += LabSync::NowNs() - lab_begin;
 }
 
 } // namespace Libs::Graphics

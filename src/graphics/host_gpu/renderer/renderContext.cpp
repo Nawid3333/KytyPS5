@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/labSync.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -150,13 +151,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	const auto       lab_begin = LabSync::NowNs();
+	uint64_t         lab_ranges = 0;
+	uint64_t         lab_bytes  = 0;
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
-		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
+	m_buffer_cache.TakeBdaSync().ForEach([&](uint64_t begin, uint64_t end) {
+		m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+			lab_ranges++;
+			lab_bytes += finish - start;
 			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
 		});
 	});
 	m_fault_process_pending = true;
+	LabSync::PrepareDone(LabSync::NowNs() - lab_begin, lab_ranges, lab_bytes);
 }
 
 void RenderContext::RunGarbageCollector() {
