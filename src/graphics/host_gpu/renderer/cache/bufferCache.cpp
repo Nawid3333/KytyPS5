@@ -388,6 +388,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
+	m_lab_join_count++;
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
