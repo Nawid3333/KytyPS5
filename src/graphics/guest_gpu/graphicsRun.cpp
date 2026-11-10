@@ -455,7 +455,9 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Guest job threads spin while they wait for work; keep them from taking this core.
-	if (!Common::Thread::SetCurrentPriorityHighest()) {
+	if (std::getenv("KYTY_LAB_GPU_PRIO_OFF") != nullptr) {
+		LOGF("[lab-lock] GPU thread priority left at normal (KYTY_LAB_GPU_PRIO_OFF)\n");
+	} else if (!Common::Thread::SetCurrentPriorityHighest()) {
 		LOGF("GPU: could not raise the GPU thread priority\n");
 	}
 #endif
