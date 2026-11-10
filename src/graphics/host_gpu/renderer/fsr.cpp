@@ -73,6 +73,10 @@ Api               g_api {};
 VkDeviceContext   g_device {};
 bool              g_available = false;
 
+float PositiveOr(float value, float fallback) {
+	return std::isfinite(value) && value > 0.0f ? value : fallback;
+}
+
 void Warn(std::string_view text) {
 	Log::WriteToConsoleAndLog(fmt::format("WARNING: FSR: {}; PSSR scales linearly.\n", text));
 }
@@ -219,14 +223,17 @@ void SetDispatch(ffxDispatchDescUpscale& desc, VkCommandBuffer command,
 	desc.upscaleSize             = {inputs.output.width, inputs.output.height};
 	desc.enableSharpening        = false;
 	desc.sharpness               = 0.0f;
-	desc.frameTimeDelta          = std::isfinite(frame_ms) && frame_ms > 0.0f ? frame_ms : FIRST_FRAME_MS;
-	desc.preExposure             = std::isfinite(request.pre_exposure) && request.pre_exposure > 0.0f
-	                                   ? request.pre_exposure
-	                                   : 1.0f;
+	desc.frameTimeDelta          = PositiveOr(frame_ms, FIRST_FRAME_MS);
+	desc.preExposure             = PositiveOr(request.pre_exposure, 1.0f);
 	desc.reset                   = reset;
-	desc.cameraNear              = CAMERA_NEAR;
-	desc.cameraFar               = CAMERA_FAR;
-	desc.cameraFovAngleVertical  = CAMERA_FOV_VERTICAL;
+	const float near_plane       = PositiveOr(request.camera_near, 0.0f);
+	const float far_plane        = PositiveOr(request.camera_far, 0.0f);
+	const bool  depth_range      = near_plane > 0.0f && far_plane > 0.0f && near_plane != far_plane;
+	const float y_scale          = PositiveOr(std::abs(request.projection_scale[1]), 0.0f);
+	desc.cameraNear              = depth_range ? near_plane : CAMERA_NEAR;
+	desc.cameraFar               = depth_range ? far_plane : CAMERA_FAR;
+	desc.cameraFovAngleVertical =
+	    y_scale > 0.0f ? 2.0f * std::atan(1.0f / y_scale) : CAMERA_FOV_VERTICAL;
 	desc.viewSpaceToMetersFactor = 1.0f;
 	desc.flags                   = 0;
 }

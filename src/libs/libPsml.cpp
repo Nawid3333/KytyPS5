@@ -112,7 +112,11 @@ struct DispatchParameters {
 	const uint32_t* exposure;
 	uint8_t         unused0[0x34];
 	float           pre_exposure;
-	uint8_t         unused1[0x88];
+	uint8_t         unused1[0x04];
+	float           projection[4][4];
+	uint8_t         unused2[0x3c];
+	float           camera_near;
+	float           camera_far;
 	uint32_t        width;
 	uint32_t        height;
 	uint32_t        x;
@@ -126,6 +130,8 @@ struct DispatchParameters {
 	const void*     vr_lookup;
 };
 static_assert(offsetof(DispatchParameters, pre_exposure) == 0x64);
+static_assert(offsetof(DispatchParameters, projection) == 0x6c);
+static_assert(offsetof(DispatchParameters, camera_near) == 0xe8);
 static_assert(offsetof(DispatchParameters, width) == 0xf0);
 static_assert(offsetof(DispatchParameters, vr_lookup) == 0x128);
 
@@ -430,11 +436,19 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 		    "prev_depth={} unused0:{} | unused1:{}\n",
 		    params->width, params->height, params->x, params->y, params->flags, params->reset,
 		    params->motion_offset[0], params->motion_offset[1], params->motion_gamma,
-		    params->previous_depth != nullptr ? 1 : 0, LabFloats(params->unused0, sizeof(params->unused0)),
-		    LabFloats(params->unused1, sizeof(params->unused1))));
+		    params->previous_depth != nullptr ? 1 : 0,
+		    LabFloats(params->unused0, sizeof(params->unused0)),
+		    LabFloats(
+		        reinterpret_cast<const uint8_t*>(params) + offsetof(DispatchParameters, unused1),
+		        offsetof(DispatchParameters, width) - offsetof(DispatchParameters, unused1))));
 	}
-	WritePacket(*space, MakeRequest(context, *params, flags,
-	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
+	auto request        = MakeRequest(context, *params, flags,
+	                                  params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure);
+	request.camera_near = params->camera_near;
+	request.camera_far  = params->camera_far;
+	request.projection_scale[0] = params->projection[0][0];
+	request.projection_scale[1] = params->projection[1][1];
+	WritePacket(*space, request);
 	return OK;
 }
 
@@ -751,7 +765,10 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 		    params->motion_offset[0], params->motion_offset[1], params->jitter[0], params->jitter[1],
 		    params->motion_scale[0], params->motion_scale[1], params->pre_exposure));
 	}
-	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
+	auto request        = MakeRequest(context, *params, flags, params->pre_exposure);
+	request.camera_near = params->depth_range[0];
+	request.camera_far  = params->depth_range[1];
+	WritePacket(*space, request);
 	return OK;
 }
 

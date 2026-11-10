@@ -32,10 +32,13 @@ struct Request {
 	float    motion_scale[2];
 	float    pre_exposure;
 	uint32_t flags;
+	float    camera_near;
+	float    camera_far;
+	float    projection_scale[2];
 };
 
 constexpr uint32_t RequestDwords = sizeof(Request) / sizeof(uint32_t);
-static_assert(sizeof(Request) == 208);
+static_assert(sizeof(Request) == 224);
 
 inline bool IsColorFormat(Prospero::BufferFormat format) {
 	switch (format) {

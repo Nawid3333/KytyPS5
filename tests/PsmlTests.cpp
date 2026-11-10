@@ -85,7 +85,11 @@ struct DispatchParameters {
   const uint32_t *exposure = nullptr;
   std::array<uint8_t, 0x34> unused0{};
   float pre_exposure = 1.0f;
-  std::array<uint8_t, 0x88> unused1{};
+  std::array<uint8_t, 0x04> unused1{};
+  float projection[4][4]{};
+  std::array<uint8_t, 0x3c> unused2{};
+  float camera_near = 0.0f;
+  float camera_far = 0.0f;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t x = 0;
@@ -99,6 +103,9 @@ struct DispatchParameters {
   const void *vr_lookup = nullptr;
 };
 static_assert(offsetof(DispatchParameters, pre_exposure) == 0x64);
+static_assert(offsetof(DispatchParameters, projection) == 0x6c);
+static_assert(offsetof(DispatchParameters, camera_near) == 0xe8);
+static_assert(offsetof(DispatchParameters, camera_far) == 0xec);
 static_assert(offsetof(DispatchParameters, width) == 0xf0);
 static_assert(offsetof(DispatchParameters, vr_lookup) == 0x128);
 
@@ -406,6 +413,59 @@ TEST_F(PsmlTest, LegacyDispatchHasNoRenderOffsetAndTwoFlags) {
   EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
   params.flags = 1u << 31;
   EXPECT_EQ(dispatch().flags, Pssr::kReset | Pssr::kSpatialOnly);
+  EXPECT_EQ(request.camera_near, 0.0f);
+  EXPECT_EQ(request.camera_far, 0.0f);
+  EXPECT_EQ(std::to_array(request.projection_scale), (std::array<float, 2>{}));
+}
+
+TEST_F(PsmlTest, DispatchCarriesTheCameraOfTheProjection) {
+  const auto output = Texture(960, 540, 0x10000);
+  const auto input = Texture(960, 540, 0x20000);
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .width = 960,
+                            .height = 540,
+                            .flags = 1u << 15};
+  std::array<uint32_t, Pssr::RequestDwords + 1> command{};
+  const CommandSpace space{command.data(), command.size()};
+  const auto dispatch = [&] {
+    EXPECT_EQ(Function<Dispatch>("94iBp3KvIuI")(context, &space, &params), 0);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request;
+  };
+  auto request = dispatch();
+  EXPECT_EQ(request.camera_near, 0.0f);
+  EXPECT_EQ(request.camera_far, 0.0f);
+  EXPECT_EQ(std::to_array(request.projection_scale), (std::array<float, 2>{}));
+
+  struct Camera {
+    float x_scale;
+    float y_scale;
+    float depth_scale;
+    float depth_offset;
+    float near_plane;
+    float far_plane;
+  };
+  const Camera ghost_of_yotei{1.029649f, 1.830488f, -1e-6f,
+                              10.00001f, 10.0f,     1e7f};
+  const Camera demons_souls{1.42799f,  2.53865f, -3.333e-5f,
+                            0.100003f, 0.1f,     3000.0f};
+  for (const auto &camera : {ghost_of_yotei, demons_souls}) {
+    params.projection[0][0] = camera.x_scale;
+    params.projection[1][1] = camera.y_scale;
+    params.projection[2][2] = camera.depth_scale;
+    params.projection[2][3] = -1.0f;
+    params.projection[3][2] = camera.depth_offset;
+    params.camera_near = camera.near_plane;
+    params.camera_far = camera.far_plane;
+    request = dispatch();
+    EXPECT_EQ(request.camera_near, camera.near_plane);
+    EXPECT_EQ(request.camera_far, camera.far_plane);
+    EXPECT_EQ(request.projection_scale[0], camera.x_scale);
+    EXPECT_EQ(request.projection_scale[1], camera.y_scale);
+    EXPECT_EQ(request.flags, Pssr::kReverseDepth);
+  }
 }
 
 TEST_F(PsmlTest, DispatchAcceptsEqualSizedBuffersAndValidatesWithoutWriting) {
@@ -732,6 +792,7 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
                                  .height = 1080,
                                  .jitter = {-0.125f, 0.5f},
                                  .motion_scale = {-1280.0f, 720.0f},
+                                 .depth_range = {0.1f, 1200.0f},
                                  .reset = 1,
                                  .flags = 1};
   std::vector<uint32_t> command(0x800);
@@ -754,6 +815,9 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
             std::to_array(params.motion_scale));
   EXPECT_EQ(request.pre_exposure, 0.5f);
   EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
+  EXPECT_EQ(request.camera_near, 0.1f);
+  EXPECT_EQ(request.camera_far, 1200.0f);
+  EXPECT_EQ(std::to_array(request.projection_scale), (std::array<float, 2>{}));
 
   params.reset = 0;
   params.flags = 1u << 1;

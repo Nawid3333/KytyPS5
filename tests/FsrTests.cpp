@@ -5,6 +5,7 @@
 #include <cmath>
 #include <gtest/gtest.h>
 #include <limits>
+#include <numbers>
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -217,6 +218,51 @@ TEST(FsrTest, DispatchReplacesInvalidExposureAndFrameTimes) {
 		EXPECT_TRUE(std::isfinite(desc.frameTimeDelta) && desc.frameTimeDelta > 0.0f);
 		EXPECT_EQ(desc.exposure.resource, nullptr);
 		EXPECT_FALSE(desc.reset);
+	}
+}
+
+TEST(FsrTest, DispatchTakesTheCameraOfTheRequest) {
+	struct Camera {
+		float near_plane;
+		float far_plane;
+		float y_scale;
+		float vertical_fov;
+	};
+	constexpr float tolerance = 1e-5f;
+	const Camera    ghost_of_yotei {10.0f, 1e7f, 1.830488f, 1.0f};
+	const Camera    demons_souls {0.1f, 3000.0f, -2.53865f, 0.750491f};
+	for (const auto& camera: {ghost_of_yotei, demons_souls}) {
+		auto request                = TemporalRequest();
+		request.camera_near         = camera.near_plane;
+		request.camera_far          = camera.far_plane;
+		request.projection_scale[1] = camera.y_scale;
+		ffxDispatchDescUpscale desc {};
+		Fsr::SetDispatch(desc, nullptr, request, MakeInputs(nullptr), false, 8.0f);
+		EXPECT_EQ(desc.cameraNear, camera.near_plane);
+		EXPECT_EQ(desc.cameraFar, camera.far_plane);
+		EXPECT_NEAR(desc.cameraFovAngleVertical, camera.vertical_fov, tolerance);
+		EXPECT_EQ(desc.viewSpaceToMetersFactor, 1.0f);
+	}
+
+	ffxDispatchDescUpscale fallback {};
+	Fsr::SetDispatch(fallback, nullptr, TemporalRequest(), MakeInputs(nullptr), false, 8.0f);
+	EXPECT_EQ(fallback.cameraNear, 0.1f);
+	EXPECT_EQ(fallback.cameraFar, 10000.0f);
+	EXPECT_NEAR(fallback.cameraFovAngleVertical, std::numbers::pi_v<float> / 3.0f, tolerance);
+
+	const float nan      = std::numeric_limits<float>::quiet_NaN();
+	const float infinity = std::numeric_limits<float>::infinity();
+	for (const auto& camera: {Camera {nan, 3000.0f, nan}, Camera {0.1f, infinity, infinity},
+	                          Camera {-0.1f, 3000.0f, 0.0f}, Camera {5.0f, 5.0f, -0.0f}}) {
+		auto request                = TemporalRequest();
+		request.camera_near         = camera.near_plane;
+		request.camera_far          = camera.far_plane;
+		request.projection_scale[1] = camera.y_scale;
+		ffxDispatchDescUpscale desc {};
+		Fsr::SetDispatch(desc, nullptr, request, MakeInputs(nullptr), false, 8.0f);
+		EXPECT_EQ(desc.cameraNear, fallback.cameraNear) << camera.near_plane;
+		EXPECT_EQ(desc.cameraFar, fallback.cameraFar) << camera.far_plane;
+		EXPECT_EQ(desc.cameraFovAngleVertical, fallback.cameraFovAngleVertical) << camera.y_scale;
 	}
 }
 
