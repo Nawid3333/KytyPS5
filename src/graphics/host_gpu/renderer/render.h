@@ -214,6 +214,7 @@ private:
 		Fsr::Creation                         creation;
 		Fsr::Context*                         handle;
 		std::chrono::steady_clock::time_point last;
+		bool                                  stale;
 	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
@@ -236,6 +237,8 @@ private:
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<DlssContext>              m_dlss_contexts;
 	std::vector<FsrContext>               m_fsr_contexts;
+	std::array<uint64_t, 3>               m_fsr_ticks {};
+	uint32_t                              m_fsr_tick_slot = 0;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

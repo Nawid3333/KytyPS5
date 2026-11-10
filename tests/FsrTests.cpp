@@ -73,6 +73,22 @@ TEST(FsrTest, ViewableNeedsOneSampleAndItsOwnOrAMutableFormat) {
 	                          VK_FORMAT_R32_SFLOAT, 1));
 }
 
+TEST(FsrTest, ChannelsMustNotBeSwizzled) {
+	const VkComponentMapping identity {};
+	const VkComponentMapping own {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
+	                              VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
+	const VkComponentMapping bgra {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G,
+	                               VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A};
+	const VkComponentMapping one_alpha {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
+	                                    VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_ONE};
+	EXPECT_TRUE(Fsr::IdentityChannels(identity, 3));
+	EXPECT_TRUE(Fsr::IdentityChannels(own, 4));
+	EXPECT_FALSE(Fsr::IdentityChannels(bgra, 3));
+	EXPECT_TRUE(Fsr::IdentityChannels(bgra, 0));
+	EXPECT_TRUE(Fsr::IdentityChannels(one_alpha, 3));
+	EXPECT_FALSE(Fsr::IdentityChannels(one_alpha, 4));
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 TEST(FsrTest, CreationFlagsFollowTheRequest) {
@@ -196,9 +212,9 @@ TEST(FsrTest, DispatchReplacesInvalidExposureAndFrameTimes) {
 	                                std::numeric_limits<float>::infinity()}) {
 		request.pre_exposure = pre_exposure;
 		ffxDispatchDescUpscale desc {};
-		Fsr::SetDispatch(desc, nullptr, request, MakeInputs(nullptr), false, 0.0f);
+		Fsr::SetDispatch(desc, nullptr, request, MakeInputs(nullptr), false, pre_exposure);
 		EXPECT_EQ(desc.preExposure, 1.0f) << pre_exposure;
-		EXPECT_GT(desc.frameTimeDelta, 0.0f);
+		EXPECT_TRUE(std::isfinite(desc.frameTimeDelta) && desc.frameTimeDelta > 0.0f);
 		EXPECT_EQ(desc.exposure.resource, nullptr);
 		EXPECT_FALSE(desc.reset);
 	}

@@ -69,6 +69,7 @@ struct DeviceFeatures {
                              const Inputs& inputs);
 [[nodiscard]] bool     Viewable(VkFormat image_format, VkImageCreateFlags image_flags,
                                 VkFormat view_format, uint32_t samples);
+[[nodiscard]] bool     IdentityChannels(VkComponentMapping mapping, uint32_t channels);
 [[nodiscard]] FfxApiResource MakeResource(const Resource* resource);
 void SetCreation(ffxCreateContextDescUpscale& desc, const Creation& creation);
 void SetDispatch(ffxDispatchDescUpscale& desc, VkCommandBuffer command,

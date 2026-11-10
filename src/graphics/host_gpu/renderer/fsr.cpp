@@ -36,6 +36,18 @@ bool Viewable(VkFormat image_format, VkImageCreateFlags image_flags, VkFormat vi
 	                        (image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0);
 }
 
+bool IdentityChannels(VkComponentMapping mapping, uint32_t channels) {
+	const std::array components {mapping.r, mapping.g, mapping.b, mapping.a};
+	const std::array own {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+	                      VK_COMPONENT_SWIZZLE_A};
+	for (uint32_t i = 0; i < std::min<uint32_t>(channels, 4); ++i) {
+		if (components[i] != VK_COMPONENT_SWIZZLE_IDENTITY && components[i] != own[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 namespace {
@@ -65,14 +77,17 @@ void Warn(std::string_view text) {
 	Log::WriteToConsoleAndLog(fmt::format("WARNING: FSR: {}; PSSR scales linearly.\n", text));
 }
 
-void OnMessage(uint32_t type, const wchar_t* message) {
-	std::wstring_view text(message != nullptr ? message : L"");
-	std::string       narrow;
-	narrow.reserve(text.size());
-	for (const wchar_t c: text) {
-		narrow.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+void OnMessage(uint32_t type, const wchar_t* message) noexcept {
+	try {
+		std::wstring_view text(message != nullptr ? message : L"");
+		std::string       narrow;
+		narrow.reserve(text.size());
+		for (const wchar_t c: text) {
+			narrow.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+		}
+		Log::WriteToConsoleAndLog(fmt::format("FSR message {}: {}\n", type, narrow));
+	} catch (...) {
 	}
-	Log::WriteToConsoleAndLog(fmt::format("FSR message {}: {}\n", type, narrow));
 }
 
 template <typename Function>
@@ -201,7 +216,7 @@ void SetDispatch(ffxDispatchDescUpscale& desc, VkCommandBuffer command,
 	desc.upscaleSize             = {inputs.output.width, inputs.output.height};
 	desc.enableSharpening        = false;
 	desc.sharpness               = 0.0f;
-	desc.frameTimeDelta          = frame_ms > 0.0f ? frame_ms : FIRST_FRAME_MS;
+	desc.frameTimeDelta          = std::isfinite(frame_ms) && frame_ms > 0.0f ? frame_ms : FIRST_FRAME_MS;
 	desc.preExposure             = std::isfinite(request.pre_exposure) && request.pre_exposure > 0.0f
 	                                   ? request.pre_exposure
 	                                   : 1.0f;

@@ -108,7 +108,15 @@ bool RenderExecutor::UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& 
 	const auto now     = std::chrono::steady_clock::now();
 	auto       context = std::ranges::find(m_fsr_contexts, request.context, &FsrContext::context);
 	bool       reset   = (request.flags & Pssr::kReset) != 0;
+	if (context != m_fsr_contexts.end()) {
+		std::rotate(context, std::next(context), m_fsr_contexts.end());
+		context = std::prev(m_fsr_contexts.end());
+	}
 	if (context == m_fsr_contexts.end() || !Fsr::Takes(context->creation, request, inputs)) {
+		const auto creation = Fsr::Choose(request, inputs);
+		if (!Fsr::Takes(creation, request, inputs)) {
+			return false;
+		}
 		if (context != m_fsr_contexts.end()) {
 			release(context->handle);
 		} else {
@@ -116,15 +124,18 @@ bool RenderExecutor::UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& 
 				release(m_fsr_contexts.front().handle);
 				m_fsr_contexts.erase(m_fsr_contexts.begin());
 			}
-			context = m_fsr_contexts.insert(m_fsr_contexts.end(), {request.context, {}, nullptr, now});
+			context = m_fsr_contexts.insert(m_fsr_contexts.end(),
+			                                 {request.context, {}, nullptr, now, false});
 		}
-		context->creation = Fsr::Choose(request, inputs);
-		context->handle   = Fsr::CreateContext(context->creation);
+		context->creation = creation;
+		context->handle   = Fsr::CreateContext(creation);
 		reset             = true;
 	}
 	if (context->handle == nullptr) {
 		return false;
 	}
+	reset          = reset || context->stale;
+	context->stale = false;
 	const float frame_ms =
 	    reset ? 0.0f : std::chrono::duration<float, std::milli>(now - context->last).count();
 	context->last = now;
@@ -135,6 +146,8 @@ bool RenderExecutor::UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& 
 		return false;
 	}
 	MemoryBarrier(command);
+	m_fsr_ticks[m_fsr_tick_slot] = m_context.GetCommandScheduler().CurrentTick();
+	m_fsr_tick_slot              = (m_fsr_tick_slot + 1) % m_fsr_ticks.size();
 	return true;
 }
 
@@ -270,6 +283,13 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			    Fsr::Available() ? 1 : 0, Fsr::Accepts(request) ? 1 : 0));
 		}
 	}
+	if (fsr) {
+		auto&      scheduler = m_context.GetCommandScheduler();
+		const auto oldest    = m_fsr_ticks[m_fsr_tick_slot];
+		if (oldest != 0 && !scheduler.IsFree(oldest)) {
+			scheduler.Wait(oldest);
+		}
+	}
 	buffer.EndRendering();
 	const auto command = buffer.Handle();
 	const auto range   = [](const ImageViewInfo& view) {
@@ -284,13 +304,16 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
 	                    range(destination_view), command);
 	if (fsr && dlss_bindings[0] && dlss_bindings[1]) {
-		const auto whole = [&](const TextureBinding& binding, bool output) {
+		const auto whole = [&](const TextureBinding& binding, bool output, uint32_t channels) {
 			const auto& image = cache.GetImage(binding.image_id);
 			const auto& view  = binding.desc.view_info;
 			const bool  depth = image.info.IsDepth();
 			const auto  format = static_cast<VkFormat>(depth ? image.backing.format : view.format);
+			const bool  sized  = !output || (image.backing.extent.width == parameters.output_size[0] &&
+			                                 image.backing.extent.height == parameters.output_size[1]);
 			return std::optional<Fsr::Resource> {
-			    view.base_level == 0 && view.base_layer == 0 &&
+			    view.base_level == 0 && view.base_layer == 0 && image.backing.layers == 1 && sized &&
+			            Fsr::IdentityChannels(static_cast<VkComponentMapping>(view.mapping), channels) &&
 			            Fsr::Viewable(static_cast<VkFormat>(image.backing.format),
 			                          static_cast<VkImageCreateFlags>(image.backing.flags), format,
 			                          image.backing.samples)
@@ -306,12 +329,12 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			              .output     = output}}
 			        : std::nullopt};
 		};
-		const auto color  = whole(input, false);
-		const auto depth  = whole(*dlss_bindings[0], false);
-		const auto motion = whole(*dlss_bindings[1], false);
-		const auto target = whole(output, true);
+		const auto color  = whole(input, false, 3);
+		const auto depth  = whole(*dlss_bindings[0], false, 0);
+		const auto motion = whole(*dlss_bindings[1], false, 2);
+		const auto target = whole(output, true, 0);
 		const auto exposure =
-		    dlss_bindings[2] ? whole(*dlss_bindings[2], false) : std::optional<Fsr::Resource> {};
+		    dlss_bindings[2] ? whole(*dlss_bindings[2], false, 1) : std::optional<Fsr::Resource> {};
 		if (color && depth && motion && target && (!dlss_bindings[2] || exposure)) {
 			for (const auto* binding: {&input, &*dlss_bindings[0], &*dlss_bindings[1]}) {
 				cache.GetImage(binding->image_id)
@@ -368,6 +391,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			ResetBindings();
 			return;
 		}
+	}
+	if (auto stale = std::ranges::find(m_fsr_contexts, request.context, &FsrContext::context);
+	    stale != m_fsr_contexts.end()) {
+		stale->stale = true;
 	}
 	auto& graphics = m_context.GetGraphics();
 	if (m_pssr_pipeline == nullptr) {
