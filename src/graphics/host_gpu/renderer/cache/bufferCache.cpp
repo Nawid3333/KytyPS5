@@ -488,6 +488,13 @@ void LabSync::PrepareDone(uint64_t prepare_ns, uint64_t ranges, uint64_t range_b
 		     ms(g_spin_max_ns.exchange(0)), ms(g_protect_ns.exchange(0)), g_protect_count.exchange(0),
 		     ms(g_other_spin_ns.exchange(0)), g_other_spin_count.exchange(0), ms(totals.max_sync_ns),
 		     mb(totals.max_sync_bytes));
+		LOGF("[lab-lock] park_spins=%u parks=%" PRIu64 " other_parks=%" PRIu64 " long_holds=%" PRIu64
+		     " long_hold_ms=%.1f long_hold_max_ms=%.2f other_long_holds=%" PRIu64
+		     " other_long_hold_ms=%.1f other_long_hold_max_ms=%.2f\n",
+		     g_park_spins, g_park_count.exchange(0), g_other_park_count.exchange(0),
+		     g_long_hold_count.exchange(0), ms(g_long_hold_ns.exchange(0)),
+		     ms(g_long_hold_max_ns.exchange(0)), g_other_long_hold_count.exchange(0),
+		     ms(g_other_long_hold_ns.exchange(0)), ms(g_other_long_hold_max_ns.exchange(0)));
 	}
 	const auto log         = totals.log;
 	totals                 = {};

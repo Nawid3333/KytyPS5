@@ -33,13 +33,22 @@ public:
 	void lock() noexcept {
 		const auto thread    = CurrentThread();
 		uint64_t   lab_start = 0;
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		uint32_t   lab_spins = 0;
+		while (m_lock.test_and_set(std::memory_order_seq_cst)) {
 			if (lab_start == 0) {
 				lab_start = LabSync::NowNs();
 			}
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			// Wait on reads, so the holder's cache line is not written until the lock is free.
 			while (m_lock.test(std::memory_order_relaxed)) {
+				if (LabSync::g_park_spins != 0 && ++lab_spins >= LabSync::g_park_spins) {
+					lab_spins = 0;
+					LabSync::AddPark();
+					m_lab_waiters.fetch_add(1, std::memory_order_seq_cst);
+					m_lock.wait(true, std::memory_order_seq_cst);
+					m_lab_waiters.fetch_sub(1, std::memory_order_seq_cst);
+					continue;
+				}
 #if defined(__x86_64__) || defined(_M_X64)
 				_mm_pause();
 #elif defined(_M_ARM64)
@@ -50,14 +59,19 @@ public:
 			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		m_lab_acquired_ns = LabSync::NowNs();
 		if (lab_start != 0) {
-			LabSync::AddSpin(LabSync::NowNs() - lab_start);
+			LabSync::AddSpin(m_lab_acquired_ns - lab_start);
 		}
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
+		LabSync::AddHold(LabSync::NowNs() - m_lab_acquired_ns);
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_lock.clear(std::memory_order_seq_cst);
+		if (m_lab_waiters.load(std::memory_order_seq_cst) != 0) {
+			m_lock.notify_one();
+		}
 	}
 
 private:
@@ -79,6 +93,8 @@ private:
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
 	std::atomic_uint32_t m_owner {0};
+	std::atomic_uint32_t m_lab_waiters {0};
+	uint64_t             m_lab_acquired_ns = 0;
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
