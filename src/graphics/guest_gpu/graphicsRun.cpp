@@ -23,7 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <immintrin.h>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -385,6 +388,67 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+namespace {
+
+struct LabBlockedPoll {
+	using Clock = std::chrono::steady_clock;
+
+	bool                    log        = std::getenv("KYTY_LAB_BLOCKED_LOG") != nullptr;
+	int64_t                 spin_us    = 0;
+	bool                    in_episode = false;
+	Clock::time_point       episode_begin {};
+	Clock::time_point       window_begin = Clock::now();
+	uint64_t                episodes     = 0;
+	uint64_t                polls        = 0;
+	uint64_t                spins        = 0;
+	uint64_t                blocked_ns   = 0;
+	std::array<uint64_t, 7> histogram {};
+
+	LabBlockedPoll() {
+		if (const char* text = std::getenv("KYTY_LAB_BLOCKED_SPIN_US"); text != nullptr) {
+			spin_us = std::atoll(text);
+		}
+		LOGF("[lab-blocked] log=%d spin_us=%lld\n", log ? 1 : 0, static_cast<long long>(spin_us));
+	}
+
+	void EndEpisode() {
+		if (!in_episode) {
+			return;
+		}
+		in_episode     = false;
+		const auto now = Clock::now();
+		const auto ns =
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - episode_begin).count();
+		blocked_ns += static_cast<uint64_t>(ns);
+		static constexpr int64_t LIMITS_US[] = {200, 1000, 2000, 5000, 20000, 50000};
+		size_t                   bucket      = 0;
+		while (bucket < std::size(LIMITS_US) && ns / 1000 >= LIMITS_US[bucket]) {
+			bucket++;
+		}
+		histogram[bucket]++;
+		if (log && now - window_begin >= std::chrono::seconds(5)) {
+			const auto window_ms =
+			    std::chrono::duration_cast<std::chrono::milliseconds>(now - window_begin).count();
+			LOGF("[lab-blocked] window_ms=%lld episodes=%" PRIu64 " polls=%" PRIu64 " spins=%" PRIu64
+			     " blocked_ms=%" PRIu64 " hist_lt_0.2_1_2_5_20_50_ge50ms=%" PRIu64 ",%" PRIu64
+			     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+			     static_cast<long long>(window_ms), episodes, polls, spins, blocked_ns / 1000000u,
+			     histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], histogram[5],
+			     histogram[6]);
+			window_begin = now;
+			episodes = polls = spins = blocked_ns = 0;
+			histogram                             = {};
+		}
+	}
+};
+
+LabBlockedPoll& LabBlocked() {
+	static LabBlockedPoll lab;
+	return lab;
+}
+
+} // namespace
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -422,7 +486,25 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					auto&      lab = LabBlocked();
+					const auto now = LabBlockedPoll::Clock::now();
+					if (!lab.in_episode) {
+						lab.in_episode    = true;
+						lab.episode_begin = now;
+						lab.episodes++;
+					}
+					if (lab.spin_us > 0 &&
+					    now - lab.episode_begin < std::chrono::microseconds(lab.spin_us)) {
+						lab.spins++;
+						gpu->m_queue_mutex.Unlock();
+						for (int i = 0; i < 16; i++) {
+							_mm_pause();
+						}
+						gpu->m_queue_mutex.Lock();
+					} else {
+						lab.polls++;
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -466,6 +548,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (complete || submission.execution.MadeProgress()) {
+			LabBlocked().EndEpisode();
+		}
 		if (!complete) {
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
