@@ -9557,6 +9557,29 @@ void TestLaneMaskProjection() {
     const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
     const auto different_lane = thread_bit(e, active_mask, false);
     const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto bound_bit = [&](uint64_t lanes, U32 shift,
+                               uint32_t low_lanes = 32u) {
+      const auto prefix =
+          e.Emit(ValueOpcode::ShiftRightLogical64, {Value(lanes), shift});
+      const auto word = [&](uint32_t index) {
+        return U32(
+            e.Emit(ValueOpcode::CompositeExtractU64, {prefix, Value(index)}));
+      };
+      const auto in_low_word =
+          e.ULessThan(U32(e.Emit(ValueOpcode::LaneId)), U32(Value(low_lanes)));
+      return thread_bit(e, wave_size == 64u
+                               ? e.Select(in_low_word, word(0u), word(1u))
+                               : word(0u));
+    };
+    const auto negated_bound = e.ISub(zero, bound);
+    const auto bounded = bound_bit(UINT64_MAX, negated_bound);
+    const auto first_bound_uncovered =
+        bound_bit(UINT64_MAX >> 1u, e.ISub(bound, U32(Value(2u))));
+    const auto last_bound_uncovered = wave_size == 64u
+                                          ? mask_bit(UINT32_MAX, 0x7fffffffu)
+                                          : mask_bit(0x7fffffffu, 0u);
+    const auto wrong_word = bound_bit(UINT64_MAX, negated_bound, 31u);
     const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
     const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
     const auto initial_predicate = e.LogicalAnd(active, selected);
@@ -9596,6 +9619,15 @@ void TestLaneMaskProjection() {
           "constant EXEC mask retained lane extraction or register predication");
     Check(partial.Resolve().TryInstruction() != nullptr,
           "partial mask was incorrectly folded to a constant predicate");
+    Check(bounded.Resolve() == Value(true),
+          "a prefix mask of the lane bound still predicated a running lane");
+    Check(
+        first_bound_uncovered.Resolve().TryInstruction() != nullptr &&
+            last_bound_uncovered.Resolve().TryInstruction() != nullptr,
+        "a mask that misses one lane bound was taken as covering every bound");
+    Check(wave_size == 32u || wrong_word.Resolve().TryInstruction() != nullptr,
+          "wave64 lane bound projection accepted a word selected at the wrong "
+          "lane");
     if (wave_size == 32u) {
       Check(low_only.Resolve() == Value(true) && high_only.Resolve() == Value(false),
             "wave32 constant mask incorrectly consumed the high half");

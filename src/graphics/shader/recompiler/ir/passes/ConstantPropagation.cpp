@@ -883,7 +883,7 @@ private:
 				return [](uint64_t a, uint64_t b) { return a >> (b & 63u); };
 			case ValueOpcode::CompositeExtractU64:
 				return [](uint64_t a, uint64_t b) -> uint64_t {
-					return static_cast<uint32_t>(a >> (32u * (b & 1u)));
+					return static_cast<uint32_t>(b == 0u ? a : a >> 32u);
 				};
 			default: return nullptr;
 		}
