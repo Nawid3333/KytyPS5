@@ -2,6 +2,8 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
+#include <cstddef>
+#include <memory>
 
 #include <memory>
 #include <string>
@@ -47,6 +49,22 @@ public:
 
 private:
 	std::unique_ptr<ThreadPrivate> m_thread;
+};
+
+struct ThreadWithStackPrivate;
+
+class ThreadWithStack {
+public:
+	using func_t = void (*)(void*);
+	ThreadWithStack(func_t func, void* arg, size_t stack_size);
+	~ThreadWithStack();
+
+	void Join();
+
+	KYTY_CLASS_NO_COPY(ThreadWithStack);
+
+private:
+	std::unique_ptr<ThreadWithStackPrivate> m_thread;
 };
 
 class Mutex {
