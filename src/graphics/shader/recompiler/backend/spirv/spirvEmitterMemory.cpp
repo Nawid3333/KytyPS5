@@ -188,7 +188,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
 	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
 	// on negative links and would advance over zero entries forever.
-	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
+	const auto missing = ConstantU32(state, ~0u);
 	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
 		auto pointer = state.builder.AllocateId();
 		if (coherent) {
