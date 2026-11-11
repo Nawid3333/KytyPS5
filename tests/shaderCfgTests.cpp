@@ -36,6 +36,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13520,7 +13522,109 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+namespace {
+const uint32_t *g_lab_code_begin = nullptr;
+const uint32_t *g_lab_code_end = nullptr;
+
+bool LabReadProgramMemory(void *, uint64_t address, std::span<uint32_t> values) {
+  const auto begin = reinterpret_cast<uint64_t>(g_lab_code_begin);
+  const auto end = reinterpret_cast<uint64_t>(g_lab_code_end);
+  if (values.empty() || address < begin || address > end || values.size_bytes() > end - address) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
+void LabWrite(const std::string &path, const void *data, size_t bytes) {
+  std::FILE *file = std::fopen(path.c_str(), "wb");
+  if (file == nullptr) {
+    std::fprintf(stderr, "lab: cannot write %s\n", path.c_str());
+    std::exit(4);
+  }
+  std::fwrite(data, 1, bytes, file);
+  std::fclose(file);
+}
+
+int LabRecompile(char **argv) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+  std::signal(SIGSEGV, [](int) { std::_Exit(5); });
+  std::signal(SIGABRT, [](int) { std::_Exit(6); });
+  using namespace Libs::Graphics;
+  EnsureConfigInitialized();
+  const std::string stage_name = argv[3];
+  const auto stage = stage_name == "VS"   ? ShaderType::Vertex
+                     : stage_name == "PS" ? ShaderType::Pixel
+                     : stage_name == "CS" ? ShaderType::Compute
+                                          : ShaderType::Unknown;
+  if (stage == ShaderType::Unknown) {
+    std::printf("status=unsupported-stage\n");
+    return 3;
+  }
+  std::FILE *input = std::fopen(argv[2], "rb");
+  if (input == nullptr) {
+    return 4;
+  }
+  std::vector<uint32_t> code;
+  uint32_t word = 0;
+  while (std::fread(&word, sizeof(word), 1, input) == 1) {
+    code.push_back(word);
+  }
+  std::fclose(input);
+  g_lab_code_begin = code.data();
+  g_lab_code_end = code.data() + code.size();
+  auto options = MakeCompileOptions(stage);
+  options.wave_size = static_cast<uint32_t>(std::atoi(argv[4]));
+  options.emit_debug_info = false;
+  options.dump_ir = false;
+  const std::string out = argv[5];
+  const int repeat = std::atoi(argv[6]);
+  long long best = -1;
+  for (int run = 0; run < repeat; run++) {
+    const auto begin = std::chrono::steady_clock::now();
+    auto timed = ShaderRecompiler::TranslateProgram(code, options);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    best = best < 0 || elapsed < best ? elapsed : best;
+  }
+  std::printf("translate_us=%lld\n", best);
+  std::fflush(stdout);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  const auto ir_text = ShaderRecompiler::IR::ProgramToString(translated.program);
+  LabWrite(out + ".ir.txt", ir_text.data(), ir_text.size());
+  std::puts("step=plan");
+  std::fflush(stdout);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::puts("step=materialize");
+  std::fflush(stdout);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_specialization_memory = LabReadProgramMemory,
+  };
+  if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+    std::printf("status=ir\n");
+    return 0;
+  }
+  std::puts("step=compile");
+  std::fflush(stdout);
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0);
+  LabWrite(out + ".spv", compiled.spirv.data(), compiled.spirv.size() * sizeof(uint32_t));
+  CheckSpirvBinaryValidates(compiled.spirv);
+  std::printf("status=spirv\n");
+  return 0;
+}
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc == 7 && std::string(argv[1]) == "--lab-recompile") {
+    return LabRecompile(argv);
+  }
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
