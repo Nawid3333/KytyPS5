@@ -590,7 +590,9 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			LabDeviceFaultReport(result);
+			EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	return Status::Success;
 }
@@ -921,7 +923,9 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			LabDeviceFaultReport(result);
+			EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;
