@@ -415,6 +415,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	lab_fault.pNext                   = nullptr;
 	LOGF("[lab-fault] VK_EXT_device_fault: %s\n",
 	     lab_fault.deviceFault ? "enabled" : "not available");
+	const bool lab_markers = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+	LOGF("[lab-work] VK_AMD_buffer_marker: %s\n", lab_markers ? "enabled" : "not available");
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
@@ -659,6 +661,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
 	if (lab_fault.deviceFault) LabDeviceFaultEnable(device);
+	LabWorkEnable(physical_device, device, lab_markers);
 	return device;
 }
 

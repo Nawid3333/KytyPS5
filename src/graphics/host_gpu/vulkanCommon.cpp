@@ -4,7 +4,10 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <cinttypes>
 #include <iterator>
 #include <map>
@@ -168,6 +171,227 @@ void LabDeviceFaultOwner(uint64_t address, uint64_t precision) {
 
 } // namespace
 
+namespace {
+
+constexpr uint64_t kLabWorkSlots     = 8192;
+constexpr uint64_t kLabWorkContext   = 4;
+constexpr uint32_t kLabWorkMaxListed = 48;
+
+struct LabWork {
+	uint64_t        id        = 0;
+	uint64_t        tick      = 0;
+	uint64_t        hash0     = 0;
+	uint64_t        hash1     = 0;
+	uint32_t        arg0      = 0;
+	uint32_t        arg1      = 0;
+	uint32_t        arg2      = 0;
+	int64_t         ms        = 0;
+	VkCommandBuffer command   = VK_NULL_HANDLE;
+	VkSemaphore     semaphore = VK_NULL_HANDLE;
+	char            kind      = 0;
+};
+
+struct LabWorkDone {
+	VkSemaphore semaphore;
+	uint64_t    tick;
+};
+
+std::array<LabWork, kLabWorkSlots> g_lab_work {};
+uint64_t                           g_lab_work_next  = 1;
+uint64_t                           g_lab_work_floor = 1;
+std::vector<LabWorkDone>           g_lab_work_done;
+VkDevice                           g_lab_work_device   = VK_NULL_HANDLE;
+VkBuffer                           g_lab_marker_buffer = VK_NULL_HANDLE;
+const uint32_t*                    g_lab_marker_words  = nullptr;
+
+int64_t LabWorkNow() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void LabWorkMark(vk::CommandBuffer command, VkPipelineStageFlagBits stage, uint64_t id,
+                 uint32_t word) {
+	const auto write = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD;
+	if (g_lab_marker_buffer == VK_NULL_HANDLE || write == nullptr) return;
+	write(static_cast<VkCommandBuffer>(command), stage, g_lab_marker_buffer,
+	      ((id % kLabWorkSlots) * 2 + word) * sizeof(uint32_t), static_cast<uint32_t>(id));
+}
+
+uint64_t LabWorkDoneTick(VkSemaphore semaphore) {
+	for (const auto& done: g_lab_work_done) {
+		if (done.semaphore == semaphore) return done.tick;
+	}
+	return 0;
+}
+
+const char* LabWorkMarkerState(const LabWork& work) {
+	if (g_lab_marker_words == nullptr) return "off";
+	const auto slot = (work.id % kLabWorkSlots) * 2;
+	const auto id   = static_cast<uint32_t>(work.id);
+	if (g_lab_marker_words[slot + 1] == id) return "ended";
+	return g_lab_marker_words[slot] == id ? "begun" : "not-begun";
+}
+
+void LabWorkReport() {
+	const auto now = LabWorkNow();
+	for (size_t index = 0; index < g_lab_work_done.size(); ++index) {
+		auto&      done    = g_lab_work_done[index];
+		uint64_t   counter = 0;
+		const auto read    = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetSemaphoreCounterValue;
+		const auto status  = g_lab_work_device == VK_NULL_HANDLE || read == nullptr
+		                         ? VK_ERROR_UNKNOWN
+		                         : read(g_lab_work_device, done.semaphore, &counter);
+		LOGF("[lab-work] semaphore %zu: known_tick=%" PRIu64 " counter_read=%d counter=%" PRIu64 "\n",
+		     index, done.tick, static_cast<int>(status), counter);
+		if (status == VK_SUCCESS && counter > done.tick) done.tick = counter;
+	}
+	const auto first = g_lab_work_next > kLabWorkSlots ? g_lab_work_next - kLabWorkSlots : 1;
+	const auto is_open = [](const LabWork& work) {
+		return work.tick != 0 && work.tick > LabWorkDoneTick(work.semaphore);
+	};
+	const auto is_begun = [](const LabWork& work) {
+		return g_lab_marker_words != nullptr && g_lab_marker_words[(work.id % kLabWorkSlots) * 2] ==
+		                                            static_cast<uint32_t>(work.id) &&
+		       g_lab_marker_words[(work.id % kLabWorkSlots) * 2 + 1] != static_cast<uint32_t>(work.id);
+	};
+	uint64_t unsubmitted = 0;
+	uint64_t open_count  = 0;
+	uint64_t begun_count = 0;
+	uint64_t first_open  = g_lab_work_next;
+	for (auto id = first; id < g_lab_work_next; ++id) {
+		const auto& work = g_lab_work[id % kLabWorkSlots];
+		unsubmitted += work.tick == 0 ? 1 : 0;
+		open_count += is_open(work) ? 1 : 0;
+		begun_count += is_begun(work) ? 1 : 0;
+		if ((is_open(work) || is_begun(work)) && id < first_open) first_open = id;
+	}
+	LOGF("[lab-work] device lost; next_id=%" PRIu64 " markers=%s entries=%" PRIu64
+	     " unsubmitted=%" PRIu64 " open_by_tick=%" PRIu64 " begun_not_ended=%" PRIu64 "\n",
+	     g_lab_work_next, g_lab_marker_words != nullptr ? "on" : "off", g_lab_work_next - first,
+	     unsubmitted, open_count, begun_count);
+	uint32_t listed = 0;
+	uint64_t more   = 0;
+	for (auto id = std::max(first, first_open > kLabWorkContext ? first_open - kLabWorkContext : 1);
+	     id < g_lab_work_next; ++id) {
+		const auto& work = g_lab_work[id % kLabWorkSlots];
+		if (id >= first_open && !is_open(work) && !is_begun(work)) continue;
+		if (id >= first_open && listed >= kLabWorkMaxListed) {
+			++more;
+			continue;
+		}
+		listed += id >= first_open ? 1 : 0;
+		LOGF("[lab-work] id=%" PRIu64 " kind=%c tick=%" PRIu64 " state=%s marker=%s hashes=0x%016" PRIx64
+		     ",0x%016" PRIx64 " args=%u,%u,%u age_ms=%" PRId64 "\n",
+		     work.id, work.kind, work.tick,
+		     work.tick == 0 ? "unsubmitted" : is_open(work) ? "open" : "done", LabWorkMarkerState(work),
+		     work.hash0, work.hash1, work.arg0, work.arg1, work.arg2, now - work.ms);
+	}
+	if (more != 0) LOGF("[lab-work] ... and %" PRIu64 " more open entries\n", more);
+}
+
+} // namespace
+
+void LabWorkEnable(vk::PhysicalDevice physical_device, vk::Device device, bool markers) {
+	const auto& vk_api = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto  handle = static_cast<VkDevice>(device);
+	{
+		std::lock_guard lock(g_lab_fault_mutex);
+		g_lab_work_device = handle;
+	}
+	if (!markers) return;
+	VkBufferCreateInfo info {};
+	info.sType  = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.size   = kLabWorkSlots * 2 * sizeof(uint32_t);
+	info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	auto buffer = VkBuffer {VK_NULL_HANDLE};
+	if (vk_api.vkCreateBuffer(handle, &info, nullptr, &buffer) != VK_SUCCESS) return;
+	VkMemoryRequirements requirements {};
+	vk_api.vkGetBufferMemoryRequirements(handle, buffer, &requirements);
+	VkPhysicalDeviceMemoryProperties memory {};
+	vk_api.vkGetPhysicalDeviceMemoryProperties(static_cast<VkPhysicalDevice>(physical_device),
+	                                           &memory);
+	constexpr VkMemoryPropertyFlags wanted =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	for (uint32_t type = 0; type < memory.memoryTypeCount; ++type) {
+		if ((requirements.memoryTypeBits & (1u << type)) == 0 ||
+		    (memory.memoryTypes[type].propertyFlags & wanted) != wanted) {
+			continue;
+		}
+		VkMemoryAllocateInfo allocate {};
+		allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocate.allocationSize  = requirements.size;
+		allocate.memoryTypeIndex = type;
+		auto  block              = VkDeviceMemory {VK_NULL_HANDLE};
+		void* mapped             = nullptr;
+		if (vk_api.vkAllocateMemory(handle, &allocate, nullptr, &block) != VK_SUCCESS) continue;
+		if (vk_api.vkBindBufferMemory(handle, buffer, block, 0) != VK_SUCCESS ||
+		    vk_api.vkMapMemory(handle, block, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+			return;
+		}
+		std::memset(mapped, 0, static_cast<size_t>(info.size));
+		std::lock_guard lock(g_lab_fault_mutex);
+		g_lab_marker_buffer = buffer;
+		g_lab_marker_words  = static_cast<const uint32_t*>(mapped);
+		return;
+	}
+}
+
+uint64_t LabWorkBegin(vk::CommandBuffer command, char kind, uint64_t hash0, uint64_t hash1,
+                      uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	const auto      id = g_lab_work_next++;
+	auto&           work = g_lab_work[id % kLabWorkSlots];
+	work.id        = id;
+	work.tick      = 0;
+	work.hash0     = hash0;
+	work.hash1     = hash1;
+	work.arg0      = arg0;
+	work.arg1      = arg1;
+	work.arg2      = arg2;
+	work.ms        = LabWorkNow();
+	work.command   = static_cast<VkCommandBuffer>(command);
+	work.semaphore = VK_NULL_HANDLE;
+	work.kind      = kind;
+	LabWorkMark(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, id, 0);
+	return id;
+}
+
+void LabWorkEnd(vk::CommandBuffer command, uint64_t id) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	LabWorkMark(command,
+	            g_lab_work[id % kLabWorkSlots].kind == 'D' ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+	                                                       : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	            id, 1);
+}
+
+void LabWorkSubmitted(vk::CommandBuffer command, vk::Semaphore semaphore, uint64_t tick) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	const auto      first = g_lab_work_next > kLabWorkSlots ? g_lab_work_next - kLabWorkSlots : 1;
+	auto            floor = g_lab_work_next;
+	for (auto id = g_lab_work_next; id-- > std::max(first, g_lab_work_floor);) {
+		auto& work = g_lab_work[id % kLabWorkSlots];
+		if (work.tick != 0) continue;
+		if (work.command == static_cast<VkCommandBuffer>(command)) {
+			work.tick      = tick;
+			work.semaphore = static_cast<VkSemaphore>(semaphore);
+		} else {
+			floor = id;
+		}
+	}
+	g_lab_work_floor = floor;
+}
+
+void LabWorkCompleted(vk::Semaphore semaphore, uint64_t tick) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	for (auto& done: g_lab_work_done) {
+		if (done.semaphore != static_cast<VkSemaphore>(semaphore)) continue;
+		done.tick = std::max(done.tick, tick);
+		return;
+	}
+	g_lab_work_done.push_back({static_cast<VkSemaphore>(semaphore), tick});
+}
+
 void LabDeviceFaultEnable(vk::Device device) {
 	std::lock_guard lock(g_lab_fault_mutex);
 	g_lab_fault_device = device;
@@ -184,6 +408,7 @@ void LabDeviceFaultReport(vk::Result result) {
 	std::lock_guard lock(g_lab_fault_mutex);
 	if (g_lab_fault_reported) return;
 	g_lab_fault_reported = true;
+	LabWorkReport();
 	const auto query     = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
 	if (g_lab_fault_device == nullptr || query == nullptr) {
 		LOGF("[lab-fault] device lost; VK_EXT_device_fault is not enabled on this device\n");

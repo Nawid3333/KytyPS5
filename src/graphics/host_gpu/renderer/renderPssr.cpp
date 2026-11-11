@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -284,8 +285,12 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
 	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
 	                      0, sizeof(parameters), &parameters);
-	command.dispatch((parameters.output_size[0] + 7) / 8,
-	                 (parameters.output_size[1] + 7) / 8, 1);
+	{
+		const auto lab_work = LabWorkBegin(command, 'P', 0, 0, 200, 0, 0);
+		command.dispatch((parameters.output_size[0] + 7) / 8,
+		                 (parameters.output_size[1] + 7) / 8, 1);
+		LabWorkEnd(command, lab_work);
+	}
 	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
