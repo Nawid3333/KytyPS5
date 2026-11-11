@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <iterator>
@@ -174,6 +175,10 @@ void LabDeviceFaultOwner(uint64_t address, uint64_t precision) {
 namespace {
 
 constexpr uint64_t kLabWorkSlots     = 8192;
+constexpr uint64_t kLabWorkWords     = 4;
+constexpr uint32_t kLabWorkBegin     = 0;
+constexpr uint32_t kLabWorkBottom    = 1;
+constexpr uint32_t kLabWorkCompute   = 2;
 constexpr uint64_t kLabWorkContext   = 4;
 constexpr uint32_t kLabWorkMaxListed = 48;
 
@@ -215,7 +220,8 @@ void LabWorkMark(vk::CommandBuffer command, VkPipelineStageFlagBits stage, uint6
 	const auto write = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD;
 	if (g_lab_marker_buffer == VK_NULL_HANDLE || write == nullptr) return;
 	write(static_cast<VkCommandBuffer>(command), stage, g_lab_marker_buffer,
-	      ((id % kLabWorkSlots) * 2 + word) * sizeof(uint32_t), static_cast<uint32_t>(id));
+	      ((id % kLabWorkSlots) * kLabWorkWords + word) * sizeof(uint32_t),
+	      static_cast<uint32_t>(id));
 }
 
 uint64_t LabWorkDoneTick(VkSemaphore semaphore) {
@@ -227,10 +233,14 @@ uint64_t LabWorkDoneTick(VkSemaphore semaphore) {
 
 const char* LabWorkMarkerState(const LabWork& work) {
 	if (g_lab_marker_words == nullptr) return "off";
-	const auto slot = (work.id % kLabWorkSlots) * 2;
-	const auto id   = static_cast<uint32_t>(work.id);
-	if (g_lab_marker_words[slot + 1] == id) return "ended";
-	return g_lab_marker_words[slot] == id ? "begun" : "not-begun";
+	const auto* slot    = g_lab_marker_words + (work.id % kLabWorkSlots) * kLabWorkWords;
+	const auto  id      = static_cast<uint32_t>(work.id);
+	const bool  bottom  = slot[kLabWorkBottom] == id;
+	const bool  compute = slot[kLabWorkCompute] == id;
+	if (bottom && (compute || work.kind == 'D')) return "ended";
+	if (bottom) return "begun,bottom-only";
+	if (compute) return "begun,compute-only";
+	return slot[kLabWorkBegin] == id ? "begun" : "not-begun";
 }
 
 void LabWorkReport() {
@@ -250,11 +260,7 @@ void LabWorkReport() {
 	const auto is_open = [](const LabWork& work) {
 		return work.tick != 0 && work.tick > LabWorkDoneTick(work.semaphore);
 	};
-	const auto is_begun = [](const LabWork& work) {
-		return g_lab_marker_words != nullptr && g_lab_marker_words[(work.id % kLabWorkSlots) * 2] ==
-		                                            static_cast<uint32_t>(work.id) &&
-		       g_lab_marker_words[(work.id % kLabWorkSlots) * 2 + 1] != static_cast<uint32_t>(work.id);
-	};
+	const auto is_begun = [](const LabWork& work) { return LabWorkMarkerState(work)[0] == 'b'; };
 	uint64_t unsubmitted = 0;
 	uint64_t open_count  = 0;
 	uint64_t begun_count = 0;
@@ -290,6 +296,17 @@ void LabWorkReport() {
 	if (more != 0) LOGF("[lab-work] ... and %" PRIu64 " more open entries\n", more);
 }
 
+void LabWorkSelfTest() {
+	static const uint64_t wanted = [] {
+		const char* text = std::getenv("KYTY_LAB_WORK_SELFTEST");
+		return text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
+	}();
+	static uint64_t submits = 0;
+	if (wanted == 0 || ++submits != wanted) return;
+	LOGF("[lab-work] self-test report after %" PRIu64 " submits (no device loss)\n", submits);
+	LabWorkReport();
+}
+
 } // namespace
 
 void LabWorkEnable(vk::PhysicalDevice physical_device, vk::Device device, bool markers) {
@@ -302,7 +319,7 @@ void LabWorkEnable(vk::PhysicalDevice physical_device, vk::Device device, bool m
 	if (!markers) return;
 	VkBufferCreateInfo info {};
 	info.sType  = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	info.size   = kLabWorkSlots * 2 * sizeof(uint32_t);
+	info.size   = kLabWorkSlots * kLabWorkWords * sizeof(uint32_t);
 	info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	auto buffer = VkBuffer {VK_NULL_HANDLE};
 	if (vk_api.vkCreateBuffer(handle, &info, nullptr, &buffer) != VK_SUCCESS) return;
@@ -353,16 +370,16 @@ uint64_t LabWorkBegin(vk::CommandBuffer command, char kind, uint64_t hash0, uint
 	work.command   = static_cast<VkCommandBuffer>(command);
 	work.semaphore = VK_NULL_HANDLE;
 	work.kind      = kind;
-	LabWorkMark(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, id, 0);
+	LabWorkMark(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, id, kLabWorkBegin);
 	return id;
 }
 
 void LabWorkEnd(vk::CommandBuffer command, uint64_t id) {
 	std::lock_guard lock(g_lab_fault_mutex);
-	LabWorkMark(command,
-	            g_lab_work[id % kLabWorkSlots].kind == 'D' ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
-	                                                       : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	            id, 1);
+	LabWorkMark(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, id, kLabWorkBottom);
+	if (g_lab_work[id % kLabWorkSlots].kind != 'D') {
+		LabWorkMark(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, id, kLabWorkCompute);
+	}
 }
 
 void LabWorkSubmitted(vk::CommandBuffer command, vk::Semaphore semaphore, uint64_t tick) {
@@ -380,6 +397,7 @@ void LabWorkSubmitted(vk::CommandBuffer command, vk::Semaphore semaphore, uint64
 		}
 	}
 	g_lab_work_floor = floor;
+	LabWorkSelfTest();
 }
 
 void LabWorkCompleted(vk::Semaphore semaphore, uint64_t tick) {
