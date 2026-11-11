@@ -112,7 +112,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher ^
+          cmake --build _Build/windows --target launcher launcher_cmd_command_tests launcher_cmd_command_old_tests ^
             audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
@@ -124,6 +124,16 @@ jobs:
       - name: Test
         shell: cmd
         run: |
+          for /f "delims=" %%f in ('where /r _Build\windows launcher_cmd_command_tests.exe') do set LAB_NEW=%%f
+          for /f "delims=" %%f in ('where /r _Build\windows launcher_cmd_command_old_tests.exe') do set LAB_OLD=%%f
+          echo lab: fix build of the test: %LAB_NEW%
+          "%LAB_NEW%"
+          if errorlevel 1 (echo lab: the test FAILED on the fix& exit /b 1)
+          echo lab: the test passed on the fix
+          echo lab: old command construction: %LAB_OLD%
+          "%LAB_OLD%"
+          if not errorlevel 1 (echo lab: the test PASSED on the old construction& exit /b 1)
+          echo lab: the test failed on the old construction, as expected
           ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
 
       - name: Install

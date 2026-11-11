@@ -2,6 +2,7 @@
 #define CMD_COMMAND_H
 
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 
@@ -31,6 +32,14 @@ inline QString CrtQuotedContent(const QString& value) {
 
 inline std::optional<CmdLaunch> CmdCommand(const QStringList& tokens, bool close_on_clean_exit,
                                            QProcessEnvironment environment) {
+#ifdef KYTY_LAB_OLD_CMD_COMMAND
+	static const QRegularExpression quote_or_end(QStringLiteral(R"((\\*)("|\z))"));
+	auto quoted = tokens;
+	quoted.replaceInStrings(quote_or_end, QStringLiteral(R"(\1\1\2\2)"));
+	return CmdLaunch {QStringLiteral("/K \"\"") + quoted.join(QStringLiteral("\" \"")) +
+	                      (close_on_clean_exit ? "\" && exit\"" : "\"\""),
+	                  environment};
+#endif
 	constexpr qsizetype separator_and_quotes = 3;
 	QStringList         references;
 	qsizetype           expanded_arguments = 0;
