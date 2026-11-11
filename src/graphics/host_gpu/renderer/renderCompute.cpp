@@ -219,11 +219,24 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
 	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
 	const auto&        flat = stage.resources->flattened_srt;
+	constexpr bool               lab_backing = true;
+	static std::atomic<uint32_t> lab_logged {0};
 	for (const auto [low, high]: stage.module->info.info.address_bases) {
-		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+		const auto base       = flat[low] | uint64_t {flat[high]} << 32u;
+		uint32_t   lab_mapped = 0;
+		uint32_t   lab_cached = 0;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * Page;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (!context.IsMapped(page, 1)) continue;
+			lab_mapped |= 1u << index;
+			if (context.GetBufferCache().IsRegionRegistered(page, 1)) lab_cached |= 1u << index;
+			if (lab_backing) (void)context.GetBufferCache().FindBuffer(page, 1);
+		}
+		if (lab_mapped != lab_cached && lab_logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+			LOGF("[lab-bases] shader=0x%016" PRIx64 " slots=%u,%u flat=%zu base=0x%016" PRIx64
+			     " mapped=%u cached_before=%u backing=%d\n",
+			     stage.module->info.shader_hash, low, high, flat.size(), base, lab_mapped, lab_cached,
+			     lab_backing ? 1 : 0);
 		}
 	}
 }
