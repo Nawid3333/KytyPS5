@@ -651,16 +651,18 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		auto index = DwordIndex(ctx, inst, mem);
-		if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-			// Keep region-address truncation local to DS atomics.
-			index = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), index,
-			               ConstantU32(ctx.state, 0x3fffu));
-		}
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+		return EmitBufferAccess(ctx, inst, mem, 1u,
+		    [&](const IR::MemoryInfo& selected, const MemoryResourceAccess& resource) {
+			    if (resource.object_pointer == 0u) return ConstantU32(ctx.state, 0u);
+			    auto index = DwordIndex(ctx, inst, selected);
+			    if (selected.kind == IR::ResourceKind::Lds || selected.kind == IR::ResourceKind::Gds) {
+				    index = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), index,
+				                   ConstantU32(ctx.state, 0x3fffu));
+			    }
+			    return EmitValueOrZeroIfCondition(
+			        ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+				        return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+			        });
 		    });
 	});
 }

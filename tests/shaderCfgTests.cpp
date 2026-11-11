@@ -7184,6 +7184,44 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   }
 }
 
+void TestBufferAtomicOnPhiOfTwoDescriptors() {
+  constexpr uint32_t no_offset_register = 125u << 25u;
+  constexpr uint32_t first_descriptor_offset = 16u;
+  constexpr uint32_t second_descriptor_offset = 32u;
+  constexpr uint32_t s_load_dwordx4_s20_from_s0 = EncodeSmem0(0x02, 20, 0);
+  constexpr uint32_t s_cmpk_gt_u32_s2_0xffff = 0xb582ffffu;
+  constexpr uint32_t s_cbranch_scc0_over_second_load = EncodeSopp(0x04, 2);
+  constexpr uint32_t s20_descriptor = 20u / 4u;
+  constexpr uint32_t op_atomic_iadd = 234u;
+  const uint32_t shader[] = {
+      s_load_dwordx4_s20_from_s0, no_offset_register | first_descriptor_offset,
+      s_cmpk_gt_u32_s2_0xffff,
+      s_cbranch_scc0_over_second_load,
+      s_load_dwordx4_s20_from_s0, no_offset_register | second_descriptor_offset,
+      EncodeMubuf0(0x32, 0, false), EncodeMubuf1(0, s20_descriptor, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> table{};
+  table[first_descriptor_offset / 4u] = 0x2000u;
+  table[first_descriptor_offset / 4u + 2u] = 4u;
+  table[second_descriptor_offset / 4u] = 0x3000u;
+  table[second_descriptor_offset / 4u + 2u] = 4u;
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(table_address),
+                                          static_cast<uint32_t>(table_address >> 32u), 0u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  const auto &buffers = result.program.info.buffers;
+  Check(!result.program.info.uses_dma && buffers.size() == 2u,
+        "atomic on a Phi of two descriptors did not bind both buffers");
+  Check(std::ranges::all_of(buffers, [](const auto &buffer) { return buffer.atomic; }),
+        "a buffer chosen by the Phi is not tracked as atomically written");
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd) >= 1u,
+        "atomic on a Phi of two descriptors emitted no native atomic");
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -13643,6 +13681,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+  TestBufferAtomicOnPhiOfTwoDescriptors();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
   TestOrderedPsDoneEndsProgram();
