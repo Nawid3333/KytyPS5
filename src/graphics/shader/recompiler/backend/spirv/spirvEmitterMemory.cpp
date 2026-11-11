@@ -1372,6 +1372,19 @@ void DefineGetBdaPointer(EmitterState& state) {
 	    Binary(state, spv::OpISub, type, address,
 	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
 	    address);
+	const auto lab_lower = Binary(state, spv::OpULessThan, TypeBool(state), address,
+	                              ConstantU64(state, LOWER_ADDRESS_SIZE));
+	const auto lab_inside =
+	    Binary(state, spv::OpULessThan, TypeBool(state), packed,
+	           ConstantU64(state, LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize));
+	const auto lab_valid =
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), lab_lower,
+	           Binary(state, spv::OpLogicalAnd, TypeBool(state), extended, lab_inside));
+	const auto lab_lookup_label = state.builder.AllocateId();
+	const auto lab_done_label   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, lab_done_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, lab_valid, lab_lookup_label, lab_done_label);
+	EmitLabel(state, lab_lookup_label);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
@@ -1399,9 +1412,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
+	const auto lab_found = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, type, lab_found, ConstantU64(state, 0), fault_label,
 	                          available, available_label);
+	state.builder.AddFunction(spv::OpBranch, lab_done_label);
+	EmitLabel(state, lab_done_label);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), entry_label,
+	                          lab_found, merge_label);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
