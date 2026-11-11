@@ -32,6 +32,10 @@
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
 #include "SrtWalkerTestMemory.h"
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -11470,6 +11474,36 @@ void TestGpuProducedWritableDescriptor() {
   const auto check = [&](uint32_t low, uint32_t high, uint32_t count, uint32_t reads_expected) {
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "GPU-produced direct writable descriptor was rejected");
+    std::fprintf(stderr, "[diag] want=%08x %08x %08x 00016204 reads_expected=%u reads=%u buffers=%zu captured=%zu\n",
+                 low, high, count, reads_expected, reads.count, snapshot.buffers.size(),
+                 snapshot.specialization_reads.size());
+    if (!snapshot.buffers.empty()) {
+      const auto &d = snapshot.buffers[0].dwords;
+      std::fprintf(stderr, "[diag] got =%08x %08x %08x %08x\n", d[0], d[1], d[2], d[3]);
+    }
+#if defined(__APPLE__)
+    {
+      mach_vm_address_t region = 0x300315028ull;
+      mach_vm_size_t bytes = 0;
+      vm_region_basic_info_data_64_t info{};
+      mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t object = MACH_PORT_NULL;
+      const auto kr = mach_vm_region(mach_task_self(), &region, &bytes, VM_REGION_BASIC_INFO_64,
+                                     reinterpret_cast<vm_region_info_t>(&info), &info_count, &object);
+      const bool readable = kr == KERN_SUCCESS && region <= 0x300315028ull &&
+                            0x300315078ull - region <= bytes && (info.protection & VM_PROT_READ) != 0;
+      std::fprintf(stderr, "[diag] vm kr=%d region=%llx bytes=%llx prot=%x covers_fake_address_readable=%d\n", kr,
+                   static_cast<unsigned long long>(region), static_cast<unsigned long long>(bytes),
+                   info.protection, readable ? 1 : 0);
+      if (readable) {
+        std::fprintf(stderr, "[diag] words at the fake addresses: %08x %08x %08x\n",
+                     *reinterpret_cast<const uint32_t *>(0x300315028ull),
+                     *reinterpret_cast<const uint32_t *>(0x30031502cull),
+                     *reinterpret_cast<const uint32_t *>(0x300315074ull));
+      }
+    }
+#endif
+    std::fflush(stderr);
     Check(snapshot.buffers.size() == 1 &&
               snapshot.buffers[0].dwords[0] == low &&
               snapshot.buffers[0].dwords[1] == high &&
