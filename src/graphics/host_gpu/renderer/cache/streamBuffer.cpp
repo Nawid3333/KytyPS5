@@ -94,6 +94,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		LabDeviceFaultTrack(m_device_address, size, cpu_address, static_cast<int>(usage), true);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -107,6 +108,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		if (m_device_address != 0) {
+			LabDeviceFaultTrack(m_device_address, m_size, m_cpu_address,
+			                    static_cast<int>(m_usage), false);
+		}
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
