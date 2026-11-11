@@ -59,6 +59,7 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	void               LabBackMappedWindow(uint64_t begin, uint64_t end);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -95,6 +96,8 @@ private:
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
 };
+
+extern RenderContext* g_lab_render_context;
 
 } // namespace Libs::Graphics
 

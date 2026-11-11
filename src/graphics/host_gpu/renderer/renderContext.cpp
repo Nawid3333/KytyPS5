@@ -1,11 +1,15 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -17,6 +21,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_lab_render_context = this;
 }
 
 RenderContext::~RenderContext() {
@@ -147,6 +152,28 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+RenderContext* g_lab_render_context = nullptr;
+
+void RenderContext::LabBackMappedWindow(uint64_t begin, uint64_t end) {
+	static std::atomic<uint32_t> lab_logged {0};
+	std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+			pieces.emplace_back(start, finish - start);
+		});
+	}
+	uint64_t bytes = 0;
+	for (const auto& [start, size]: pieces) {
+		(void)m_buffer_cache.FindBuffer(start, size);
+		bytes += size;
+	}
+	if (!pieces.empty() && lab_logged.fetch_add(1, std::memory_order_relaxed) < 300) {
+		LOGF("[lab-wide] window=0x%016" PRIx64 " mapped_bytes=0x%" PRIx64 " pieces=%zu\n", begin, bytes,
+		     pieces.size());
+	}
 }
 
 void RenderContext::PrepareBda() {

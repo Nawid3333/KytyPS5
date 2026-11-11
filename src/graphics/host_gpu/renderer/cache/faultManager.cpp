@@ -5,6 +5,7 @@
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -144,6 +145,11 @@ void FaultManager::ProcessFaultBuffer() {
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
+			constexpr uint64_t lab_window = 32ull << 20u;
+			if (start != 0 && g_lab_render_context != nullptr) {
+				g_lab_render_context->LabBackMappedWindow(
+				    start & ~(lab_window - 1), (end + lab_window - 1) & ~(lab_window - 1));
+			}
 		});
 		m_fault_areas[area] = 0;
 	});
