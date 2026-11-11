@@ -338,6 +338,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		LabDeviceFaultReport(result);
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
