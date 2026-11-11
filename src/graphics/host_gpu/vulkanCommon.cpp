@@ -144,10 +144,12 @@ void LabDeviceFaultLine(const char* where, uint64_t address, uint64_t start,
 	     range.alive ? "alive" : "destroyed");
 }
 
-void LabDeviceFaultOwner(uint64_t address) {
-	bool found = false;
+void LabDeviceFaultOwner(uint64_t address, uint64_t precision) {
+	const auto low   = address & ~(precision - 1);
+	const auto high  = low + precision < low ? UINT64_MAX : low + precision;
+	bool       found = false;
 	for (const auto& [start, range]: g_lab_fault_ranges) {
-		if (address < start || address - start >= range.size) continue;
+		if (start >= high || start + range.size <= low) continue;
 		found = true;
 		LabDeviceFaultLine("in buffer", address, start, range);
 	}
@@ -209,7 +211,8 @@ void LabDeviceFaultReport(vk::Result result) {
 		return;
 	}
 	info.description[VK_MAX_DESCRIPTION_SIZE - 1] = 0;
-	LOGF("[lab-fault] description: %s\n", info.description);
+	LOGF("[lab-fault] description: %s%s\n", info.description,
+	     status == VK_INCOMPLETE ? " (incomplete)" : "");
 	for (uint32_t index = 0; index < counts.addressInfoCount && index < addresses.size(); ++index) {
 		const auto& fault = addresses[index];
 		LOGF("[lab-fault] address %u: type=%s reported=0x%016" PRIx64 " precision=0x%" PRIx64 "\n",
@@ -217,7 +220,8 @@ void LabDeviceFaultReport(vk::Result result) {
 		     vk::to_string(static_cast<vk::DeviceFaultAddressTypeEXT>(fault.addressType)).c_str(),
 		     static_cast<uint64_t>(fault.reportedAddress),
 		     static_cast<uint64_t>(fault.addressPrecision));
-		LabDeviceFaultOwner(fault.reportedAddress);
+		LabDeviceFaultOwner(fault.reportedAddress,
+		                    fault.addressPrecision == 0 ? 1 : fault.addressPrecision);
 	}
 	for (uint32_t index = 0; index < counts.vendorInfoCount && index < vendors.size(); ++index) {
 		auto& vendor = vendors[index];
