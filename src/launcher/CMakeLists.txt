@@ -53,6 +53,12 @@ if(WIN32)
 	)
 	target_link_libraries(launcher_cmd_command_tests Qt6::Core)
 	target_include_directories(launcher_cmd_command_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+	add_executable(launcher_cmd_command_old_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/LauncherCmdCommandTests.cpp"
+	)
+	target_link_libraries(launcher_cmd_command_old_tests Qt6::Core)
+	target_include_directories(launcher_cmd_command_old_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+	target_compile_definitions(launcher_cmd_command_old_tests PRIVATE KYTY_LAB_OLD_CMD_COMMAND)
 endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
