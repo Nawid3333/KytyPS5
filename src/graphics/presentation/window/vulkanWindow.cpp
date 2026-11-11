@@ -404,6 +404,17 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       image_atomic_int64, conditional_rendering, barycentric] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT lab_fault {};
+	if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 lab_features {};
+		lab_features.pNext = &lab_fault;
+		physical_device.getFeatures2(&lab_features);
+		if (lab_fault.deviceFault) add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	}
+	lab_fault.deviceFaultVendorBinary = VK_FALSE;
+	lab_fault.pNext                   = nullptr;
+	LOGF("[lab-fault] VK_EXT_device_fault: %s\n",
+	     lab_fault.deviceFault ? "enabled" : "not available");
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
@@ -640,9 +651,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
 	}
 
+	if (lab_fault.deviceFault) {
+		lab_fault.pNext    = const_cast<void*>(create.get().pNext);
+		create.get().pNext = &lab_fault;
+	}
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
+	if (lab_fault.deviceFault) LabDeviceFaultEnable(device);
 	return device;
 }
 

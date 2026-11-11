@@ -22,7 +22,8 @@ constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
-      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+                     AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
                      BufferCache::CACHING_NUMPAGES / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {

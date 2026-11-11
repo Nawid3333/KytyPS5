@@ -26,6 +26,10 @@ namespace Libs::Graphics {
 
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
+void        LabDeviceFaultEnable(vk::Device device);
+void        LabDeviceFaultTrack(uint64_t device_address, uint64_t size, uint64_t guest,
+                                int usage, bool alive);
+void        LabDeviceFaultReport(vk::Result result);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
                                        vk::PipelineLayout layout, const char* operation);

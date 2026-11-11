@@ -1,9 +1,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cinttypes>
+#include <iterator>
+#include <map>
+#include <mutex>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -116,8 +121,116 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 	return index < kFormatLookup.size() ? kFormatLookup[index] : vk::Format::eUndefined;
 }
 
+namespace {
+
+struct LabFaultRange {
+	uint64_t size;
+	uint64_t guest;
+	int      usage;
+	bool     alive;
+};
+
+std::mutex                        g_lab_fault_mutex;
+std::map<uint64_t, LabFaultRange> g_lab_fault_ranges;
+vk::Device                        g_lab_fault_device   = nullptr;
+bool                              g_lab_fault_reported = false;
+
+void LabDeviceFaultLine(const char* where, uint64_t address, uint64_t start,
+                        const LabFaultRange& range) {
+	LOGF("[lab-fault]   %s va=0x%016" PRIx64 " size=0x%" PRIx64 " offset=%s0x%" PRIx64
+	     " guest=0x%016" PRIx64 " usage=%d %s\n",
+	     where, start, range.size, address < start ? "-" : "",
+	     address < start ? start - address : address - start, range.guest, range.usage,
+	     range.alive ? "alive" : "destroyed");
+}
+
+void LabDeviceFaultOwner(uint64_t address) {
+	bool found = false;
+	for (const auto& [start, range]: g_lab_fault_ranges) {
+		if (address < start || address - start >= range.size) continue;
+		found = true;
+		LabDeviceFaultLine("in buffer", address, start, range);
+	}
+	if (found) return;
+	const auto above = g_lab_fault_ranges.upper_bound(address);
+	if (above != g_lab_fault_ranges.begin()) {
+		const auto below = std::prev(above);
+		LabDeviceFaultLine("in no tracked buffer; below it:", address, below->first,
+		                   below->second);
+	}
+	if (above != g_lab_fault_ranges.end()) {
+		LabDeviceFaultLine("in no tracked buffer; above it:", address, above->first,
+		                   above->second);
+	}
+}
+
+} // namespace
+
+void LabDeviceFaultEnable(vk::Device device) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	g_lab_fault_device = device;
+}
+
+void LabDeviceFaultTrack(uint64_t device_address, uint64_t size, uint64_t guest, int usage,
+                         bool alive) {
+	std::lock_guard lock(g_lab_fault_mutex);
+	g_lab_fault_ranges[device_address] = {size, guest, usage, alive};
+}
+
+void LabDeviceFaultReport(vk::Result result) {
+	if (result != vk::Result::eErrorDeviceLost) return;
+	std::lock_guard lock(g_lab_fault_mutex);
+	if (g_lab_fault_reported) return;
+	g_lab_fault_reported = true;
+	const auto query     = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+	if (g_lab_fault_device == nullptr || query == nullptr) {
+		LOGF("[lab-fault] device lost; VK_EXT_device_fault is not enabled on this device\n");
+		return;
+	}
+	const auto             device = static_cast<VkDevice>(g_lab_fault_device);
+	VkDeviceFaultCountsEXT counts {};
+	counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+	auto status  = query(device, &counts, nullptr);
+	LOGF("[lab-fault] device lost; status=%d addresses=%u vendor_infos=%u vendor_binary=%" PRIu64
+	     " tracked_buffers=%zu\n",
+	     static_cast<int>(status), counts.addressInfoCount, counts.vendorInfoCount,
+	     static_cast<uint64_t>(counts.vendorBinarySize), g_lab_fault_ranges.size());
+	if (status != VK_SUCCESS) return;
+	counts.vendorBinarySize = 0;
+	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	VkDeviceFaultInfoEXT                     info {};
+	info.sType         = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+	info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+	info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
+	status             = query(device, &counts, &info);
+	if (status != VK_SUCCESS && status != VK_INCOMPLETE) {
+		LOGF("[lab-fault] fault info query failed: %d\n", static_cast<int>(status));
+		return;
+	}
+	info.description[VK_MAX_DESCRIPTION_SIZE - 1] = 0;
+	LOGF("[lab-fault] description: %s\n", info.description);
+	for (uint32_t index = 0; index < counts.addressInfoCount && index < addresses.size(); ++index) {
+		const auto& fault = addresses[index];
+		LOGF("[lab-fault] address %u: type=%s reported=0x%016" PRIx64 " precision=0x%" PRIx64 "\n",
+		     index,
+		     vk::to_string(static_cast<vk::DeviceFaultAddressTypeEXT>(fault.addressType)).c_str(),
+		     static_cast<uint64_t>(fault.reportedAddress),
+		     static_cast<uint64_t>(fault.addressPrecision));
+		LabDeviceFaultOwner(fault.reportedAddress);
+	}
+	for (uint32_t index = 0; index < counts.vendorInfoCount && index < vendors.size(); ++index) {
+		auto& vendor = vendors[index];
+		vendor.description[VK_MAX_DESCRIPTION_SIZE - 1] = 0;
+		LOGF("[lab-fault] vendor %u: %s code=0x%" PRIx64 " data=0x%" PRIx64 "\n", index,
+		     vendor.description, static_cast<uint64_t>(vendor.vendorFaultCode),
+		     static_cast<uint64_t>(vendor.vendorFaultData));
+	}
+}
+
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
+		LabDeviceFaultReport(result);
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}
