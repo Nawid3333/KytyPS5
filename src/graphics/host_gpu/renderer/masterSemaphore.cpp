@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -27,6 +28,7 @@ void MasterSemaphore::Refresh() {
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	LabDeviceFaultReport(result);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	LabWorkCompleted(m_semaphore, counter);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&

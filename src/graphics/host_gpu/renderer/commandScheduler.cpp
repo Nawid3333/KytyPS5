@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -316,6 +317,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
+		LabWorkSubmitted(buffer, m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;

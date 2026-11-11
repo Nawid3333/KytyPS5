@@ -30,6 +30,12 @@ void        LabDeviceFaultEnable(vk::Device device);
 void        LabDeviceFaultTrack(uint64_t device_address, uint64_t size, uint64_t guest,
                                 int usage, bool alive);
 void        LabDeviceFaultReport(vk::Result result);
+void        LabWorkEnable(vk::PhysicalDevice physical_device, vk::Device device, bool markers);
+uint64_t    LabWorkBegin(vk::CommandBuffer command, char kind, uint64_t hash0, uint64_t hash1,
+                         uint32_t arg0, uint32_t arg1, uint32_t arg2);
+void        LabWorkEnd(vk::CommandBuffer command, uint64_t id);
+void        LabWorkSubmitted(vk::CommandBuffer command, vk::Semaphore semaphore, uint64_t tick);
+void        LabWorkCompleted(vk::Semaphore semaphore, uint64_t tick);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
                                        vk::PipelineLayout layout, const char* operation);

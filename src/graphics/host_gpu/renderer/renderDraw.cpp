@@ -1213,6 +1213,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const auto lab_work = LabWorkBegin(
+	    vk_buffer, 'D', vertex_stages.back().stage.module->info.shader_hash,
+	    state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0u, draw.index_count,
+	    draw.instance_count,
+	    (draw.indexed ? 1u : 0u) | (args_buffer.first != nullptr ? 2u : 0u) |
+	        (mesh_active ? 4u : 0u));
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1226,6 +1232,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
 	}
+	LabWorkEnd(vk_buffer, lab_work);
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
