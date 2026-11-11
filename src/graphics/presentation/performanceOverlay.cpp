@@ -20,6 +20,8 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <array>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -743,6 +745,87 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 	}
 }
 
+// LAB: frame pacing every 10 s of flips ([LAB fps]); needs the overlay counters on (--perf-overlay).
+// [LAB hitch]: one line per frame interval > 100 ms (cap 2000 lines per run). Every field is a
+// Common::DebugCounters delta since the PREVIOUS flip; the snapshot is refreshed at EVERY flip, so
+// a line covers exactly that frame. The flip hook returns early when the counters are off, so runs
+// without --perf-overlay produce neither [LAB fps] nor [LAB hitch] lines.
+struct LabFrameLog {
+	using Cnt    = Common::DebugCounters::Counter;
+	using Totals = std::array<uint64_t, static_cast<size_t>(Cnt::Count)>;
+	Clock::time_point  first {};
+	Clock::time_point  start {};
+	Clock::time_point  last {};
+	std::vector<float> intervals;
+	Totals             snap {};
+	uint64_t           draws0  = 0;
+	size_t             printed = 0;
+	void Flip(Clock::time_point now) {
+		if (first == Clock::time_point {}) {
+			first  = now;
+			start  = now;
+			last   = now;
+			snap   = ReadCounters();
+			draws0 = snap[static_cast<size_t>(Cnt::Draws)];
+			return;
+		}
+		const float ms = std::chrono::duration<float, std::milli>(now - last).count();
+		last             = now;
+		const Totals cur = ReadCounters();
+		if (ms > 100.0f && printed < 2000) {
+			printed++;
+			const auto delta = [&](Cnt c) {
+				return static_cast<double>(cur[static_cast<size_t>(c)] - snap[static_cast<size_t>(c)]);
+			};
+			const auto ms_of = [&](Cnt c) { return delta(c) / 1e6; };
+			const auto cnt   = [&](Cnt c) { return static_cast<unsigned long long>(delta(c)); };
+			const double upload_kb =
+			    (delta(Cnt::TextureUploadBytes) + delta(Cnt::BufferUploadBytes)) / 1024.0;
+			std::printf("[LAB hitch] t=%.1f ms=%.1f gpu_wait_ms=%.1f compile_ms=%.1f compiles=%llu "
+			            "pipeline_ms=%.1f pipelines=%llu meta_readback_ms=%.1f gpu_busy_ms=%.1f "
+			            "present_ms=%.1f upload_kb=%.1f faults=%llu draws=%llu file_read_kb=%.1f\n",
+			            std::chrono::duration<double>(now - first).count(), static_cast<double>(ms),
+			            ms_of(Cnt::GpuWaitNs), ms_of(Cnt::ShaderCompileNs), cnt(Cnt::ShadersCompiled),
+			            ms_of(Cnt::PipelineCreateNs), cnt(Cnt::PipelinesCreated),
+			            ms_of(Cnt::ColorMetadataReadbackNs), ms_of(Cnt::GpuThreadBusyNs),
+			            ms_of(Cnt::PresentNs), upload_kb, cnt(Cnt::GpuFaults), cnt(Cnt::Draws),
+			            delta(Cnt::GuestFileReadBytes) / 1024.0);
+			std::fflush(stdout);
+		}
+		snap = cur;
+		intervals.push_back(ms);
+		const double seconds = std::chrono::duration<double>(now - start).count();
+		if (seconds < 10.0) {
+			return;
+		}
+		std::vector<float> sorted = intervals;
+		std::sort(sorted.begin(), sorted.end());
+		const auto at = [&](double q) {
+			return sorted[std::min(sorted.size() - 1, static_cast<size_t>(q * static_cast<double>(sorted.size())))];
+		};
+		double sum = 0.0;
+		size_t hitches = 0;
+		double excess = 0.0;
+		for (const float interval: intervals) {
+			sum += interval;
+			if (interval > 100.0f) {
+				hitches++;
+				excess += interval - 100.0;
+			}
+		}
+		const uint64_t draws = Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws);
+		std::printf("[LAB fps] fps=%.2f mean_ms=%.2f p50_ms=%.2f p99_ms=%.2f max_ms=%.2f flips=%zu seconds=%.1f draws_per_flip=%.0f hitches=%zu excess_ms=%.1f\n",
+		            static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
+		            static_cast<double>(at(0.5)), static_cast<double>(at(0.99)), static_cast<double>(sorted.back()),
+		            intervals.size(), seconds,
+		            static_cast<double>(draws - draws0) / static_cast<double>(intervals.size()), hitches, excess);
+		intervals.clear();
+		start  = now;
+		draws0 = draws;
+	}
+};
+LabFrameLog g_lab_fps;
+
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
@@ -750,7 +833,9 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
-	g_frames.Record(Clock::now(), ReadCounters());
+	const auto now = Clock::now();
+	g_frames.Record(now, ReadCounters());
+	g_lab_fps.Flip(now);
 	g_frames.guest_width  = guest_width;
 	g_frames.guest_height = guest_height;
 }
