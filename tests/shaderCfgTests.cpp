@@ -7211,15 +7211,19 @@ void TestBufferAtomicOnPhiOfTwoDescriptors() {
                                           static_cast<uint32_t>(table_address >> 32u), 0u, 0u};
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
-  const auto result = RecompileForTest(shader, options);
-  const auto &buffers = result.program.info.buffers;
-  Check(!result.program.info.uses_dma && buffers.size() == 2u,
-        "atomic on a Phi of two descriptors did not bind both buffers");
-  Check(std::ranges::all_of(buffers, [](const auto &buffer) { return buffer.atomic; }),
-        "a buffer chosen by the Phi is not tracked as atomically written");
-  CheckSpirvBinaryValidates(result.spirv);
-  Check(SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd) >= 1u,
-        "atomic on a Phi of two descriptors emitted no native atomic");
+  for (const uint32_t second_stride : {0u, 4u}) {
+    table[second_descriptor_offset / 4u + 1u] = second_stride << 16u;
+    const auto result = RecompileForTest(shader, options);
+    const auto &buffers = result.program.info.buffers;
+    Check(!result.program.info.uses_dma && buffers.size() == 2u,
+          "atomic on a Phi of two descriptors did not bind both buffers");
+    Check(std::ranges::all_of(buffers, [](const auto &buffer) { return buffer.atomic; }),
+          "a buffer chosen by the Phi is not tracked as atomically written");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto atomics = SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd);
+    Check(second_stride == 0u ? atomics >= 1u : atomics == 2u,
+          "atomic on a Phi of two descriptors does not act on the chosen buffer");
+  }
 }
 
 void TestCapturedBufferAtomicsX2() {

@@ -298,14 +298,9 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	    std::invoke_result_t<Fn, const IR::MemoryInfo&, const MemoryResourceAccess&>>;
 	const auto access = [&](uint32_t resource) {
 		mem.resource = resource;
-		if (mem.kind == IR::ResourceKind::Buffer) {
-			const auto& buffer = state.program.info.buffers[resource];
-			if (buffer.packed_stride == 0u &&
-			    buffer.source < state.program.descriptor_sources.size() &&
-			    state.program.descriptor_sources[buffer.source].indirect_descriptor) {
-				// Empty candidates still carry the format/swizzle needed for OOB loads.
-				return emit(mem, MemoryResourceAccess{});
-			}
+		if (mem.kind == IR::ResourceKind::Buffer && EmptyIndirectBufferCandidate(state, resource)) {
+			// Empty candidates still carry the format/swizzle needed for OOB loads.
+			return emit(mem, MemoryResourceAccess{});
 		}
 		return emit(mem, PrepareMemoryResourceAccess(state, mem));
 	};
@@ -319,7 +314,7 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto selected = ctx.Arg(handle, 0);
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	const auto empty_root = shared && EmptyIndirectBufferCandidate(state, root_resource);
 	const auto selected_access = [&]() {
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
