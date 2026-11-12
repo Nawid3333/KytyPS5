@@ -875,6 +875,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
+		if (state.profile.maximal_reconvergence) {
+			state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
+		}
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}

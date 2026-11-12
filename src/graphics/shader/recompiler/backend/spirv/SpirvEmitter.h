@@ -22,6 +22,7 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	bool maximal_reconvergence = false;
 };
 
 inline constexpr Profile DefaultProfile {};

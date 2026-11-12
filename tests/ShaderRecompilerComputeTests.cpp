@@ -1436,6 +1436,7 @@ constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 constexpr ShaderProfile SrgbViewProfile{
     .maintenance8 = true, .r8_srgb_views = true, .r8g8_srgb_views = true};
 constexpr ShaderProfile RelaxedFloatProfile{.maintenance8 = true, .relaxed_float = true};
+ShaderProfile g_fragment_profile = Maintenance8Profile;
 
 struct TestCase {
   const char *name = "";
@@ -1522,6 +1523,9 @@ struct GraphicsCase {
   u32 width = 1;
   std::vector<u32> object_ids;
   std::vector<u32> gds_initial;
+  std::vector<std::vector<u32>> sampled_image_rgba_mips;
+  u32 image_width = 1;
+  u32 image_height = 1;
 };
 
 struct CompiledShader {
@@ -2030,7 +2034,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
-  options.profile = &Maintenance8Profile;
+  options.profile = &g_fragment_profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -2054,6 +2058,13 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
+  if (const char *dir = std::getenv("KYTY_LAB_DUMP_SPV")) {
+    const auto path = std::string(dir) + "/" + test.name + ".spv";
+    if (FILE *file = std::fopen(path.c_str(), "wb")) {
+      std::fwrite(result.spirv.data(), sizeof(u32), result.spirv.size(), file);
+      std::fclose(file);
+    }
+  }
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.info.user_data_registers) {
     packed_user_data.push_back(
@@ -21988,37 +21999,71 @@ public:
 
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const bool uses_gds = !test.gds_initial.empty();
+    const bool uses_texture = !test.sampled_image_rgba_mips.empty();
     const auto gds_bit = uint64_t{1} << static_cast<u32>(Kind::Gds);
-    Require(test.name, "graphics", fragment_bind.descriptor_mask == (uses_gds ? gds_bit : 0u),
-            "a graphics case binds GDS only, and only with initial GDS data");
+    Require(test.name, "graphics",
+            (fragment_bind.descriptor_mask & gds_bit) == (uses_gds ? gds_bit : 0u) &&
+                ((fragment_bind.descriptor_mask & ~gds_bit) != 0) == uses_texture,
+            "a graphics case binds GDS only with initial GDS data, images only with a texture");
     Buffer gds_buffer;
     vk::DescriptorBufferInfo gds_info{};
-    vk::WriteDescriptorSet gds_write{};
-    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    Image texture;
+    vk::Sampler sampler = nullptr;
     if (uses_gds) {
       gds_buffer = CreateStorageBuffer(test.name, test.gds_initial, test.gds_initial.size());
       gds_info = {gds_buffer.buffer, 0, gds_buffer.size};
-      const vk::DescriptorSetLayoutBinding binding{
-          ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds),
-          vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eFragment};
+    }
+    if (uses_texture) {
+      texture = CreateImageMips(test.name, test.image_width, test.image_height,
+                                vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eSampled,
+                                test.sampled_image_rgba_mips, 4,
+                                vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+                                vk::ImageViewType::e2D, 1);
+      sampler = CreateSampler(test.name, texture.mip_levels);
+    }
+    std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+    std::vector<std::vector<vk::DescriptorImageInfo>> descriptor_images;
+    std::vector<vk::WriteDescriptorSet> descriptor_writes;
+    for (auto mask = fragment_bind.descriptor_mask; mask != 0; mask &= mask - 1) {
+      const auto index = std::countr_zero(mask);
+      const auto kind = static_cast<Kind>(index);
+      const auto type = NativeDescriptorType(kind);
+      Require(test.name, "graphics",
+              kind == Kind::Gds || type == vk::DescriptorType::eSampledImage ||
+                  type == vk::DescriptorType::eSampler,
+              "a graphics case binds GDS, sampled images and samplers only");
+      const auto count = fragment_bind.descriptor_counts[index];
+      descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, kind),
+                                     type, count, vk::ShaderStageFlagBits::eFragment});
+      vk::WriteDescriptorSet write{};
+      write.sType = vk::StructureType::eWriteDescriptorSet;
+      write.dstBinding = descriptor_bindings.back().binding;
+      write.descriptorCount = count;
+      write.descriptorType = type;
+      if (kind == Kind::Gds) {
+        write.pBufferInfo = &gds_info;
+      } else {
+        auto &infos = descriptor_images.emplace_back(
+            count, vk::DescriptorImageInfo{sampler, texture.view, texture.layout});
+        write.pImageInfo = infos.data();
+      }
+      descriptor_writes.push_back(write);
+    }
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    if (!descriptor_bindings.empty()) {
       vk::DescriptorSetLayoutCreateInfo layout_info{};
       layout_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
       layout_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-      layout_info.bindingCount = 1;
-      layout_info.pBindings = &binding;
+      layout_info.bindingCount = static_cast<u32>(descriptor_bindings.size());
+      layout_info.pBindings = descriptor_bindings.data();
       RequireVk(test.name, "graphics",
                 m_device.createDescriptorSetLayout(&layout_info, nullptr, &descriptor_layout),
                 "vkCreateDescriptorSetLayout");
-      gds_write.sType = vk::StructureType::eWriteDescriptorSet;
-      gds_write.dstBinding = binding.binding;
-      gds_write.descriptorCount = 1;
-      gds_write.descriptorType = vk::DescriptorType::eStorageBuffer;
-      gds_write.pBufferInfo = &gds_info;
     }
 
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
-    pipeline_layout_info.setLayoutCount = uses_gds ? 1u : 0u;
+    pipeline_layout_info.setLayoutCount = descriptor_layout ? 1u : 0u;
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
     pipeline_layout_info.pushConstantRangeCount =
         push_constant_range.size != 0 ? 1u : 0u;
@@ -22176,9 +22221,10 @@ public:
       }
       cmd.beginRendering(rendering);
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-      if (uses_gds) {
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1,
-                                 &gds_write);
+      if (!descriptor_writes.empty()) {
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0,
+                                 static_cast<u32>(descriptor_writes.size()),
+                                 descriptor_writes.data());
       }
       if (push_constant_range.size != 0) {
         ShaderRecompiler::IR::PushData push_data;
@@ -22209,6 +22255,8 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     DestroyBuffer(&gds_buffer);
+    DestroyImage(&texture);
+    if (sampler) m_device.destroySampler(sampler, nullptr);
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
@@ -23510,6 +23558,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic = true;
+  bool m_reconvergence = false;
   bool m_robust_pipelines = true;
   u32   m_skipped_cases          = 0;
   u32   m_skipped_compute_cases  = 0;
@@ -23558,7 +23608,8 @@ private:
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+        m_runtime_context.attachment_feedback_loop_enabled =
+        m_rasterization_supported && m_feedback_dynamic;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23714,8 +23765,10 @@ private:
     available_pipeline_robustness.pNext = &available_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
     available_robustness2.pNext = &available_pipeline_robustness;
+    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR available_reconvergence{};
+    available_reconvergence.pNext = &available_robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
-    available_mesh.pNext = &available_robustness2;
+    available_mesh.pNext = &available_reconvergence;
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR available_acceleration_structure{};
     available_acceleration_structure.pNext = &available_mesh;
     vk::PhysicalDeviceRayQueryFeaturesKHR available_ray_query{};
@@ -23816,8 +23869,13 @@ private:
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
+    m_feedback_dynamic = available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
+    m_reconvergence = available_reconvergence.shaderMaximalReconvergence &&
+                      std::getenv("KYTY_LAB_NO_RECONVERGENCE") == nullptr;
+    g_fragment_profile.maximal_reconvergence = m_reconvergence;
+    m_runtime_context.maximal_reconvergence_enabled = m_reconvergence;
+    std::printf("[host]    MaximalReconvergence      %s\n", m_reconvergence ? "on" : "off");
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -23875,7 +23933,8 @@ private:
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.pNext = m_feedback_dynamic ? static_cast<void *>(&feedback_dynamic)
+                                                  : static_cast<void *>(&feedback_layout);
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -23901,7 +23960,11 @@ private:
     conditional_rendering.pNext = &robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
-    mesh.pNext = &conditional_rendering;
+    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR reconvergence{};
+    reconvergence.shaderMaximalReconvergence = true;
+    reconvergence.pNext = &conditional_rendering;
+    mesh.pNext = m_reconvergence ? static_cast<void *>(&reconvergence)
+                                 : static_cast<void *>(&conditional_rendering);
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure{};
     acceleration_structure.accelerationStructure = true;
     acceleration_structure.pNext = &mesh;
@@ -23942,12 +24005,17 @@ private:
     if (m_robust_pipelines) {
       device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     }
+    if (m_reconvergence) {
+      device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -48468,6 +48536,102 @@ GraphicsCase GraphicsDsOrderedCountSkipsHelperLanes() {
   return test;
 }
 
+GraphicsCase GraphicsWqmImplicitLod(bool branch, bool coords_in_branch, bool lod1) {
+  using O = ShaderOpcode;
+
+  constexpr u32 exec = 126;
+  constexpr u32 vcc = 106;
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x0a, exec, exec));
+  auto interpolate = [&] {
+    code.push_back(EncodeVintrp(0x00, 2, 0, 0, 0));
+    code.push_back(EncodeVintrp(0x01, 2, 0, 0, 1));
+    code.push_back(EncodeVintrp(0x00, 3, 0, 1, 0));
+    code.push_back(EncodeVintrp(0x01, 3, 0, 1, 1));
+  };
+  if (!coords_in_branch) interpolate();
+  if (branch) {
+    code.push_back(EncodeVop1(0x01, 8, InlineU32(0)));
+    code.push_back(EncodeVopc(0xc2, InlineU32(0), 8));
+    code.push_back(EncodeSop1(0x24, 20, vcc));
+  }
+  if (coords_in_branch) interpolate();
+  code.push_back(EncodeMimg0(0x20, 0xf));
+  code.push_back(EncodeMimg1(4, 2));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(4, 5, 6, 7));
+  AppendEnd(&code);
+
+  constexpr u32 one = 0x3f800000u;
+  constexpr u32 two = 0x40000000u;
+  std::vector<u32> mip0(4 * 4 * 4, 0);
+  std::vector<u32> mip1(2 * 2 * 4, 0);
+  for (size_t i = 0; i < mip0.size(); i += 4) mip0[i] = one;
+  for (size_t i = 0; i < mip1.size(); i += 4) mip1[i] = two;
+
+  const u32 u_far = lod1 ? 0x3fc00000u : 0x3f400000u;
+  const u32 v_low = lod1 ? 0xbe800000u : 0xbe000000u;
+  const u32 v_high = lod1 ? 0x3f400000u : 0x3ec00000u;
+
+  static std::string names[8];
+  auto &name = names[(branch ? 4 : 0) + (coords_in_branch ? 2 : 0) + (lod1 ? 1 : 0)];
+  name = std::string("GraphicsWqmImplicitLod") + (branch ? "Branch" : "") +
+         (coords_in_branch ? "CoordsIn" : "") + (lod1 ? "Mip1" : "Mip0");
+  GraphicsCase test;
+  test.name = name.c_str();
+  test.fragment_code = std::move(code);
+  CoverOnePixelOfQuad(&test);
+  test.gds_initial.clear();
+  test.vertices = {0x00000000u, 0xbf800000u, 0, v_low, 0, 0,
+                   0x40400000u, 0xbf800000u, u_far, v_low, 0, 0,
+                   0x00000000u, 0x40400000u, 0, v_high, 0, 0};
+  test.sampled_image_rgba_mips = {mip0, mip1};
+  test.image_width = 4;
+  test.image_height = 4;
+  test.expected_pixel = {0, 0, 0, 0, lod1 ? two : one, 0, 0, 0};
+  test.opcodes = {O::S_WQM_B64, O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_MOV_B32,
+                  O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64, O::IMAGE_SAMPLE, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
+GraphicsCase GraphicsWqmHelpersJoinCompareMasks() {
+  using O = ShaderOpcode;
+
+  constexpr u32 exec = 126;
+  constexpr u32 vcc = 106;
+  constexpr u32 one = 242;
+  constexpr u32 dpp = 250;
+  constexpr u32 quad_lane0 = 0x000;
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x0a, exec, exec));
+  code.push_back(EncodeSop1(0x10, 0, exec));
+  code.push_back(EncodeVop1(0x01, 8, InlineU32(0)));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 8));
+  code.push_back(EncodeSop1(0x10, 1, vcc));
+  code.push_back(EncodeSop1(0x24, 2, vcc));
+  code.push_back(EncodeSop1(0x10, 4, exec));
+  code.push_back(EncodeVop1(0x01, 9, one));
+  code.push_back(EncodeVop1(0x01, 10, dpp));
+  code.push_back(EncodeVop1Dpp(9, quad_lane0));
+  code.push_back(EncodeVop1(0x06, 4, 0));
+  code.push_back(EncodeVop1(0x06, 5, 1));
+  code.push_back(EncodeVop1(0x06, 6, 4));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(4, 5, 6, 10));
+  AppendEnd(&code);
+
+  constexpr u32 four = 0x40800000u;
+  GraphicsCase test;
+  test.name = "GraphicsWqmHelpersJoinCompareMasks";
+  test.fragment_code = std::move(code);
+  CoverOnePixelOfQuad(&test);
+  test.gds_initial.clear();
+  test.expected_pixel = {0, 0, 0, 0, four, four, four, 0x3f800000u};
+  test.opcodes = {O::S_WQM_B64, O::S_BCNT1_I32_B64, O::V_MOV_B32, O::V_CMP_EQ_U32,
+                  O::S_AND_SAVEEXEC_B64, O::V_CVT_F32_U32, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
 
@@ -56069,6 +56233,26 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--helper-lod-only") == 0) {
+    VulkanHarness vulkan;
+    int failed = 0;
+    for (const bool branch : {false, true})
+      for (const bool coords_in_branch : {false, true})
+        for (const bool lod1 : {false, true}) {
+          if (!branch && coords_in_branch) continue;
+          const auto test = GraphicsWqmImplicitLod(branch, coords_in_branch, lod1);
+          const auto compiled = CompileFragmentCase(test);
+          const auto actual = vulkan.RenderFragment(test, compiled);
+          const bool pass = actual == test.expected_pixel;
+          failed += pass ? 0 : 1;
+          std::printf("[helper-lod] %-44s %s pixel1 = %08x %08x %08x %08x\n", test.name,
+                      pass ? "PASS" : "FAIL", actual.size() > 4 ? actual[4] : 0u,
+                      actual.size() > 5 ? actual[5] : 0u, actual.size() > 6 ? actual[6] : 0u,
+                      actual.size() > 7 ? actual[7] : 0u);
+        }
+    std::printf("[helper-lod] done, %d failed\n", failed);
+    return failed;
   }
   if (argc == 2 && std::strcmp(argv[1], "--helper-lanes-only") == 0) {
     VulkanHarness vulkan;
