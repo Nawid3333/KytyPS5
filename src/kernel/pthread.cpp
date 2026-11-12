@@ -509,25 +509,6 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-static void SleepMicroWithSignalPoll(uint64_t microseconds) {
-	if (microseconds == 0) {
-		KernelDispatchPendingSignalForCurrentThread();
-		return;
-	}
-	std::optional<Common::DebugCounters::ScopedTimer> lab_short_sleep;
-	if (microseconds < 500) {
-		lab_short_sleep.emplace(Common::DebugCounters::Counter::GuestShortSleeps,
-		                        Common::DebugCounters::Counter::GuestShortSleepNs);
-	}
-
-	while (microseconds > 0) {
-		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
-		microseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
-}
-
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -538,6 +519,18 @@ static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 		lab_short_sleep.emplace(Common::DebugCounters::Counter::GuestShortSleeps,
 		                        Common::DebugCounters::Counter::GuestShortSleepNs);
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t host_timer_floor_nanos = 500000;
+	if (nanoseconds < host_timer_floor_nanos) {
+		const auto deadline =
+		    std::chrono::steady_clock::now() + std::chrono::nanoseconds(nanoseconds);
+		do {
+			SchedulerBackoffOnce();
+		} while (std::chrono::steady_clock::now() < deadline);
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+#endif
 
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
 	while (nanoseconds > 0) {
@@ -3866,12 +3859,12 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	SleepMicroWithSignalPoll(microseconds);
+	SleepNanoWithSignalPoll(uint64_t {microseconds} * 1000);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
+	SleepNanoWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000000ull);
 	return OK;
 }
 
