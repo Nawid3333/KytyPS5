@@ -292,6 +292,34 @@ void TestPendingSignalDispatch() {
   Check(remove(30) == OK, "remove signal handler");
 }
 
+void TestShortSleeps() {
+  using namespace Libs::LibKernel;
+  using Clock = std::chrono::steady_clock;
+  using GuestSleep = int (*)();
+  constexpr int calls = 101;
+  constexpr int max_runs = 10;
+  constexpr auto requested = std::chrono::microseconds(1);
+  constexpr auto short_sleep_bound = std::chrono::microseconds(100);
+  static const KernelTimespec requested_spec {0, 1000};
+  const std::array<GuestSleep, 2> short_sleeps {
+      [] { return KernelUsleep(1); }, [] { return KernelNanosleep(&requested_spec, nullptr); }};
+  for (const auto sleep : short_sleeps) {
+    auto median = Clock::duration::max();
+    for (int run = 0; run < max_runs && median >= short_sleep_bound; ++run) {
+      std::array<Clock::duration, calls> took {};
+      for (auto &call : took) {
+        const auto start = Clock::now();
+        Check(sleep() == OK, "a 1 us guest sleep succeeds");
+        call = Clock::now() - start;
+        Check(call >= requested, "a 1 us guest sleep lasts at least 1 us");
+      }
+      std::nth_element(took.begin(), took.begin() + calls / 2, took.end());
+      median = took[calls / 2];
+    }
+    Check(median < short_sleep_bound, "most 1 us guest sleeps return within 100 us");
+  }
+}
+
 class TempDirectory {
 public:
   TempDirectory() {
@@ -2902,6 +2930,13 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (argc == 2 && std::string_view(argv[1]) == "--sleep-only") {
+    TestShortSleeps();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: sleep cases passed\n");
+    return 0;
+  }
+
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   TestPendingSignalDispatch();
@@ -2910,6 +2945,7 @@ int main(int argc, char** argv) {
     std::printf("KernelFileSystemTests: mutex cases passed\n");
     return 0;
   }
+  TestShortSleeps();
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
