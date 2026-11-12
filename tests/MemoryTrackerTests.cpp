@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -1055,6 +1056,106 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+std::chrono::nanoseconds CurrentThreadCpuTime() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  FILETIME created{}, exited{}, kernel{}, user{};
+  Check(GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) !=
+            0,
+        "GetThreadTimes failed");
+  const auto kernel_ticks =
+      (uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime;
+  const auto user_ticks =
+      (uint64_t{user.dwHighDateTime} << 32) | user.dwLowDateTime;
+  constexpr uint64_t nanoseconds_per_tick = 100;
+  return std::chrono::nanoseconds((kernel_ticks + user_ticks) *
+                                  nanoseconds_per_tick);
+#else
+  timespec value{};
+  Check(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0,
+        "clock_gettime failed");
+  return std::chrono::seconds(value.tv_sec) +
+         std::chrono::nanoseconds(value.tv_nsec);
+#endif
+}
+
+void TestTrackingLockWaiterSleeps() {
+  constexpr auto hold_time = std::chrono::milliseconds(500);
+  constexpr auto waiter_cpu_limit = std::chrono::milliseconds(100);
+  constexpr auto timeout = std::chrono::seconds(30);
+  constexpr int attempts = 5;
+  bool waited_through_the_hold = false;
+  for (int attempt = 0; attempt < attempts && !waited_through_the_hold;
+       ++attempt) {
+    Libs::Graphics::TrackingSpinLock lock;
+    std::binary_semaphore waiting{0};
+    std::binary_semaphore finished{0};
+    std::chrono::nanoseconds waiter_cpu_time{};
+    std::chrono::steady_clock::duration waited{};
+    uint32_t guarded = 0;
+    uint32_t seen = 0;
+    lock.lock();
+    std::thread waiter([&] {
+      const auto cpu_begin = CurrentThreadCpuTime();
+      const auto begin = std::chrono::steady_clock::now();
+      waiting.release();
+      lock.lock();
+      waited = std::chrono::steady_clock::now() - begin;
+      waiter_cpu_time = CurrentThreadCpuTime() - cpu_begin;
+      seen = guarded;
+      lock.unlock();
+      finished.release();
+    });
+    Check(waiting.try_acquire_for(timeout),
+          "tracking lock waiter did not start");
+    std::this_thread::sleep_for(hold_time);
+    Check(!finished.try_acquire(), "tracking lock waiter entered a held lock");
+    guarded = 1;
+    lock.unlock();
+    Check(finished.try_acquire_for(timeout),
+          "tracking lock waiter was not woken by the unlock");
+    waiter.join();
+    Check(seen == 1, "tracking lock waiter did not see the holder's write");
+    Check(waiter_cpu_time < waiter_cpu_limit,
+          "tracking lock waiter used CPU time while the holder kept the lock");
+    waited_through_the_hold = waited >= hold_time / 2;
+  }
+  Check(waited_through_the_hold,
+        "tracking lock waiter never waited for the holder");
+}
+
+void TestTrackingLockContention() {
+  constexpr int thread_count = 8;
+  constexpr uint32_t iterations = 20000;
+  constexpr uint32_t yield_interval = 64;
+  constexpr auto timeout = std::chrono::seconds(60);
+  Libs::Graphics::TrackingSpinLock lock;
+  std::counting_semaphore<thread_count> finished{0};
+  std::vector<std::thread> workers;
+  uint64_t counter = 0;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (int thread = 0; thread < thread_count; ++thread) {
+    workers.emplace_back([&] {
+      for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        std::scoped_lock guard(lock);
+        ++counter;
+        if (iteration % yield_interval == 0) {
+          std::this_thread::yield();
+        }
+      }
+      finished.release();
+    });
+  }
+  for (int thread = 0; thread < thread_count; ++thread) {
+    Check(finished.try_acquire_until(deadline),
+          "tracking lock contention did not finish");
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  Check(counter == uint64_t{thread_count} * iterations,
+        "tracking lock lost an update under contention");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1243,6 +1344,8 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestTrackingLockWaiterSleeps();
+  TestTrackingLockContention();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
