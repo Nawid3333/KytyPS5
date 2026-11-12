@@ -1082,11 +1082,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto                 indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	const Pm4::LoadedRegisters registers {indirect_buffer, buffer[2]};
+	Lab::TraceRegList("cp SET_SH_REG_INDIRECT", buffer - 1, 5, indirect_address, indirect_num_dw,
+	                  nullptr, false);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++) {
 		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = registers.Value(i);
+
+		if ((cmd_offset != Pm4::SH_NOP && raw_cmd_offset != 0xffffffffu) &&
+		    (cmd_offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset] == nullptr)) {
+			Lab::TraceRegList("cp SET_SH_REG_INDIRECT FAILING", buffer - 1, 5, indirect_address,
+			                  indirect_num_dw, nullptr, true);
+		}
 
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;

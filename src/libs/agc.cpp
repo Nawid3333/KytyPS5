@@ -2305,6 +2305,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 	auto vaddr = reinterpret_cast<uint64_t>(regs);
 
 	reg_indirect_write_packet(cmd, vaddr, num_regs, RegIndirectPacket::Sh);
+	Lab::TraceRegList("AgcDcbSetShRegistersIndirect", cmd, RegIndirectPacketSizeDw, vaddr, num_regs,
+	                  __builtin_return_address(0), false);
 
 	return cmd;
 }
