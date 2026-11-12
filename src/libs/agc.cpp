@@ -1,4 +1,5 @@
 #include "libs/agc.h"
+#include "graphics/guest_gpu/command_processor/labWriteDataTrace.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -1474,6 +1475,8 @@ int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t ad
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
 	if (op == Pm4::IT_WRITE_DATA) {
+		Lab::TraceWriteData("AgcWriteDataPatchSetAddressOrOffset", cmd[1], address_or_offset, 0,
+		                    nullptr, __builtin_return_address(0));
 		cmd[2] = static_cast<uint32_t>(address_or_offset & 0xffffffffu);
 		cmd[3] = static_cast<uint32_t>((address_or_offset >> 32u) & 0xffffffffu);
 		return OK;
@@ -3242,6 +3245,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 	cmd[2] = static_cast<uint32_t>(address_or_offset);
 	cmd[3] = static_cast<uint32_t>(address_or_offset >> 32u);
+	Lab::TraceWriteData("AgcAcbWriteData", cmd[1], address_or_offset, num_dwords,
+	                    static_cast<const uint32_t*>(data), __builtin_return_address(0));
 
 	memcpy(cmd + 4, data, static_cast<size_t>(num_dwords) * 4u);
 
@@ -3683,6 +3688,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 	cmd[2] = static_cast<uint32_t>(address_or_offset) & ~0x3u;
 	cmd[3] = static_cast<uint32_t>(address_or_offset >> 32u);
+	Lab::TraceWriteData("AgcDcbWriteData", cmd[1], address_or_offset, num_dwords,
+	                    static_cast<const uint32_t*>(data), __builtin_return_address(0));
 
 	memcpy(cmd + 4, data, static_cast<size_t>(num_dwords) * 4);
 

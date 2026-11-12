@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/labWriteDataTrace.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1391,6 +1392,8 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	Lab::TraceWriteData("cp WRITE_DATA", write_control, reinterpret_cast<uint64_t>(dst), dw_num - 2,
+	                    buffer + 3, buffer - 1);
 	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
 
 	return 1 + dw_num;
