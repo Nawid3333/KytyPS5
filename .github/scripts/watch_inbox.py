@@ -94,7 +94,7 @@ class Api:
 
     def _note_rate(self, headers):
         value = headers.get("X-RateLimit-Remaining") if headers else None
-        if value is not None:
+        if value is not None and (headers.get("X-RateLimit-Resource") or "core") == "core":
             self.remaining = int(value)
 
     def get(self, path, params=None):
@@ -276,7 +276,8 @@ def inbox_body(since, state, calls):
     text = (
         "Fork-only. `.github/workflows/watch-inbox.yml` posts one comment here whenever "
         f"{UPSTREAM} has new comments, reviews or PR state changes on threads listed in "
-        f"`.github/watch-threads.txt`, on {USER}'s open issues and PRs, or that mention {USER}."
+        f"`.github/watch-threads.txt`, on {USER}'s open issues and PRs, on threads {USER} "
+        f"commented on, or that mention {USER}."
     )
     if since:
         text += f"\n\nLast check: window up to {since.replace('T', ' ').rstrip('Z')} UTC, {calls} API calls."
@@ -292,6 +293,7 @@ class Collector:
         self.api, self.since, self.until, self.watch = api, since, until, watch
         self.threads = {}
         self.events = []
+        self.participated = None
 
     def in_window(self, stamp):
         return stamp is not None and self.since <= parse_ts(stamp) < self.until
@@ -312,8 +314,22 @@ class Collector:
             self.remember(self.api.get(f"/repos/{UPSTREAM}/issues/{number}"))
         return self.threads[number]
 
+    def participated_threads(self):
+        """Threads USER has commented on that changed in the window (one search call)."""
+        if self.participated is None:
+            query = f"repo:{UPSTREAM} commenter:{USER} updated:>={iso(self.since)}"
+            try:
+                items = self.api.get("/search/issues", {"q": query, "per_page": 100})["items"]
+            except RuntimeError as err:
+                print(f"::warning::commenter search failed, watching without it: {err}")
+                items = []
+            self.participated = {item["number"] for item in items}
+        return self.participated
+
     def wanted(self, number, body):
         if number in self.watch or MENTION_RE.search(body or ""):
+            return True
+        if number in self.participated_threads():
             return True
         info = self.thread(number)
         return info["open"] and same_user(info["author"])
