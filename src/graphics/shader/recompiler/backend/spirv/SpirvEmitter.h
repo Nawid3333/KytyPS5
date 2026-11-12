@@ -23,6 +23,7 @@ struct Profile {
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
 	bool maximal_reconvergence = false;
+	bool require_full_quads   = false;
 };
 
 inline constexpr Profile DefaultProfile {};

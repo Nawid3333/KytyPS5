@@ -23560,6 +23560,7 @@ private:
   bool m_rasterization_supported = true;
   bool m_feedback_dynamic = true;
   bool m_reconvergence = false;
+  bool m_full_quads = false;
   bool m_robust_pipelines = true;
   u32   m_skipped_cases          = 0;
   u32   m_skipped_compute_cases  = 0;
@@ -23765,8 +23766,10 @@ private:
     available_pipeline_robustness.pNext = &available_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
     available_robustness2.pNext = &available_pipeline_robustness;
+    vk::PhysicalDeviceShaderQuadControlFeaturesKHR available_quad_control{};
+    available_quad_control.pNext = &available_robustness2;
     vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR available_reconvergence{};
-    available_reconvergence.pNext = &available_robustness2;
+    available_reconvergence.pNext = &available_quad_control;
     vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
     available_mesh.pNext = &available_reconvergence;
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR available_acceleration_structure{};
@@ -23876,6 +23879,10 @@ private:
     g_fragment_profile.maximal_reconvergence = m_reconvergence;
     m_runtime_context.maximal_reconvergence_enabled = m_reconvergence;
     std::printf("[host]    MaximalReconvergence      %s\n", m_reconvergence ? "on" : "off");
+    m_full_quads = available_quad_control.shaderQuadControl &&
+                   std::getenv("KYTY_LAB_FULL_QUADS") != nullptr;
+    g_fragment_profile.require_full_quads = m_full_quads;
+    std::printf("[host]    RequireFullQuads          %s\n", m_full_quads ? "on" : "off");
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -23943,7 +23950,8 @@ private:
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
-    maintenance8.maintenance8 = true;
+    const bool small_device = std::getenv("KYTY_LAB_SMALL_DEVICE") != nullptr;
+    maintenance8.maintenance8 = !small_device;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
     shader_clock.shaderDeviceClock = true;
     shader_clock.pNext = &min_lod;
@@ -23959,11 +23967,16 @@ private:
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
-    mesh.meshShader = mesh.taskShader = true;
+    mesh.meshShader = mesh.taskShader = !small_device;
     vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR reconvergence{};
     reconvergence.shaderMaximalReconvergence = true;
-    reconvergence.pNext = &conditional_rendering;
+    vk::PhysicalDeviceShaderQuadControlFeaturesKHR quad_control{};
+    quad_control.shaderQuadControl = true;
+    quad_control.pNext = &conditional_rendering;
+    reconvergence.pNext = m_full_quads ? static_cast<void *>(&quad_control)
+                                       : static_cast<void *>(&conditional_rendering);
     mesh.pNext = m_reconvergence ? static_cast<void *>(&reconvergence)
+                 : m_full_quads  ? static_cast<void *>(&quad_control)
                                  : static_cast<void *>(&conditional_rendering);
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure{};
     acceleration_structure.accelerationStructure = true;
@@ -24002,11 +24015,20 @@ private:
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    if (small_device) {
+      std::erase_if(device_extensions, [](const char *name) {
+        return std::strcmp(name, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0 ||
+               std::strcmp(name, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0;
+      });
+    }
     if (m_robust_pipelines) {
       device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     }
     if (m_reconvergence) {
       device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    }
+    if (m_full_quads) {
+      device_extensions.push_back(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -48551,8 +48573,10 @@ GraphicsCase GraphicsWqmImplicitLod(bool branch, bool coords_in_branch, bool lod
   };
   if (!coords_in_branch) interpolate();
   if (branch) {
-    code.push_back(EncodeVop1(0x01, 8, InlineU32(0)));
-    code.push_back(EncodeVopc(0xc2, InlineU32(0), 8));
+    constexpr u32 minus_one = 193;
+    code.push_back(EncodeVintrp(0x00, 9, 0, 2, 0));
+    code.push_back(EncodeVintrp(0x01, 9, 0, 2, 1));
+    code.push_back(EncodeVopc(0xc5, minus_one, 9));
     code.push_back(EncodeSop1(0x24, 20, vcc));
   }
   if (coords_in_branch) interpolate();
@@ -48589,8 +48613,58 @@ GraphicsCase GraphicsWqmImplicitLod(bool branch, bool coords_in_branch, bool lod
   test.image_width = 4;
   test.image_height = 4;
   test.expected_pixel = {0, 0, 0, 0, lod1 ? two : one, 0, 0, 0};
+  test.opcodes = {O::S_WQM_B64, O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_CMP_NE_U32,
+                  O::S_AND_SAVEEXEC_B64, O::IMAGE_SAMPLE, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
+GraphicsCase GraphicsWqmDppReadsHelperLane(bool sample) {
+  using O = ShaderOpcode;
+
+  constexpr u32 exec = 126;
+  constexpr u32 dpp = 250;
+  constexpr u32 quad_lane0 = 0x000;
+  constexpr u32 minus_two = 194;
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x0a, exec, exec));
+  code.push_back(EncodeVintrp(0x00, 2, 0, 0, 0));
+  code.push_back(EncodeVintrp(0x01, 2, 0, 0, 1));
+  code.push_back(EncodeVintrp(0x00, 3, 0, 1, 0));
+  code.push_back(EncodeVintrp(0x01, 3, 0, 1, 1));
+  code.push_back(EncodeVop1(0x01, 4, InlineU32(0)));
+  if (sample) {
+    code.push_back(EncodeMimg0(0x20, 0xf));
+    code.push_back(EncodeMimg1(4, 2));
+  }
+  code.push_back(EncodeVop1(0x01, 10, minus_two));
+  code.push_back(EncodeVop1(0x01, 10, dpp));
+  code.push_back(EncodeVop1Dpp(2, quad_lane0));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(10, 4, 2, 3));
+  AppendEnd(&code);
+
+  constexpr u32 one = 0x3f800000u;
+  std::vector<u32> mip0(4 * 4 * 4, 0);
+  std::vector<u32> mip1(2 * 2 * 4, 0);
+  for (size_t i = 0; i < mip0.size(); i += 4) mip0[i] = one;
+  for (size_t i = 0; i < mip1.size(); i += 4) mip1[i] = 0x40000000u;
+
+  GraphicsCase test;
+  test.name = sample ? "GraphicsWqmDppReadsHelperLaneSample" : "GraphicsWqmDppReadsHelperLane";
+  test.fragment_code = std::move(code);
+  CoverOnePixelOfQuad(&test);
+  test.gds_initial.clear();
+  test.vertices = {0x00000000u, 0xbf800000u, 0, 0xbe000000u, 0, 0,
+                   0x40400000u, 0xbf800000u, 0x3f400000u, 0xbe000000u, 0, 0,
+                   0x00000000u, 0x40400000u, 0, 0x3ec00000u, 0, 0};
+  if (sample) {
+    test.sampled_image_rgba_mips = {mip0, mip1};
+    test.image_width = 4;
+    test.image_height = 4;
+  }
+  test.expected_pixel = {0, 0, 0, 0, 0xbe000000u, sample ? one : 0u, 0x3e000000u, 0};
   test.opcodes = {O::S_WQM_B64, O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_MOV_B32,
-                  O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64, O::IMAGE_SAMPLE, O::EXP, O::S_ENDPGM};
+                  O::IMAGE_SAMPLE, O::EXP, O::S_ENDPGM};
   return test;
 }
 
@@ -56244,13 +56318,30 @@ int main(int argc, char **argv) {
           const auto test = GraphicsWqmImplicitLod(branch, coords_in_branch, lod1);
           const auto compiled = CompileFragmentCase(test);
           const auto actual = vulkan.RenderFragment(test, compiled);
-          const bool pass = actual == test.expected_pixel;
+          const bool pass = actual.size() == test.expected_pixel.size() &&
+          std::ranges::equal(actual, test.expected_pixel, [](u32 a, u32 b) {
+            return std::fabs(std::bit_cast<float>(a) - std::bit_cast<float>(b)) <= 1e-6f;
+          });
           failed += pass ? 0 : 1;
           std::printf("[helper-lod] %-44s %s pixel1 = %08x %08x %08x %08x\n", test.name,
                       pass ? "PASS" : "FAIL", actual.size() > 4 ? actual[4] : 0u,
                       actual.size() > 5 ? actual[5] : 0u, actual.size() > 6 ? actual[6] : 0u,
                       actual.size() > 7 ? actual[7] : 0u);
         }
+    for (const bool sample : {false, true}) {
+      const auto test = GraphicsWqmDppReadsHelperLane(sample);
+      const auto compiled = CompileFragmentCase(test);
+      const auto actual = vulkan.RenderFragment(test, compiled);
+      const bool pass = actual.size() == test.expected_pixel.size() &&
+          std::ranges::equal(actual, test.expected_pixel, [](u32 a, u32 b) {
+            return std::fabs(std::bit_cast<float>(a) - std::bit_cast<float>(b)) <= 1e-6f;
+          });
+      failed += pass ? 0 : 1;
+      std::printf("[helper-lod] %-44s %s pixel1 = %08x %08x %08x %08x\n", test.name,
+                  pass ? "PASS" : "FAIL", actual.size() > 4 ? actual[4] : 0u,
+                  actual.size() > 5 ? actual[5] : 0u, actual.size() > 6 ? actual[6] : 0u,
+                  actual.size() > 7 ? actual[7] : 0u);
+    }
     std::printf("[helper-lod] done, %d failed\n", failed);
     return failed;
   }
