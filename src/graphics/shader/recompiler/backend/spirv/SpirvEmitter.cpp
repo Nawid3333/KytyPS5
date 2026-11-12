@@ -45,6 +45,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        : 1u;
 	DefineModule(state);
 	EmitProgram(state);
+	if (state.full_quads_required) {
+		state.builder.RequireExtension("SPV_KHR_quad_control");
+		state.builder.RequireCapability(spv::CapabilityQuadControlKHR);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRequireFullQuadsKHR);
+	}
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 

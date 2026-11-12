@@ -112,6 +112,7 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	bool                                             full_quads_required     = false;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
@@ -389,6 +390,9 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
+bool     UsesFullQuadLaneReads(const EmitterState& state);
+uint32_t EmitQuadLaneActiveBool(EmitterState& state, uint32_t lane);
+uint32_t EmitQuadLaneReadEnabled(EmitterState& state, uint32_t exec, uint32_t lane);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 

@@ -26,7 +26,9 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
 	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
 	const auto source_active =
-	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
+	    AndCondition(state, source_exec,
+	                 UsesFullQuadLaneReads(state) ? EmitQuadLaneActiveBool(state, target)
+	                                              : EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
 }
 

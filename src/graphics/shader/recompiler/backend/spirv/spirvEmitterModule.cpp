@@ -879,11 +879,6 @@ void DefineModule(EmitterState& state) {
 			state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
 		}
-		if (state.profile.require_full_quads) {
-			state.builder.RequireExtension("SPV_KHR_quad_control");
-			state.builder.RequireCapability(spv::CapabilityQuadControlKHR);
-			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRequireFullQuadsKHR);
-		}
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}

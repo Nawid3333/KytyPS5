@@ -118,6 +118,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 // Whether EXEC enables a source lane within the caller's 32-lane half.
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
 	auto&      state  = ctx.state;
+	if (UsesFullQuadLaneReads(state)) {
+		return EmitQuadLaneReadEnabled(state, exec, lane);
+	}
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
 	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
 	if (ctx.half != 0) {
@@ -791,8 +794,10 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (flags.fetch_inactive) {
 		return shuffled;
 	}
-	const auto ballot        = ctx.Ballot(inst.Arg(1));
-	const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+	const auto source_active =
+	    UsesFullQuadLaneReads(state)
+	        ? EmitQuadLaneReadEnabled(state, ctx.Arg(inst, 1), target.lane)
+	        : EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Arg(1)), target.lane);
 	const auto can_fetch     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid,
 	                          source_active);

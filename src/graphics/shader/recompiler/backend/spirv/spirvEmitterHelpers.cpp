@@ -191,6 +191,51 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
+
+bool UsesFullQuadLaneReads(const EmitterState& state) {
+	return state.profile.require_full_quads && state.program.stage == ShaderType::Pixel &&
+	       state.lane_count == 1;
+}
+
+uint32_t EmitQuadLaneActiveBool(EmitterState& state, uint32_t lane) {
+	state.full_quads_required = true;
+	const auto active_ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	const auto whole_quads = [&](uint32_t index) {
+		const auto word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, active_ballot,
+		                          index);
+		const auto pairs = Binary(state, spv::OpBitwiseOr, TypeU32(state), word,
+		                          Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+		                                 ConstantU32(state, 1)));
+		const auto quads = Binary(state, spv::OpBitwiseOr, TypeU32(state), pairs,
+		                          Binary(state, spv::OpShiftRightLogical, TypeU32(state), pairs,
+		                                 ConstantU32(state, 2)));
+		return Binary(state, spv::OpIMul, TypeU32(state),
+		              Binary(state, spv::OpBitwiseAnd, TypeU32(state), quads,
+		                     ConstantU32(state, 0x11111111u)),
+		              ConstantU32(state, 0xfu));
+	};
+	const auto low      = whole_quads(0);
+	const auto high     = state.program.wave_size == 64u ? whole_quads(1) : ConstantU32(state, 0);
+	const auto widened  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), widened, low,
+	                          high, ConstantU32(state, 0), ConstantU32(state, 0));
+	return EmitBallotLaneActiveBool(state, widened, lane);
+}
+
+uint32_t EmitQuadLaneReadEnabled(EmitterState& state, uint32_t exec, uint32_t lane) {
+	const auto present = EmitQuadLaneActiveBool(state, lane);
+	if (exec == ConstantBool(state, true)) {
+		return present;
+	}
+	const auto source_exec = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+	                          ConstantU32(state, spv::ScopeSubgroup), exec, lane);
+	return Binary(state, spv::OpLogicalAnd, TypeBool(state), source_exec, present);
+}
+
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, active_ballot, 0);
