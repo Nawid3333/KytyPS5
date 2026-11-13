@@ -84,16 +84,24 @@ uint32_t BufferLane(EmitterState& state) {
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto&      state  = ctx.state;
 	const auto packed = StorageBufferPackedStride(state, mem);
-	const auto stride = packed & 0x3fffu;
-	auto       index  = ctx.Arg(inst, 1);
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	const auto& sources = state.program.descriptor_sources;
+	const bool runtime_stride = buffer.source < sources.size() &&
+	                            !sources[buffer.source].indirect_descriptor.has_value();
+	const auto  stride = runtime_stride
+	                         ? state.memory_buffer_strides[buffer.descriptor_index]
+	                         : ConstantU32(state, packed & IR::BufferResource::NumericStrideMask);
+	auto        index  = ctx.Arg(inst, 1);
 	if ((packed & (1u << 20u)) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
-	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	const auto swizzle =
+	    (packed & (1u << 14u)) == 0u ? 0u
+	    : runtime_stride
+	        ? Binary(state, spv::OpINotEqual, TypeBool(state), stride, ConstantU32(state, 0))
+	        : ConstantBool(state, (packed & IR::BufferResource::NumericStrideMask) != 0u);
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
-	                              swizzle ? ConstantBool(state, true) : 0u,
-	                              ConstantU32(state, (packed >> 16u) & 3u))
+	                              stride, swizzle, ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
 }
 

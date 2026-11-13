@@ -1094,6 +1094,48 @@ void TestBackEdgeReachesPhiPredecessor() {
   }
 }
 
+void TestNativeBufferStrideKey() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 4u;
+  auto& block = AddValueBlock(program);
+  DescriptorSource source;
+  source.dword_count = 4u;
+  for (uint32_t word = 0; word < 4u; ++word)
+    source.dwords[word] = Value(&block.AppendNewInst(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(word))}));
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0u});
+  const auto handle = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+  auto& read = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {handle, Value(1u), Value(0u), Value(0u), Value(true)});
+  read.SetFlags(MemoryFlags{.index = 0u});
+  block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+  const auto plan = Extract(program);
+  std::array<uint32_t, 4> descriptor{0x1000u, 4u << 16u, 16u, 3u << 28u};
+  const SrtRuntime runtime{.user_data = descriptor};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization original, current;
+  Check(MaterializeResources(plan, runtime, snapshot, original),
+        "native stride materialization failed");
+  for (const uint32_t stride: {0u, 4u, 8u, 48u, 0u}) {
+    for (uint32_t mode = 0u; mode < 4u; ++mode) {
+      descriptor[1] = stride << 16u;
+      descriptor[3] = mode << 28u;
+      Check(MaterializeResources(plan, runtime, snapshot, current),
+            "native stride materialization failed");
+      const bool zero_stride_oob = stride == 0u && mode == 0u;
+      Check(current.buffers[0].zero_stride_oob == zero_stride_oob &&
+                (current == original) == !zero_stride_oob,
+            "numeric stride changed the key or zero-stride folding was lost");
+    }
+  }
+}
+
 void TestEmptyScalarBufferSpecialization() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   struct Fixture {
@@ -1497,6 +1539,7 @@ int main() {
   TestEmptyTraversalSkipsUnmappedDescriptor(false, true);
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
+  TestNativeBufferStrideKey();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();

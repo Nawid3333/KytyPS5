@@ -1682,16 +1682,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			descriptor_value.dwords.fill(0);
 			descriptor = {};
 		}
+		const auto* descriptor_source = Source(program, base.source);
+		const bool  runtime_stride =
+		    descriptor_source != nullptr && !descriptor_source->indirect_descriptor.has_value();
 		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
+		const auto stride        = packed_stride & BufferResource::NumericStrideMask;
+		const bool swizzle       = (packed_stride & (1u << 14u)) != 0u;
+		if (!runtime_stride && stride == 0u) {
 			packed_stride &= ~((1u << 14u) | (3u << 16u));
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
-		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
+		auto& buffer = specialization.buffers[i];
+		buffer.packed_stride =
+		    runtime_stride ? packed_stride & ~BufferResource::NumericStrideMask : packed_stride;
 		buffer.descriptor_format =
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);

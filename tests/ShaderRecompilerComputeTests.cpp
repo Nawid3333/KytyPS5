@@ -19907,6 +19907,9 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        ShaderBufferResource descriptor{};
+        std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
+        shader_data[layout.BufferStrideDword() + index] = descriptor.Stride();
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -49532,7 +49535,6 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
         {.type = Prospero::ShaderBinaryType::kCs,
          .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
-  // The first two share code and differ only in the buffer stride specialization.
   struct Case { u32 code, stride; };
   constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
   const auto compile = [&](PipelineCache &cache, const Case &test) {
@@ -49553,10 +49555,9 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
     for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
-    // One compute module per case and nothing else.
     auto expected = PipelineCacheTestAccess::Compiled(cache);
     expected.fill(0);
-    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
+    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<u32>(codes.size());
     Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
             "the per-stage compile counts missed or added a module");
   }
@@ -49567,8 +49568,9 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   Require(name, "order independence", forward == reverse,
           "a program's module id depended on the order it was compiled in");
   const std::set<uint64_t> ids(forward.begin(), forward.end());
-  Require(name, "distinct modules", ids.size() == forward.size(),
-          "different code or specialization shared a module id");
+  Require(name, "runtime stride identity",
+          forward[0] == forward[1] && forward[0] != forward[2] && ids.size() == codes.size(),
+          "numeric stride changed the module or different code shared a module");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 

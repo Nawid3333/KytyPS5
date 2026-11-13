@@ -114,6 +114,7 @@ struct ExportInfo {
 
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	static constexpr uint32_t NumericStrideMask = 0x3fffu;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -503,8 +504,12 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t BufferStrideDword() const {
 		return MemorySizeDword() +
+		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return BufferStrideDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
 	[[nodiscard]] bool UsesPushData() const {

@@ -832,7 +832,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (const auto& resource: program.info.buffers) {
+	for (uint32_t resource_index = 0; resource_index < program.info.buffers.size();
+	     ++resource_index) {
+		const auto& resource = program.info.buffers[resource_index];
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
@@ -842,6 +844,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		const auto descriptor =
+		    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource_index]);
+		prepared.shader_data[layout.BufferStrideDword() + index] = descriptor.Stride();
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
