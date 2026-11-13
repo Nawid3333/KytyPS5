@@ -19910,9 +19910,14 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
-        ShaderBufferResource descriptor{};
-        std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
-        shader_data[layout.BufferStrideDword() + index] = descriptor.Stride();
+        u32 stride = compiled.program.info.buffers[resource].packed_stride &
+                     ShaderRecompiler::IR::BufferResource::NumericStrideMask;
+        if (resource < compiled.resources.buffers.size()) {
+          ShaderBufferResource descriptor{};
+          std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
+          stride = descriptor.Stride();
+        }
+        shader_data[layout.BufferStrideDword() + index] = stride;
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
