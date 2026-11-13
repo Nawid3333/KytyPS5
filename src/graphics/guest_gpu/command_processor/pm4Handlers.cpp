@@ -1094,6 +1094,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		    (cmd_offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset] == nullptr)) {
 			Lab::TraceRegList("cp SET_SH_REG_INDIRECT FAILING", buffer - 1, 5, indirect_address,
 			                  indirect_num_dw, nullptr, true);
+			Lab::TraceListMemory("cp SET_SH_REG_INDIRECT FAILING", indirect_address, 64, 2 * indirect_num_dw + 16);
+			Lab::TracePacketsBefore(buffer - 1 - (num_dw - dw), num_dw - dw);
+			Lab::TraceListAfterDelay(indirect_address, indirect_num_dw);
+			Lab::TraceListMemory("cp SET_SH_REG_INDIRECT FAILING after 250 ms", indirect_address, 64,
+			                     2 * indirect_num_dw + 16);
 		}
 
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {

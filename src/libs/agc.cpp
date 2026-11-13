@@ -916,6 +916,9 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                  
 
 	auto vaddr = reinterpret_cast<uint64_t>(regs);
 
+	Lab::TraceLine(fmt::format("AgcSetShRegIndirectPatchSetAddress cmd=0x{:016x} list=0x{:016x} before={:08x},{:08x},{:08x} caller=0x{:016x}",
+	                            reinterpret_cast<uint64_t>(cmd), vaddr, cmd[1], cmd[2], cmd[4],
+	                            reinterpret_cast<uintptr_t>(__builtin_return_address(0))));
 	return reg_indirect_patch_set_address(cmd, vaddr, RegIndirectPacket::Sh);
 }
 
@@ -956,6 +959,9 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
+	Lab::TraceLine(fmt::format("AgcSetShRegIndirectPatchSetNumRegisters cmd=0x{:016x} num_regs={} before={:08x},{:08x},{:08x} caller=0x{:016x}",
+	                            reinterpret_cast<uint64_t>(cmd), num_regs, cmd[1], cmd[2], cmd[4],
+	                            reinterpret_cast<uintptr_t>(__builtin_return_address(0))));
 	return reg_indirect_patch_set_num_registers(cmd, num_regs, RegIndirectPacket::Sh);
 }
 
@@ -992,6 +998,9 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t n
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
+	Lab::TraceLine(fmt::format("AgcSetShRegIndirectPatchAddRegisters cmd=0x{:016x} add_regs={} before={:08x},{:08x},{:08x} caller=0x{:016x}",
+	                            reinterpret_cast<uint64_t>(cmd), num_regs, cmd[1], cmd[2], cmd[4],
+	                            reinterpret_cast<uintptr_t>(__builtin_return_address(0))));
 	return reg_indirect_patch_add_registers(cmd, num_regs, RegIndirectPacket::Sh);
 }
 
