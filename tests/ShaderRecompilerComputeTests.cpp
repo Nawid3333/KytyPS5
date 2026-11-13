@@ -19683,7 +19683,8 @@ public:
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
                 std::span<const Image> image_resources = {},
-                std::span<const vk::Sampler> sampler_resources = {}) {
+                std::span<const vk::Sampler> sampler_resources = {},
+                vk::ShaderModule cached_module = nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -19713,14 +19714,16 @@ public:
               "unsupported image dimension needs a matching Vulkan test view");
     }
 
-    vk::ShaderModuleCreateInfo module_info{};
-    module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
-    module_info.codeSize = compiled.spirv.size() * sizeof(u32);
-    module_info.pCode = compiled.spirv.data();
-    vk::ShaderModule module = nullptr;
-    RequireVk(test.name, "SPIR-V module",
-              m_device.createShaderModule(&module_info, nullptr, &module),
-              "vkCreateShaderModule");
+    vk::ShaderModule module = cached_module;
+    if (module == nullptr) {
+      vk::ShaderModuleCreateInfo module_info{};
+      module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+      module_info.codeSize = compiled.spirv.size() * sizeof(u32);
+      module_info.pCode = compiled.spirv.data();
+      RequireVk(test.name, "SPIR-V module",
+                m_device.createShaderModule(&module_info, nullptr, &module),
+                "vkCreateShaderModule");
+    }
 
     std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
     auto add_layout_binding =
@@ -20173,7 +20176,7 @@ public:
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
-    m_device.destroyShaderModule(module, nullptr);
+    if (cached_module == nullptr) m_device.destroyShaderModule(module, nullptr);
   }
 
   void CheckRasterization(
@@ -49574,6 +49577,169 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckBufferLoadStoreAtomicStrideReplay(VulkanHarness &vulkan) {
+  constexpr const char *name = "BufferLoadStoreAtomicStrideReplay";
+  constexpr u32 dword_bytes = sizeof(u32);
+  constexpr u32 descriptor_dwords = 4u;
+  constexpr u32 descriptor_address_word = 0u;
+  constexpr u32 descriptor_control_word = 3u;
+  constexpr u32 guest_base = 0x10000u;
+  constexpr u32 buffer_srsrc = 0u;
+  constexpr size_t buffer_count = 1u;
+  constexpr u32 index_vgpr = 20u;
+  constexpr u32 loaded_vgpr = 4u;
+  constexpr u32 stored_vgpr = 5u;
+  constexpr u32 atomic_vgpr = 6u;
+  constexpr u32 record_index = 2u;
+  constexpr u32 load_opcode = 0x0cu;
+  constexpr u32 store_opcode = 0x1cu;
+  constexpr u32 atomic_add_opcode = 0x32u;
+  constexpr u32 waitcnt_opcode = 0x0cu;
+  constexpr u32 no_offset = 0u;
+  constexpr u32 wait_all = 0u;
+  constexpr u32 wide_stride = 8u;
+  constexpr u32 narrow_stride = 4u;
+  constexpr u32 zero_stride = 0u;
+  constexpr u32 max_prefix = 8u;
+  constexpr u32 mode_zero = 0u;
+  constexpr u32 mode_three = 3u;
+  constexpr u32 mode_shift = 28u;
+  constexpr u32 mode_mask = mode_three << mode_shift;
+  constexpr u32 load_result_word = 8u;
+  constexpr u32 atomic_result_word = load_result_word + 1u;
+  constexpr u32 buffer_dwords = atomic_result_word + 1u;
+  constexpr u32 buffer_bytes = buffer_dwords * dword_bytes;
+  constexpr u32 guard_dwords = 2u;
+  constexpr u32 initial_base = 0x20000000u;
+  constexpr u32 stored_value = 0x12345678u;
+  constexpr u32 atomic_increment = 7u;
+  constexpr u32 wave_size = 32u;
+  constexpr u32 thread_count = 1u;
+  constexpr size_t compute_stage = static_cast<size_t>(ShaderType::Compute);
+  constexpr size_t specialization_count = 2u;
+  constexpr std::array strides{
+      wide_stride, zero_stride, narrow_stride, zero_stride, wide_stride};
+  constexpr ShaderProfile robust_profile{
+      .maintenance8 = true, .robust_buffer_access = true};
+
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  AppendVMovU32(&code, index_vgpr, record_index);
+  code.insert(code.end(), {
+      EncodeMubuf0(load_opcode, no_offset, true, false),
+      EncodeMubuf1(loaded_vgpr, buffer_srsrc, index_vgpr),
+      EncodeSopp(waitcnt_opcode, wait_all)});
+  AppendVMovLiteral(&code, stored_vgpr, stored_value);
+  code.insert(code.end(), {
+      EncodeMubuf0(store_opcode, no_offset, true, false),
+      EncodeMubuf1(stored_vgpr, buffer_srsrc, index_vgpr),
+      EncodeSopp(waitcnt_opcode, wait_all)});
+  AppendVMovU32(&code, atomic_vgpr, atomic_increment);
+  code.insert(code.end(), {
+      EncodeMubuf0(atomic_add_opcode, no_offset, true, false, true),
+      EncodeMubuf1(atomic_vgpr, buffer_srsrc, index_vgpr),
+      EncodeSopp(waitcnt_opcode, wait_all),
+      EncodeMubuf0(store_opcode, load_result_word * dword_bytes, false, false),
+      EncodeMubuf1(loaded_vgpr, buffer_srsrc, index_vgpr),
+      EncodeMubuf0(store_opcode, atomic_result_word * dword_bytes, false, false),
+      EncodeMubuf1(atomic_vgpr, buffer_srsrc, index_vgpr)});
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+      {.type = Prospero::ShaderBinaryType::kCs,
+       .code_size_bytes = static_cast<u32>(code.size() * dword_bytes)});
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.storage_buffer_range_bytes = buffer_bytes;
+  test.initial.resize(max_prefix / dword_bytes + buffer_dwords + guard_dwords);
+  for (u32 word = 0u; word < test.initial.size(); ++word)
+    test.initial[word] = initial_base + word;
+
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = thread_count;
+  regs.cs_regs.num_thread_y = thread_count;
+  regs.cs_regs.num_thread_z = thread_count;
+  regs.cs_regs.wave_size = wave_size;
+  regs.cs_regs.user_sgpr = descriptor_dwords;
+  auto &graphics = vulkan.RuntimeContext();
+  const bool saved_robust = graphics.robust_buffer_access_enabled;
+  for (const bool robust : {false, true}) {
+    graphics.robust_buffer_access_enabled = robust;
+    test.profile = robust ? &robust_profile : &Maintenance8Profile;
+    for (const u32 mode : {mode_zero, mode_three}) {
+      PipelineCache cache(graphics, nullptr);
+      auto expected_compiled = PipelineCacheTestAccess::Compiled(cache);
+      std::array<vk::ShaderModule, specialization_count> modules{};
+      std::array<uint64_t, specialization_count> module_ids{};
+      for (const u32 prefix : {0u, max_prefix}) {
+        test.storage_buffer_offsets = {prefix};
+        for (const u32 stride : strides) {
+          const bool zero_stride_oob = stride == zero_stride && mode == mode_zero;
+          const auto slot = static_cast<size_t>(zero_stride_oob);
+          const auto detail = "robust=" + std::to_string(robust) +
+              " mode=" + std::to_string(mode) + " prefix=" + std::to_string(prefix) +
+              " stride=" + std::to_string(stride);
+          const u32 records = stride == zero_stride ? buffer_bytes : buffer_bytes / stride;
+          test.user_data = MakeStructuredStorageBufferData(stride, records);
+          test.user_data[descriptor_address_word] = guest_base;
+          test.user_data[descriptor_control_word] =
+              (test.user_data[descriptor_control_word] & ~mode_mask) | (mode << mode_shift);
+          std::copy_n(test.user_data.begin(), descriptor_dwords, regs.cs_user_sgpr.value);
+          ShaderComputeInputInfo input{};
+          const auto *module = cache.GetComputeProgram(regs, input);
+          Require(name, "cached shader", module != nullptr, detail);
+          if (modules[slot] == nullptr) {
+            modules[slot] = module->module;
+            module_ids[slot] = module->id;
+            ++expected_compiled[compute_stage];
+          }
+
+          CompiledShader compiled;
+          compiled.program.info = module->info.info;
+          compiled.program.bindings = module->info.bindings;
+          compiled.resources = *input.stage.resources;
+          for (const auto reg : module->info.info.user_data_registers)
+            compiled.packed_user_data.push_back(
+                compiled.resources.user_data[reg - module->info.user_data_base]);
+          compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+          Require(name, "one shared V#", compiled.program.info.buffers.size() == buffer_count &&
+                  compiled.program.info.buffers.front().descriptor_index == buffer_srsrc,
+                  detail);
+          compiled.packed_user_data[compiled.program.bindings.memory_offset_dword] = prefix;
+          test.compute_info = input;
+          const u32 target_word = (prefix + record_index * stride) / dword_bytes;
+          const u32 load_result = prefix / dword_bytes + load_result_word;
+          const u32 atomic_result = prefix / dword_bytes + atomic_result_word;
+          test.expected = test.initial;
+          test.expected[target_word] = stored_value + atomic_increment;
+          test.expected[load_result] = zero_stride_oob ? 0u : test.initial[target_word];
+          test.expected[atomic_result] = stored_value;
+          auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
+          vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                          nullptr, {}, {}, module->module);
+          const auto actual = vulkan.ReadBuffer(name, buffer, test.expected.size());
+          vulkan.DestroyBuffer(&buffer);
+          Require(name, "loaded value", actual[load_result] == test.expected[load_result],
+                  detail);
+          Require(name, "atomic previous value", actual[atomic_result] == stored_value,
+                  detail);
+          CompareWords(test, detail.c_str(), test.expected, actual);
+          Require(name, "cached module", module->module == modules[slot] &&
+                  module->id == module_ids[slot], detail);
+          Require(name, "compiled modules",
+                  PipelineCacheTestAccess::Compiled(cache) == expected_compiled, detail);
+        }
+      }
+      if (mode == mode_zero)
+        Require(name, "zero-stride specialization", modules.front() != modules.back() &&
+                module_ids.front() != module_ids.back(), "mode zero lost its read specialization");
+    }
+  }
+  graphics.robust_buffer_access_enabled = saved_robust;
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // With a shader store a restart compiles nothing and creates every pipeline before the first
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
@@ -55985,6 +56151,11 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-stride-replay-only") == 0) {
+    VulkanHarness vulkan;
+    CheckBufferLoadStoreAtomicStrideReplay(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderStore(vulkan);
@@ -57273,6 +57444,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckBufferLoadStoreAtomicStrideReplay(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
