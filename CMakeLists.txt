@@ -866,6 +866,7 @@ if(BUILD_TESTING)
 		scalar_provenance
 		resource_materialization
 		shader_vertex_metadata
+		shader_cfg
 		archive_file
 		avplayer_file
 		memory_tracker
