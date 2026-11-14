@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "common/assert.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
@@ -294,8 +295,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
 	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
 	                      0, sizeof(parameters), &parameters);
+	const auto diag_pssr = DeviceLossDiag::BeginInternal(command, "renderPssr.cpp:297");
 	command.dispatch((parameters.output_size[0] + 7) / 8,
 	                 (parameters.output_size[1] + 7) / 8, 1);
+	DeviceLossDiag::End(command, diag_pssr);
 	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

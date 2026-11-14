@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 
 #include "common/assert.h"
@@ -183,7 +184,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
-	command.draw(3, 1, 0, 0);
+	{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "blitHelper.cpp:186"); command.draw(3, 1, 0, 0); DeviceLossDiag::End(command, diag_id); }
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();

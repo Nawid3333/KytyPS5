@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 
 #include "common/alignment.h"
@@ -597,7 +598,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	const auto dispatch = [&](Mode mode, size_t groups) {
 		const Push push {table, mode};
 		command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-		command.dispatch(static_cast<uint32_t>(groups), 1, 1);
+		{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "rayTracing.cpp:600 BVH"); command.dispatch(static_cast<uint32_t>(groups), 1, 1); DeviceLossDiag::End(command, diag_id); }
 	};
 	if (!area.walks.empty()) {
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_walk_pipeline);

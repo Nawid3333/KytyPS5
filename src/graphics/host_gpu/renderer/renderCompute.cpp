@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -463,6 +464,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
+	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::Dispatch,
+	                                           program.shader_hash, sh_ctx.GetCs().cs_regs.data_addr,
+	                                           m_context.GetCommandScheduler().CurrentTick());
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -480,6 +484,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	DeviceLossDiag::End(vk_buffer, diag_id);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -537,7 +542,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::DispatchIndirect,
+	                                           program.shader_hash, cs_regs.cs_regs.data_addr,
+	                                           m_context.GetCommandScheduler().CurrentTick());
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	DeviceLossDiag::End(vk_buffer, diag_id);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
