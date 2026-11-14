@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/alignment.h"
@@ -304,7 +305,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
 	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
 	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
-	command.dispatch(groups_x, groups_y, 1);
+	{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "tiler.cpp:307"); command.dispatch(groups_x, groups_y, 1); DeviceLossDiag::End(command, diag_id); }
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
@@ -515,7 +516,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
-			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
+			{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "tiler.cpp:518"); command.dispatch(static_cast<uint32_t>(groups_x), rows, 1); DeviceLossDiag::End(command, diag_id); }
 			row += rows;
 		}
 	}
@@ -585,7 +586,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.to_host         = to_host;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
-	command.dispatch((pixels + 63u) / 64u, 1, 1);
+	{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "tiler.cpp:588"); command.dispatch((pixels + 63u) / 64u, 1, 1); DeviceLossDiag::End(command, diag_id); }
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
@@ -649,7 +650,7 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	                  static_cast<uint32_t>(stride / 4), keys, expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
-	command.dispatch(slices, 1, 1);
+	{ const auto diag_id = DeviceLossDiag::BeginInternal(command, "tiler.cpp:652"); command.dispatch(slices, 1, 1); DeviceLossDiag::End(command, diag_id); }
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
