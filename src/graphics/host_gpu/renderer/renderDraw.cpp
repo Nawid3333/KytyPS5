@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -1209,6 +1211,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const auto    diag_kind         = mesh_active ? DeviceLossDiag::Kind::Mesh
+	                                  : args_buffer.first == nullptr ? DeviceLossDiag::Kind::Draw
+	                                                                 : DeviceLossDiag::Kind::DrawIndirect;
+	const auto    diag_id           = DeviceLossDiag::Begin(
+        vk_buffer, diag_kind, vertex_stages.back().stage.module->info.shader_hash,
+        state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0,
+        m_context.GetCommandScheduler().CurrentTick());
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1222,6 +1231,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
 	}
+	DeviceLossDiag::End(vk_buffer, diag_id);
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
