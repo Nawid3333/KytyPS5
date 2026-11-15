@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/pipelineWatch.h"
 
 #include <array>
 
@@ -130,6 +131,7 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	vk::ShaderModule module = nullptr;
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
+	PipelineWatch::RememberModule(module, code);
 	return module;
 }
 

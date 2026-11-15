@@ -7,10 +7,12 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipelineWatch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -18,7 +20,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <fmt/format.h>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -353,6 +357,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
 
+	std::string                   watch_text = "graphics";
+	std::vector<vk::ShaderModule> watch_modules;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			watch_text += fmt::format(" {}=0x{:016x} (id 0x{:016x})",
+			                          ShaderRecompiler::StageName(stage->info.stage),
+			                          stage->info.shader_hash, stage->id);
+			watch_modules.push_back(stage->module);
+		}
+	}
+	const PipelineWatch::Scope watch(std::move(watch_text), std::move(watch_modules));
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -389,6 +404,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
+	const PipelineWatch::Scope watch(
+	    fmt::format("compute CS=0x{:016x} (id 0x{:016x})", module.info.shader_hash, module.id),
+	    {module.module});
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
