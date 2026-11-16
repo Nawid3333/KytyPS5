@@ -370,6 +370,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const PipelineWatch::Scope watch(std::move(watch_text), std::move(watch_modules));
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		watch.Failed(result);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -409,6 +412,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    {module.module});
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		watch.Failed(result);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

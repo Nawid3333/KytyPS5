@@ -48,8 +48,9 @@ void Write(const std::string& text) {
 	Log::WriteToConsoleAndLog(text);
 }
 
-std::string DumpModules(uint64_t id, const InFlight& entry) {
-	const std::filesystem::path folder = std::filesystem::absolute("_SlowPipelines");
+std::string DumpModules(uint64_t id, const InFlight& entry, const char* tag = "PIPELINE-SLOW",
+                        const char* folder_name = "_SlowPipelines") {
+	const std::filesystem::path folder = std::filesystem::absolute(folder_name);
 	std::error_code             error;
 	std::filesystem::create_directories(folder, error);
 	std::string written;
@@ -62,11 +63,10 @@ std::string DumpModules(uint64_t id, const InFlight& entry) {
 		std::ofstream file(path, std::ios::binary);
 		file.write(reinterpret_cast<const char*>(found->second.data()),
 		           static_cast<std::streamsize>(found->second.size() * sizeof(uint32_t)));
-		written += fmt::format("[PIPELINE-SLOW]   wrote {} ({} bytes)\n",
+		written += fmt::format("[{}]   wrote {} ({} bytes)\n", tag,
 		                       Common::PathToString(path), found->second.size() * sizeof(uint32_t));
 	}
-	return written.empty() ? std::string("[PIPELINE-SLOW]   no SPIR-V kept for its modules\n")
-	                       : written;
+	return written.empty() ? fmt::format("[{}]   no SPIR-V kept for its modules\n", tag) : written;
 }
 
 void Watch() {
@@ -140,6 +140,23 @@ Scope::~Scope() {
 	if (!text.empty()) {
 		Write(text);
 	}
+}
+
+void Scope::Failed(vk::Result result) const {
+	std::string text;
+	{
+		auto&           state = GetState();
+		std::lock_guard lock(state.mutex);
+		const auto      found = state.in_flight.find(m_id);
+		if (found == state.in_flight.end()) {
+			return;
+		}
+		text = fmt::format("[PIPELINE-FAIL] pipeline #{} returned {}: {}\n", m_id,
+		                   vk::to_string(result), found->second.description);
+		text += DumpModules(m_id, found->second, "PIPELINE-FAIL", "_FailedPipelines");
+	}
+	Write(text);
+	std::fflush(nullptr);
 }
 
 } // namespace Libs::Graphics::PipelineWatch

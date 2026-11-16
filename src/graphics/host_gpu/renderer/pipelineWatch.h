@@ -15,6 +15,7 @@ class Scope {
 public:
 	Scope(std::string description, std::vector<vk::ShaderModule> modules);
 	~Scope();
+	void Failed(vk::Result result) const;
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
