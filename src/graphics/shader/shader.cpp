@@ -623,13 +623,24 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto& sh        = context.GetShaderRegisters();
 	if (regs.ls_regs.data_addr == 0 || regs.hs_regs.data_addr == 0 ||
 	    regs.es_regs.data_addr == 0) {
+		const auto mapped_type = [](uint64_t addr) {
+			std::scoped_lock lock(g_shader_map_mutex);
+			const auto iter = g_shader_map->find(addr);
+			if (iter == g_shader_map->end()) {
+				return -1;
+			}
+			const auto& [mapped, hash] = iter->second;
+			return static_cast<int>(mapped.type);
+		};
 		EXIT("tessellation draw without a stage program: ls=0x%llx hs=0x%llx es=0x%llx gs=0x%llx "
-		     "stages=0x%08x hs_user_data=0x%llx hs_user_sgpr=%u gs_user_sgpr=%u ls_hs_config=0x%08x "
-		     "tf_param=0x%08x\n",
+		     "types=%d/%d/%d/%d stages=0x%08x hs_user_data=0x%llx hs_user_sgpr=%u gs_user_sgpr=%u "
+		     "ls_hs_config=0x%08x tf_param=0x%08x\n",
 		     static_cast<unsigned long long>(regs.ls_regs.data_addr),
 		     static_cast<unsigned long long>(regs.hs_regs.data_addr),
 		     static_cast<unsigned long long>(regs.es_regs.data_addr),
 		     static_cast<unsigned long long>(regs.gs_regs.data_addr),
+		     mapped_type(regs.ls_regs.data_addr), mapped_type(regs.hs_regs.data_addr),
+		     mapped_type(regs.es_regs.data_addr), mapped_type(regs.gs_regs.data_addr),
 		     static_cast<uint32_t>(context.GetShaderStages()),
 		     static_cast<unsigned long long>(regs.hs_regs.user_data_addr),
 		     static_cast<uint32_t>(regs.hs_regs.rsrc2.user_sgpr),
