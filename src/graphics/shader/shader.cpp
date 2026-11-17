@@ -621,6 +621,21 @@ std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
 	const auto& sh        = context.GetShaderRegisters();
+	if (regs.ls_regs.data_addr == 0 || regs.hs_regs.data_addr == 0 ||
+	    regs.es_regs.data_addr == 0) {
+		EXIT("tessellation draw without a stage program: ls=0x%llx hs=0x%llx es=0x%llx gs=0x%llx "
+		     "stages=0x%08x hs_user_data=0x%llx hs_user_sgpr=%u gs_user_sgpr=%u ls_hs_config=0x%08x "
+		     "tf_param=0x%08x\n",
+		     static_cast<unsigned long long>(regs.ls_regs.data_addr),
+		     static_cast<unsigned long long>(regs.hs_regs.data_addr),
+		     static_cast<unsigned long long>(regs.es_regs.data_addr),
+		     static_cast<unsigned long long>(regs.gs_regs.data_addr),
+		     static_cast<uint32_t>(context.GetShaderStages()),
+		     static_cast<unsigned long long>(regs.hs_regs.user_data_addr),
+		     static_cast<uint32_t>(regs.hs_regs.rsrc2.user_sgpr),
+		     static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr),
+		     static_cast<uint32_t>(sh.m_vgtLsHsConfig), static_cast<uint32_t>(sh.m_vgtTfParam));
+	}
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
