@@ -30,7 +30,7 @@ namespace Libs::Graphics {
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
-	char    detail[512];
+	char    detail[1536];
 	va_list args;
 	va_start(args, format);
 	std::vsnprintf(detail, sizeof(detail), format, args);
@@ -158,11 +158,46 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
 	    (depth_address & 0xffffu) != 0) {
+		const auto& lab_hw = buffer.GetRegisters();
+		const auto& lab_rc = lab_hw.GetRenderControl();
+		const auto& lab_dc = lab_hw.GetDepthControl();
+		const auto& lab_ov = lab_hw.GetDepthRenderOverride();
 		DepthFatal("unsupported depth register state [site 160] max_mip=%u shading_rate=%u htile=%d "
-		           "address=0x%llx write_buffer=%d",
+		           "address=0x%llx write_buffer=%d | z_format=%u stencil_format=%u samples=%u "
+		           "z_read=0x%llx z_write=0x%llx s_read=0x%llx s_write=0x%llx htile_addr=0x%llx "
+		           "size_valid=%d size=%ux%u slices=%u..%u mip=%u expclear=%d/%d | z_enable=%d "
+		           "z_write=%d stencil_enable=%d bounds=%d zfunc=%u | depth_clear=%d stencil_clear=%d "
+		           "depth_compress_disable=%d stencil_compress_disable=%d resummarize=%d "
+		           "copy_z=%d copy_s=%d | force_z_valid=%d force_z_dirty=%d force_s_valid=%d "
+		           "force_s_dirty=%d | color_mode=%u depth_write_disable=%d stencil_write_disable=%d",
 		           static_cast<unsigned>(z.z_info.max_mip_level),
 		           static_cast<unsigned>(z.shading_rate_encoding), static_cast<int>(has_htile),
-		           static_cast<unsigned long long>(depth_address), static_cast<int>(write_buffer));
+		           static_cast<unsigned long long>(depth_address), static_cast<int>(write_buffer),
+		           static_cast<unsigned>(z.z_info.format), static_cast<unsigned>(z.stencil_info.format),
+		           static_cast<unsigned>(z.z_info.num_samples),
+		           static_cast<unsigned long long>(z.z_read_base_addr),
+		           static_cast<unsigned long long>(z.z_write_base_addr),
+		           static_cast<unsigned long long>(z.stencil_read_base_addr),
+		           static_cast<unsigned long long>(z.stencil_write_base_addr),
+		           static_cast<unsigned long long>(z.htile_data_base_addr), static_cast<int>(z.size.valid),
+		           static_cast<unsigned>(z.size.x_max) + 1u, static_cast<unsigned>(z.size.y_max) + 1u,
+		           static_cast<unsigned>(z.depth_view.slice_start),
+		           static_cast<unsigned>(z.depth_view.slice_max),
+		           static_cast<unsigned>(z.depth_view.current_mip_level),
+		           static_cast<int>(z.z_info.expclear_enabled),
+		           static_cast<int>(z.stencil_info.expclear_enabled), static_cast<int>(lab_dc.z_enable),
+		           static_cast<int>(lab_dc.z_write_enable), static_cast<int>(lab_dc.stencil_enable),
+		           static_cast<int>(lab_dc.depth_bounds_enable), static_cast<unsigned>(lab_dc.zfunc),
+		           static_cast<int>(lab_rc.depth_clear_enable), static_cast<int>(lab_rc.stencil_clear_enable),
+		           static_cast<int>(lab_rc.depth_compress_disable),
+		           static_cast<int>(lab_rc.stencil_compress_disable),
+		           static_cast<int>(lab_rc.resummarize_enable), static_cast<int>(lab_rc.copy_depth_to_color),
+		           static_cast<int>(lab_rc.copy_stencil_to_color), static_cast<int>(lab_ov.force_z_valid),
+		           static_cast<int>(lab_ov.force_z_dirty), static_cast<int>(lab_ov.force_stencil_valid),
+		           static_cast<int>(lab_ov.force_stencil_dirty),
+		           static_cast<unsigned>(lab_hw.GetColorControl().mode),
+		           static_cast<int>(z.depth_view.depth_write_disable),
+		           static_cast<int>(z.depth_view.stencil_write_disable));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || stencil_address == 0 ||
