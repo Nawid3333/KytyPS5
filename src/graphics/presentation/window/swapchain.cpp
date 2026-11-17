@@ -216,7 +216,14 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
-	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
+	if (copy.srcSubresource.layerCount != copy.dstSubresource.layerCount) {
+		EXIT("presentation copy layer mismatch: source layers=%u extent=%ux%u format=%d | frame "
+		     "layers=%u extent=%ux%u format=%d\n",
+		     static_cast<unsigned>(source.backing.layers), source.backing.extent.width,
+		     source.backing.extent.height, static_cast<int>(source.backing.format),
+		     static_cast<unsigned>(image.layers), image.extent.width, image.extent.height,
+		     static_cast<int>(image.format));
+	}
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }

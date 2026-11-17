@@ -30,13 +30,14 @@ namespace Libs::Graphics {
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
+	char    detail[512];
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(detail, sizeof(detail), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	std::fprintf(stderr, "%s\n", detail);
 	std::fflush(stderr);
-	EXIT("unsupported render state; details were printed above\n");
+	EXIT("Depth target fatal: %s\n", detail);
 }
 
 static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
@@ -157,7 +158,11 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
 	    (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state [site 160] max_mip=%u shading_rate=%u htile=%d "
+		           "address=0x%llx write_buffer=%d",
+		           static_cast<unsigned>(z.z_info.max_mip_level),
+		           static_cast<unsigned>(z.shading_rate_encoding), static_cast<int>(has_htile),
+		           static_cast<unsigned long long>(depth_address), static_cast<int>(write_buffer));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || stencil_address == 0 ||
@@ -302,7 +307,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state [site 305] copy_stencil_to_color=%d zfunc=%u "
+		           "depth_write_disable=%d z_read=0x%llx z_write=0x%llx has_stencil=%d "
+		           "stencil_write_disable=%d s_read=0x%llx s_write=0x%llx",
+		           static_cast<int>(rc.copy_stencil_to_color), static_cast<unsigned>(dc.zfunc),
+		           static_cast<int>(z.depth_view.depth_write_disable),
+		           static_cast<unsigned long long>(z.z_read_base_addr),
+		           static_cast<unsigned long long>(z.z_write_base_addr), static_cast<int>(has_stencil),
+		           static_cast<int>(z.depth_view.stencil_write_disable),
+		           static_cast<unsigned long long>(z.stencil_read_base_addr),
+		           static_cast<unsigned long long>(z.stencil_write_base_addr));
 	}
 	if (rc.copy_depth_to_color &&
 	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
