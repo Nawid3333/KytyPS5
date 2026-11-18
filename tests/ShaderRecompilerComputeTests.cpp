@@ -45,6 +45,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -64,6 +65,7 @@
 #include "libs/agc.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
@@ -126,6 +128,7 @@
 
 namespace Libs {
 void InitAgcDriver_1(Loader::SymbolDatabase *symbols);
+void InitHmd2_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::Graphics {
@@ -55859,8 +55862,9 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
 
-  // A GPU-written storage image the flip's GL2 writeback copies back.
-  constexpr uint64_t image_size = 0x10000;
+  // A GPU-written storage image the flip's GL2 writeback copies back, and at
+  // 0x20000 a two-layer eye array.
+  constexpr uint64_t image_size = 0x40000;
   int64_t image_offset = -1;
   void *image_memory = nullptr;
   Require(name, "image memory",
@@ -56078,6 +56082,27 @@ void CheckPm4Flip() {
   Require(name, "wait for a shown buffer", shown_complete && shown_pending == 0,
           "the wait returned before its buffer's flip was presented");
 
+  // A flipped surface can be the first layer of a cached array, as a headset
+  // eye of a stereo render target is; the frame copies only that layer.
+  gpu.SendCommandSync([&] {
+    auto eyes = VulkanHarness::MakeLinearDesc(
+        image_base + 0x20000, 0, vk::Format::eR8G8B8A8Srgb,
+        Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+        {64, 64, 1}, 2, 4, 1);
+    eyes.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    eyes.info.pitch = 0;
+    eyes.info.UpdateSize();
+    (void)renderer.GetTextureCache().FindImage(eyes);
+    eyes.info.data.size = 0;
+    eyes.info.resources.layers = 1;
+    eyes.info.UpdateSize();
+    auto &scheduler = renderer.GetCommandScheduler();
+    auto &frame = window.presenter->PrepareFrame(
+        scheduler.Current(), eyes.info, 0x8000000022000000ull, false);
+    scheduler.Finish();
+    window.presenter->Discard(frame);
+  });
+
   gpu.WaitForIdle();
   Require(name, "close",
           VideoOut::VideoOutClose(headset) == 0 &&
@@ -56086,6 +56111,48 @@ void CheckPm4Flip() {
   EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Device information by handle checks the handle, then clears the output
+// before it checks that the library is initialized. No reprojection pass runs
+// on the host, so every status field is zero once reprojection is initialized.
+void CheckHmd2() {
+  constexpr const char *name = "Hmd2";
+  Loader::SymbolDatabase hmd2;
+  Libs::InitHmd2_1(&hmd2);
+  const auto func = [&](const char *nid) {
+    return hmd2.FindByNid(nid, Loader::SymbolType::Func)->vaddr;
+  };
+  const auto get_status =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(void *)>(func("8GkaY2B7opM"));
+  const auto initialize =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(const void *, void *)>(
+          func("C0rPwER-yxg"));
+  const auto device_info =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, void *)>(
+          func("4BlE4IPXP0Q"));
+  std::array<uint8_t, 28> info;
+  info.fill(0xff);
+  const auto filled = info;
+  Require(name, "device information by handle",
+          device_info(0x0f000002, info.data()) == -1972240381 && // 0x8a720003
+              info == filled &&
+              device_info(0x0f000001, info.data()) == -1972240382 && // 0x8a720002
+              info == std::array<uint8_t, 28>{},
+          "the handle or the output was checked out of order");
+  static Hmd2::ReprojectionState work;
+  // Work and display buffers, and no see-through buffer.
+  const std::array<void *, 9> param{&work, &work};
+  std::array<uint8_t, 0x68> status;
+  status.fill(0xff);
+  Require(name, "status",
+          get_status(status.data()) ==
+                  Hmd2::ERROR_REPROJECTION_NOT_INITIALIZED &&
+              initialize(param.data(), nullptr) == 0 &&
+              get_status(status.data()) == 0 &&
+              status == std::array<uint8_t, 0x68>{},
+          "the reprojection status is not that of none completed");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -57352,6 +57419,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
     CheckFlipRate();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--hmd2-only") == 0) {
+    CheckHmd2();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {
