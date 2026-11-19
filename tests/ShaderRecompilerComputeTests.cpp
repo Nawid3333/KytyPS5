@@ -7961,6 +7961,90 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      constexpr uint32_t stencil_width = 4;
+      constexpr uint8_t stencil_guest = 0x11;
+      constexpr uint8_t stencil_written = 0x5a;
+      struct StencilReadbackCase {
+        const char *check;
+        uint64_t depth_offset;
+        uint64_t plane_offset;
+        uint32_t layers;
+        bool compressed;
+      };
+      for (const auto &stencil_case :
+           {StencilReadbackCase{"stencil plane buffer readback", 0x2fa0000,
+                                0x2fb0000, 1, false},
+            StencilReadbackCase{"partially cleared stencil plane readback",
+                                0x2fc0000, 0x2fd0000, 2, false},
+            StencilReadbackCase{"compressed stencil plane stays guest-owned",
+                                0x2fe0000, 0x2ff0000, 2, true}}) {
+        const uint32_t plane_size = stencil_width * stencil_case.layers;
+        std::memset(memory + stencil_case.plane_offset, stencil_guest,
+                    plane_size);
+        auto stencil_depth = MakeLinearDesc(
+            base + stencil_case.depth_offset, plane_size * sizeof(float),
+            vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {stencil_width, 1, 1},
+            stencil_case.layers, sizeof(float), 1);
+        stencil_depth.type = BindingType::DepthTarget;
+        stencil_depth.info.stencil = {base + stencil_case.plane_offset,
+                                      plane_size};
+        if (stencil_case.compressed) {
+          stencil_depth.info.metadata.kind = ImageMetadataKind::Htile;
+          stencil_depth.info.metadata.range = {
+              base + stencil_case.depth_offset + 0x8000, 0x1000};
+          stencil_depth.info.metadata.stencil_compressed = true;
+        }
+        stencil_depth.view_info.format = vk::Format::eD32SfloatS8Uint;
+        stencil_depth.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        stencil_depth.view_info.usage =
+            vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        stencil_depth.view_info.layer_count = stencil_case.layers;
+        stencil_depth.view_info.type = stencil_case.layers > 1
+                                           ? vk::ImageViewType::e2DArray
+                                           : vk::ImageViewType::e2D;
+        const auto stencil_depth_image = texture_cache.FindImage(stencil_depth);
+        (void)texture_cache.FindDepthTarget(stencil_depth_image, stencil_depth);
+        const uint32_t cleared_layer = stencil_case.layers - 1;
+        vk::ClearValue stencil_clear{};
+        stencil_clear.depthStencil.stencil = stencil_written;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), stencil_depth_image,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, cleared_layer, 1},
+            stencil_clear);
+        Libs::Graphics::Buffer stencil_plane(
+            m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+            stencil_depth.info.stencil.address, AllFlags, plane_size);
+        const bool stencil_synchronized =
+            BufferCacheTestAccess::SynchronizeBufferFromImage(
+                resources.GetBufferCache(), stencil_plane,
+                stencil_depth.info.stencil.address, plane_size);
+        TransferReadBarrier(stencil_plane.Handle(), plane_size);
+        auto stencil_plane_readback = CreateHostBuffer(
+            name, plane_size, vk::BufferUsageFlagBits::eTransferDst, {});
+        const vk::BufferCopy stencil_copy{0, 0, plane_size};
+        scheduler.Current().Handle().copyBuffer(stencil_plane.Handle(),
+                                                stencil_plane_readback.buffer, 1,
+                                                &stencil_copy);
+        HostReadBarrier(stencil_plane_readback.buffer,
+                        stencil_plane_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        std::vector<u32> expected(stencil_case.layers,
+                                  stencil_guest * 0x01010101u);
+        expected[cleared_layer] = stencil_written * 0x01010101u;
+        Require(name, stencil_case.check,
+                stencil_synchronized != stencil_case.compressed &&
+                    (stencil_case.compressed ||
+                     ReadBuffer(name, stencil_plane_readback,
+                                stencil_case.layers) == expected),
+                "a buffer read of the stencil range missed the GPU-written "
+                "stencil or downloaded a compressed plane");
+        DestroyBuffer(&stencil_plane_readback);
+      }
+
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
