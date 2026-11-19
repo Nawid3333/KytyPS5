@@ -874,6 +874,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 
 bool TextureCache::CanDownload(const Image& image) const {
 	const auto& info = image.info;
+	if (image.depth_id) {
+		const auto& owner = m_slot_images[image.depth_id];
+		return owner.backing.samples == 1 && !owner.info.metadata.stencil_compressed &&
+		       info.resources.layers != 0 && info.LinearSize() != 0;
+	}
 	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
 	    info.data.size % info.resources.layers != 0) {
 		return false;
@@ -1349,11 +1354,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
-		const auto* owner = &image;
-		if (ensure_valid && owner->depth_id) {
-			owner = &m_slot_images[owner->depth_id];
-		}
-		if (ensure_valid && !owner->SafeToDownload()) {
+		if (ensure_valid && !image.SafeToDownload()) {
 			return;
 		}
 		matches.push_back(id);
@@ -1369,9 +1370,6 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 				break;
 			}
 		}
-	}
-	if (selected && ensure_valid && m_slot_images[selected].depth_id) {
-		selected = m_slot_images[selected].depth_id;
 	}
 	return selected;
 }
@@ -1589,8 +1587,8 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 			RefreshImage(stencil_id);
 		} else {
 			TrackImage(stencil_id);
-			CommitGpuWrite(m_slot_images[stencil_id]);
 		}
+		CommitGpuWrite(m_slot_images[stencil_id]);
 	}
 	command.EndRendering();
 	// Transfer clears use the backing format; aliased clears must encode through their view.
@@ -1675,7 +1673,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 			image.Download(copies, destination.Handle(), destination_offset, info.data.size);
 		} else {
 			const auto copies = info.BufferCopies();
-			m_tiler.TileImage(image, copies, destination.Handle(), destination_offset,
+			m_tiler.TileImage(image, info, copies, destination.Handle(), destination_offset,
 			                  info.data.size);
 		}
 		return;
@@ -1711,6 +1709,21 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
+	if (image.depth_id) {
+		const bool tiled  = image.info.IsTiled();
+		auto       copies = image.info.BufferCopies(tiled ? 0 : destination_offset, levels);
+		for (auto& copy: copies) {
+			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+		}
+		auto& depth = m_slot_images[image.depth_id];
+		if (tiled) {
+			m_tiler.TileImage(depth, image.info, copies, destination.Handle(), destination_offset,
+			                  destination_size, levels);
+		} else {
+			depth.Download(copies, destination.Handle(), destination_offset, destination_size);
+		}
+		return;
+	}
 	if (UploadBinding(image) == BindingType::DepthTarget) {
 		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);
@@ -1721,8 +1734,8 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	const auto  transform = info.GetColorTransform();
 	if (info.IsTiled()) {
 		const auto copies = info.BufferCopies(0, levels);
-		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
-		                  levels);
+		m_tiler.TileImage(image, info, copies, destination.Handle(), destination_offset,
+		                  destination_size, levels);
 	} else if (transform != ColorTransform::None) {
 		auto       linear = m_tiler.GetScratchBuffer(destination_size);
 		const auto copies = info.BufferCopies(0, levels);

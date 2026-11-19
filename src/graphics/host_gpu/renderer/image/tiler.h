@@ -47,7 +47,8 @@ public:
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
-	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
+	void TileImage(Image& source, const ImageInfo& info,
+	               std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,

@@ -336,16 +336,16 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling);
 }
 
-void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
-                            vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                            uint32_t levels) {
+void TileManager::TileImage(Image& source, const ImageInfo& info,
+                            std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
+                            uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels) {
 	EXIT_IF(regions.empty());
-	const auto linear_capacity = image.info.LinearSize(levels);
+	const auto linear_capacity = info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
 	const auto tiling =
-	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, tiled_offset);
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, 0, tiled_offset);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
-	image.Download(regions, linear.buffer, 0, linear.size);
+	source.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling);
 }
 
