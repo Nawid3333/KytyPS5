@@ -39,6 +39,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -46,6 +47,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1430,9 +1432,20 @@ int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
 	EXIT_IF(g_net == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(size == 0);
 
-	int id = g_net->PoolCreate(name, size);
+	const char* lab_mode   = std::getenv("KYTY_LAB_NETPOOL0");
+	const bool  reject_zero = lab_mode != nullptr && std::string_view(lab_mode) == "einval";
+	const char* pool_name   = name != nullptr ? name : "(null)";
+	if (size == 0 && reject_zero) {
+		Log::WriteToConsoleAndLog(fmt::format("[NET2411] sceNetPoolCreate name=\"{}\" size=0 flags={} -> EINVAL (mode einval)\n",
+		                                      pool_name, flags));
+		return NET_ERROR_EINVAL;
+	}
+
+	int id = g_net->PoolCreate(name != nullptr ? name : "", size);
+
+	Log::WriteToConsoleAndLog(fmt::format("[NET2411] sceNetPoolCreate name=\"{}\" size={} flags={} -> {}\n", pool_name,
+	                                      size, flags, id));
 
 	if (id < 0) {
 		return NET_ERROR_ENFILE;
