@@ -6,13 +6,43 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "common/logging/log.h"
+
+#include <array>
 #include <cstring>
+#include <fmt/format.h>
 #include <numeric>
+#include <string>
 #include <vk_mem_alloc.h>
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long frames_to_skip, unsigned long frames_to_capture, void** back_trace,
+    unsigned long* back_trace_hash);
+#endif
 
 namespace Libs::Graphics {
 
 namespace {
+
+void LabReportBuffer(const char* event, vk::Buffer handle, uint64_t size, uint64_t cpu_address,
+                     MemoryUsage usage, bool with_stack) {
+	auto line = fmt::format("[BUF938] {} handle=0x{:x} size=0x{:x} cpu=0x{:x} usage={}", event,
+	                        reinterpret_cast<uint64_t>(static_cast<VkBuffer>(handle)), size,
+	                        cpu_address, static_cast<uint32_t>(usage));
+#ifdef _WIN32
+	if (with_stack) {
+		std::array<void*, 12> frames {};
+		const auto count = RtlCaptureStackBackTrace(1, static_cast<unsigned long>(frames.size()),
+		                                            frames.data(), nullptr);
+		line += " stack=";
+		for (unsigned i = 0; i < count; ++i) {
+			line += fmt::format(" {:x}", reinterpret_cast<uintptr_t>(frames[i]));
+		}
+	}
+#endif
+	LOGF("%s\n", line.c_str());
+}
 
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
@@ -89,6 +119,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	LabReportBuffer("create", m_buffer, size, cpu_address, usage, false);
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -107,6 +138,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		LabReportBuffer("destroy", m_buffer, m_size, m_cpu_address, m_usage, true);
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

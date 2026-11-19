@@ -138,6 +138,13 @@ jobs:
           path: _Build/windows/install/**
           if-no-files-found: error
 
+      - name: Upload Windows link map
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64-map
+          path: _Build/windows/kyty_emulator_*.map
+          if-no-files-found: error
+
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
