@@ -535,15 +535,26 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
+    DrawTargets targets{};
     executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
+        std::span{stages.data(), pixel_active ? 2u : 1u}, targets);
     return result;
   }
 
   static void PrepareGraphicsBindings(RenderExecutor &executor,
                                       std::span<PreparedBindings *const> stages,
+                                      DrawTargets &targets) {
+    executor.PrepareGraphicsBindings(stages, targets);
+  }
+
+  static void PrepareGraphicsBindings(RenderExecutor &executor,
+                                      std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
-    executor.PrepareGraphicsBindings(stages, colors);
+    DrawTargets targets{};
+    std::ranges::copy(colors, targets.colors);
+    targets.color_count = static_cast<uint32_t>(colors.size());
+    executor.PrepareGraphicsBindings(stages, targets);
+    std::ranges::copy(std::span{targets.colors, colors.size()}, colors.begin());
   }
 
   static PipelineCache::Pipeline
@@ -7346,6 +7357,35 @@ public:
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
 
+      // A view keeps its mip once later candidates resolve against its container.
+      const auto make_linear = [&](uint64_t offset, vk::Format format,
+                                   Prospero::BufferFormat guest, uint32_t bytes,
+                                   uint32_t extent, uint32_t levels) {
+        auto desc = MakeLinearDesc(base + offset, 0, format, guest,
+                                   Prospero::ImageType::kColor2D, {extent, extent, 1}, 1,
+                                   bytes, 1);
+        desc.info.resources.levels = levels;
+        desc.info.pitch = 0;
+        desc.info.UpdateSize();
+        desc.view_info.level_count = levels;
+        return desc;
+      };
+      constexpr uint64_t view_chain_offset = 0x780000;
+      auto view_chain = make_linear(view_chain_offset, vk::Format::eR8Unorm,
+                                    Prospero::BufferFormat::k8UNorm, 1, 64, 3);
+      const auto view_chain_id = texture_cache.FindImage(view_chain);
+      auto view_neighbor = make_linear(view_chain_offset + 0x2000, vk::Format::eR32Sfloat,
+                                       Prospero::BufferFormat::k32Float, 4, 8, 1);
+      const auto view_neighbor_id = texture_cache.FindImage(view_neighbor);
+      auto mip_view = make_linear(view_chain_offset + view_chain.info.mip_layout[1].offset,
+                                  vk::Format::eR8Unorm, Prospero::BufferFormat::k8UNorm, 1,
+                                  32, 1);
+      Require(name, "view mip after a later candidate",
+              view_neighbor_id != view_chain_id &&
+                  texture_cache.FindImage(mip_view) == view_chain_id &&
+                  mip_view.view_info.base_level == 1,
+              "a later overlapping candidate reset a view to its container's base level");
+
       ImageInfo chain = sampled.info;
       chain.data = {0x2394c1000, 0x384000};
       chain.extent = {64, 64, 1};
@@ -7362,9 +7402,8 @@ public:
       subresource.resources = {1, 1};
       subresource.mip_layout = {};
       subresource.mip_layout[0] = {0, 0x4000, 64, 64};
-      const auto mip = subresource.MipOf(chain);
       Require(name, "overlap resolution",
-              mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
+              subresource.SubresourceOf(chain) == ImageSubresource{0, 0} &&
                   ImageRangeOverlaps(chain.data, subresource.data),
               "captured PS5 atlas mip/slice overlap did not resolve");
 
@@ -8170,6 +8209,69 @@ public:
           "the partial depth view lost a layer or failed to restore raw UINT "
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
+
+      // PPSA18026: an image heap samples a four-layer shadow array as R16 while a draw renders
+      // slice 1 of its two-layer D16 HTile depth target.
+      constexpr uint64_t grow_depth_offset = layered_raw_d16_offset + 0x1000;
+      constexpr uint64_t grow_htile_address = base + grow_depth_offset + 0x800;
+      constexpr std::array<uint16_t, 8> grow_depth_values{
+          0x1111u, 0x1112u, 0x2221u, 0x2222u, 0x3331u, 0x3332u, 0x4441u, 0x4442u};
+      std::memcpy(memory + grow_depth_offset, grow_depth_values.data(),
+                  sizeof(grow_depth_values));
+      DrawTargets grow_targets{};
+      auto &grow_depth = grow_targets.depth;
+      grow_depth.desc = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values) / 2, vk::Format::eD16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+          sizeof(uint16_t), 1);
+      grow_depth.desc.type = BindingType::DepthTarget;
+      grow_depth.desc.info.metadata.kind = ImageMetadataKind::Htile;
+      grow_depth.desc.info.metadata.range = {grow_htile_address, 0x200};
+      grow_depth.desc.info.htile_initial_clear = true;
+      grow_depth.desc.view_info.type = vk::ImageViewType::e2D;
+      grow_depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      grow_depth.desc.view_info.base_layer = 1;
+      grow_depth.desc.view_info.layer_count = 1;
+      grow_depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      grow_depth.image_id = texture_cache.FindImage(grow_depth.desc);
+      (void)texture_cache.FindDepthTarget(grow_depth.image_id, grow_depth.desc);
+      RenderExecutorTestAccess::BindRenderTarget(context.GetRenderExecutor(),
+                                                 grow_depth.image_id);
+      const auto two_layer_depth = grow_depth.image_id;
+      vk::ClearValue grow_clear{};
+      grow_clear.depthStencil.depth = 1.0f;
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), two_layer_depth,
+                                         {vk::ImageAspectFlagBits::eDepth, 0, 1, 1, 1},
+                                         grow_clear);
+      texture_cache.MarkGpuWritten(two_layer_depth);
+      auto grow_sampled = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values), vk::Format::eR16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 4,
+          sizeof(uint16_t), 1);
+      const auto grown = texture_cache.FindImage(grow_sampled);
+      Require(name, "sampled depth array grows as depth",
+              grown != two_layer_depth &&
+                  !TextureCacheTestAccess::Contains(texture_cache, two_layer_depth) &&
+                  texture_cache.GetImage(grown).backing.format == vk::Format::eD16Unorm &&
+                  texture_cache.GetImage(grown).info.resources.layers == 4 &&
+                  texture_cache.IsMetaCleared(grow_htile_address, 3) &&
+                  texture_cache.FindTexture(grown, grow_sampled) != nullptr,
+              "a sampled view of more layers moved the depth target to a color copy");
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          context.GetRenderExecutor(), std::span<PreparedBindings *const>{}, grow_targets);
+      const auto grow_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          context.GetRenderExecutor(), scheduler.Current(), grow_targets.colors, 0, grow_depth);
+      Require(name, "grown depth target rediscovery",
+              grow_depth.image_id == grown &&
+                  grow_rendering.depth_stencil_attachment.image_view != nullptr,
+              "the draw did not find its depth target in the grown image");
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+      Require(name, "grown depth layers",
+              ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 1) ==
+                      std::vector<u32>{0xffffffffu} &&
+                  ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 3) ==
+                      std::vector<u32>{0x44424441u},
+              "the grown depth image lost a GPU-written layer or skipped guest memory");
 
       // RE2 converts a prefix of a 32-layer HTile depth array to R32F storage.
       constexpr uint32_t htile_layers = 32;
@@ -16459,6 +16561,58 @@ public:
                     binding.offset == owner.Offset(buffer_address) &&
                     binding.range == 0x5000,
                 "descriptor rebind lost its clamped guest range or retained a stale host owner");
+      }
+
+      {
+        // A GiB-sized pool descriptor whose window is mapped in pieces around a free hole.
+        constexpr uint64_t page = 0x10000;
+        constexpr uint64_t address = base + allocation_size - page;
+        constexpr uint64_t piece = base + allocation_size + page;
+        constexpr u32 resident_value = 0x2468ace1u;
+        int64_t piece_offset = -1;
+        void *piece_mapping = reinterpret_cast<void *>(piece);
+        Require(name, "pool piece mapping",
+                LibKernel::Memory::KernelAllocateDirectMemory(
+                    0, LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0,
+                    &piece_offset) == 0 &&
+                    LibKernel::Memory::KernelMapDirectMemory(&piece_mapping, page, 0x3, 0x10,
+                                                             piece_offset, page) == 0,
+                "pool piece fixed mapping failed");
+        resources.MapMemory(piece, page);
+        LibKernel::Memory::WriteBacking(piece, &resident_value, sizeof(resident_value));
+        const auto program = make_buffer_program(ShaderType::Compute, {.read = true});
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        value.dword_count = 4;
+        value.dwords = {static_cast<u32>(address), static_cast<u32>(address >> 32), 0x40000000u};
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
+        executor.RebindBuffers(bindings);
+        const auto &source = bindings.buffer_sources[0];
+        const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+        Require(name, "oversized descriptor across a free hole",
+                source.address == address && source.size == 3u * page &&
+                    bindings.buffers[0].range == 3u * page,
+                "oversized descriptor stopped at its first unmapped hole");
+        auto output = CreateHostBuffer(name, 2u * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferCopy, 2> copies{{
+            {owner.Offset(base + allocation_size), 0, sizeof(u32)},
+            {owner.Offset(piece), sizeof(u32), sizeof(u32)}}};
+        scheduler.Current().Handle().copyBuffer(owner.Handle(), output.buffer, copies.size(), copies.data());
+        scheduler.Finish();
+        Require(name, "oversized descriptor upload across a free hole",
+                ReadBuffer(name, output, 2) == std::vector<u32>{0u, resident_value},
+                "pool upload lost its zero-filled hole or the piece past it");
+        DestroyBuffer(&output);
+        // The buffer also watches the hole, which the section's own unmap does not cover.
+        resources.UnmapMemory(base + allocation_size, 2u * page);
+        Require(name, "pool piece release",
+                LibKernel::Memory::KernelMunmap(piece, page) == 0 &&
+                    LibKernel::Memory::KernelReleaseDirectMemory(piece_offset, page) == 0,
+                "pool piece release failed");
       }
 
       {
@@ -36822,7 +36976,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     std::copy(row.begin(), row.end(), test.initial.begin() + descriptor_base / 4u + i * 8);
     if (!input.zero_payload)
       std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
-    // Read the selection on the GPU, as GTA's descriptor waterfall does.
+    // Read the selection on the GPU, as a descriptor waterfall does.
     test.initial[selection_base / 4u + i] = std::size(cases) - 1 - i;
     test.expected.push_back(cases[std::size(cases) - 1 - i].expected);
   }
@@ -50277,8 +50431,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                     packed_clear, size),
           "partial buffer coverage was classified as a complete clear");
 
-  // Same descriptor/dispatch as GTA3, with the stored value encoded in the
-  // shader.
+  // A clear whose stored value is encoded in the shader.
   user_data = {0x00200000u, 4u << 16u, 64u, 0x14204u};
   compute.workgroup_register = 4;
   compute.dispatch_thread_dimensions = false;
@@ -50295,7 +50448,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                    packed_clear, size) &&
               descriptor.Base48() == 0x200000u && size == 256u &&
               packed_clear == 0u,
-          "GTA3's actual scalar store was not recognized from IR");
+          "the inline scalar store was not recognized from IR");
   Require("Ps5GameExampleImageClear", "excess dispatch",
           !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
@@ -50374,7 +50527,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
-          "GTA3's scalar input was confused with its destination");
+          "the scalar input was confused with its destination");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
@@ -54895,6 +55048,43 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
           ctx.GetPrimitiveResetIndex() == 0xffffffffu &&
               processor.GetDispatchIndirectArgsBaseAddress() == 0,
           "the reset did not clear the context and the indirect bases");
+
+  // A compute queue resets Sh state only, and only when the op names it.
+  CommandProcessor compute(renderer, 0x20);
+  const auto reset_async = [&](uint32_t op, uint32_t gcr) {
+    std::array<uint32_t, 11> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcAcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&acb), op);
+    const std::array<uint32_t, 11> expected{
+        0xc0017900u, 0x342u, 0xce000000u | op, gcr == 0 ? 0u : 0xc0065800u,
+        0,           0,      0,                0,
+        0,           0,      gcr};
+    Pm4Execution execution;
+    Require(name, "async packet",
+            packet == expected &&
+                compute.Process(execution, {packet.data(), acb.cursor_up}) ==
+                    Pm4ProcessResult::Complete,
+            "the async reset packets are not the native ones or did not complete");
+  };
+  compute.GetCtx().SetPrimitiveResetIndex(7);
+  compute.GetShCtx().SetCsUserSgpr(0, 7);
+  compute.GetUcfg().SetPrimitiveResetControl(7);
+  compute.SetDispatchIndirectArgsBaseAddress(0x1000);
+  const auto kept = [&](uint32_t sgpr) {
+    return compute.GetShCtx().GetCs().cs_user_sgpr.value[0] == sgpr &&
+           compute.GetCtx().GetPrimitiveResetIndex() == 7 &&
+           compute.GetUcfg().GetPrimitiveResetControl() == 7 &&
+           compute.GetDispatchIndirectArgsBaseAddress() == 0x1000;
+  };
+  reset_async(0x40u, 0xc1u);
+  reset_async(0x1c0u, 0xc3a1u);
+  Require(name, "async keeps state", kept(7),
+          "an async reset without Sh state reset the queue");
+  reset_async(Op::ShState, 0);
+  Require(name, "async Sh", kept(0),
+          "an async Sh reset did not reset only Sh state");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -55131,8 +55321,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
           emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
                             : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
         }
-        const uint32_t begin = multi && !indexed ? 3 : 0;
-        const uint32_t words = multi ? (indexed ? 10 : 16) : 5;
+        const uint32_t begin = multi ? 3 : 0;
+        const uint32_t words = multi ? 16 : 5;
         const uint32_t opcode = multi ? (indexed ? 0xc0083800u : 0xc0082c00u)
                                       : (indexed ? 0xc0032500u : 0xc0032400u);
         const uint32_t initiator = (indexed ? 0 : 2) |
@@ -55719,6 +55909,17 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
               selected == 11 && returned == 22,
           "long chain did not complete and return to the original caller");
+
+  // A jump fetches from its target with bits 1:0 of the low DWORD cleared.
+  auto jump = indirect(then_commands, false);
+  jump[1] |= 3u;
+  std::copy(jump.begin(), jump.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution jump_execution;
+  Require(name, "jump low bits",
+          processor.Process(jump_execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "a jump fetched its target with the low bits as address bits");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -56523,9 +56724,9 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
 
   Require(name, "wait stream",
           emit(0, 7) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
                                          0xc0023900u, low & ~0x7u, high, 0xe0010000u,
-                                         0xc0017904u, 0x342u, 0xc9000000u} &&
+                                         0xc0017900u, 0x342u, 0xc9000000u} &&
               Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
               Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
           "semaphore wait differs from the native stream");
@@ -56539,7 +56740,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
 
   Require(name, "increment stream",
           emit(0, 6) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
                                          0xc0011000u, poison, poison,
                                          0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
               Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
@@ -56553,6 +56754,68 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   Require(name, "write",
           emit(1, 6) && packet[10] == 0xc0110000u && execute(packet) && counter == 1,
           "semaphore write signal did not set the counter to one");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckPm4WriteDataGds(VulkanHarness &vulkan) {
+  constexpr const char *name = "Pm4WriteDataGds";
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  CommandProcessor processor(context, 0x20);
+  // Increment 0 writes consecutive DWORDs, 1 writes one address.
+  const auto write = [&](uint64_t offset, uint8_t increment) {
+    constexpr std::array<uint32_t, 3> data{0x11u, 0x22u, 0x33u};
+    std::array<uint32_t, 7> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcAcbWriteData(reinterpret_cast<Gen5::CommandBuffer *>(&acb), 3, 0,
+                          offset, data.data(), 3, increment, 0);
+    Pm4Execution execution;
+    return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+  };
+  Require(name, "process", write(3, 0) && write(7, 1),
+          "the GDS writes did not complete");
+  scheduler.Finish();
+  std::array<uint32_t, 5> gds{};
+  Sync::ReadGds(*context.GetBufferCache().GetGdsBuffer(), gds.data(), 3, 5);
+  Require(name, "contents", gds == std::array<uint32_t, 5>{0x11u, 0x22u, 0x33u, 0, 0x33u},
+          "the GDS writes did not land at their DWORD offsets");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+void CheckPm4DmaDataAddress(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DmaDataAddress";
+  namespace Memory = Libs::LibKernel::Memory;
+  constexpr uint64_t base = 0x0000000300030000ull;
+  constexpr uint64_t size = 0x10000;
+  // A destination whose low 32 bits are 0x3022c.
+  constexpr uint64_t destination = base + 0x22c;
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "map",
+          Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size,
+                                             size, 0, &direct_offset) == 0 &&
+              Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+              mapped == reinterpret_cast<void *>(base),
+          "the fixed direct-memory mapping failed");
+  const std::array<uint32_t, 7> fill{KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 0x5eedu, 0,
+                                     static_cast<uint32_t>(destination),
+                                     static_cast<uint32_t>(destination >> 32u), 4};
+  CommandProcessor processor(renderer, 0);
+  Pm4Execution execution;
+  Require(name, "fill",
+          processor.Process(execution, fill) == Pm4ProcessResult::Complete &&
+              *reinterpret_cast<const uint32_t *>(destination) == 0x5eedu,
+          "the DMA fill skipped its destination");
+  Require(name, "unmap",
+          Memory::KernelMunmap(base, size) == 0 &&
+              Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+          "the direct-memory release failed");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -57686,6 +57949,16 @@ int main(int argc, char **argv) {
     CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--write-data-gds-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4WriteDataGds(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dma-data-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -58000,6 +58273,8 @@ int main(int argc, char **argv) {
   CheckPm4LodStatsBoundTextures(vulkan, false);
   CheckPm4LodStatsBoundTextures(vulkan, true);
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+  CheckPm4WriteDataGds(vulkan);
+  CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();

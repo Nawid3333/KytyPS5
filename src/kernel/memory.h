@@ -138,7 +138,8 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
-[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Stops at the first hole, or with span_holes at the end of the last committed range.
+[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
@@ -186,6 +187,8 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
 int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_vaddr,
                                                  uint64_t old_vaddr, uint64_t size, int prot,
                                                  int prot_mask, uint64_t* record_size);
+int KYTY_SYSV_ABI KernelWriteUnmapToPrtCommand(uint32_t* record, uint64_t vaddr, uint64_t size,
+                                               uint64_t* record_size);
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out);
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
