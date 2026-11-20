@@ -125,6 +125,7 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	uint64_t                                     lab_guest_hash = 0;
 };
 
 // A draw's depth target and its first color_count color targets.

@@ -330,6 +330,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .info           = std::move(info),
 	    .specialization = program.specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
+	    .lab_guest_hash = key.hash,
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.

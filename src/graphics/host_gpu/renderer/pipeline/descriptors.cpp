@@ -295,6 +295,9 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
+static thread_local uint64_t t_lab_shader_hash = 0;
+static thread_local uint64_t t_lab_module_id   = 0;
+
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
 	const auto format        = descriptor.Format();
@@ -324,7 +327,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     "depth_tile_bpe=%u swizzle_ok=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
-	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x shader_hash=0x%016" PRIx64
+	     " module=0x%016" PRIx64 " first_use_pc=0x%x descriptor_index=%u source=%u\n",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
@@ -339,7 +343,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     static_cast<uint32_t>(format), static_cast<uint32_t>(descriptor.TileMode()),
 	     descriptor.DstSelXYZW(), resource.read, resource.written, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7], t_lab_shader_hash,
+	     t_lab_module_id, resource.first_use_pc, resource.descriptor_index, resource.source);
 }
 
 // sRGB views decode before filtering; a sampler that skips degamma reads through a UNorm view.
@@ -721,6 +726,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
+	t_lab_shader_hash    = runtime.module->lab_guest_hash;
+	t_lab_module_id      = runtime.module->id;
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -853,6 +860,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& program       = prepared.runtime->module->info;
 	const auto& snapshot      = *prepared.runtime->resources;
+	t_lab_shader_hash         = prepared.runtime->module->lab_guest_hash;
+	t_lab_module_id           = prepared.runtime->module->id;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.

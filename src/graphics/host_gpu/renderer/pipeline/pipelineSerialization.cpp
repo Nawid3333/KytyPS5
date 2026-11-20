@@ -233,6 +233,7 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			IoKey(reader, key);
 			IoAll(reader, plan);
 			IoModule(reader, module);
+			module.lab_guest_hash = key.hash;
 			IoAll(reader, spirv);
 			if (!complete()) {
 				return false;
