@@ -7961,6 +7961,33 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      constexpr uint64_t selection_offset = 0x2e80000;
+      constexpr uint32_t selection_width = 64;
+      constexpr uint64_t selection_layer_size =
+          selection_width * selection_width * sizeof(uint32_t);
+      auto selection_array = MakeLinearDesc(
+          base + selection_offset, selection_layer_size * 2,
+          vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm,
+          Prospero::ImageType::kColor2D, {selection_width, selection_width, 1},
+          2, sizeof(uint32_t), 1);
+      const auto selection_array_id = texture_cache.FindImage(selection_array);
+      auto selection_rows = MakeLinearDesc(
+          base + selection_offset + selection_layer_size + 0x100,
+          selection_width * 16 * sizeof(uint32_t), vk::Format::eR8G8B8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {selection_width, 16, 1}, 1, sizeof(uint32_t), 1);
+      const auto selection_rows_id = texture_cache.FindImage(selection_rows);
+      auto selection_layer = MakeLinearDesc(
+          base + selection_offset + selection_layer_size, selection_layer_size,
+          vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm,
+          Prospero::ImageType::kColor2D, {selection_width, selection_width, 1},
+          1, sizeof(uint32_t), 1);
+      Require(name, "contained layer survives a later overlap",
+              selection_rows_id != selection_array_id &&
+                  texture_cache.FindImage(selection_layer) == selection_array_id &&
+                  selection_layer.view_info.base_layer == 1,
+              "a later overlapping image reset the contained layer selection");
+
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
