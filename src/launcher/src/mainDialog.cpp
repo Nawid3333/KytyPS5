@@ -277,6 +277,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
+	AddFlag(args, info.perf_log_enabled, "--perf-log");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	if (!info.launch_activity.isEmpty()) {
 		args << "--launch-activity" << info.launch_activity;

@@ -341,6 +341,12 @@
              </widget>
             </item>
             <item>
+             <widget class="QCheckBox" name="checkBox_perf_log">
+              <property name="toolTip"><string>Every 10 seconds, write FPS, frame times and their causes (GPU waits, shader compiles, uploads, short sleeps) to the console and log. Slow frames get one line each.</string></property>
+              <property name="text"><string>Write performance log</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_skip_notice_screen">
               <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
               <property name="text"><string>Skip boot logos</string></property>

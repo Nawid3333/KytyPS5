@@ -138,6 +138,7 @@ public:
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
+	bool                   perf_log_enabled            = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
@@ -191,6 +192,7 @@ public:
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
+		perf_log_enabled            = other.perf_log_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		psn_emulation_enabled       = other.psn_emulation_enabled;
