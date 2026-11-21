@@ -726,10 +726,11 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  template <typename InputInfo>
   static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
-                                        ShaderVertexInputInfo &input) {
-    uint32_t push_data_cursor = 0;
-    return cache.GetProgram(params, input, push_data_cursor);
+                                        InputInfo &input,
+                                        ShaderRecompiler::IR::PushData::Window push_data = {}) {
+    return cache.GetProgram(params, input, push_data);
   }
 
   static void StoreLayout(PipelineCache &cache, uint64_t key,
@@ -1969,7 +1970,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, *options.profile, true);
+        result.program, options.input_info, {}, *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -2127,7 +2128,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
-      static_cast<u32>(pixel_info.object_primitive_id));
+      {.begin = static_cast<u32>(pixel_info.object_primitive_id)});
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -3722,7 +3723,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_interrupt_matches =
         compute_interrupt_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x456 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_interrupt_label == 0x55667788u;
 
@@ -3738,7 +3739,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_clock_matches =
         compute_clock_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x567 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_clock_label != 0;
 
@@ -3756,12 +3757,12 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
             compute_done_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x678 << 16 | 0x20) &&
                 interrupt_event.udata == &compute_interrupt_udata &&
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
-    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x789u);
+    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x7654789u);
     gpu.SubmitCompute(0x20, send_context_commands);
     gpu.WaitForIdle();
     finish_gpu();
@@ -3771,7 +3772,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "kSendIntCtx interrupt",
             send_context_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x789u,
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x7654789ll << 16 | 0x20),
             "kSendIntCtx lost its interrupt or context id");
 
     // A GDS release interrupt follows the interrupts queued before it, so
@@ -3802,8 +3803,8 @@ public:
     const auto second_wait = wait_for_interrupt(second_event, second_count);
     Require("GpuCommandLane", "GDS interrupt order",
             parked_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT && first_wait == 0 &&
-                interrupt_count == 1 && interrupt_event.data == 0xa1u &&
-                second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
+                interrupt_count == 1 && interrupt_event.data == (0xa1 << 16 | 0x20) &&
+                second_wait == 0 && second_count == 1 && second_event.data == (0xa2 << 16 | 0x20),
             "a GDS release interrupt overtook an earlier interrupt");
 
     // Repeats of the newest undelivered data count in its event instead of queuing.
@@ -3812,8 +3813,8 @@ public:
     }
     const bool coalesced =
         wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 << 16 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3 << 16;
     Require("GpuCommandLane", "interrupt coalescing", coalesced,
             "undelivered interrupts with the same data were not counted in one event");
 
@@ -20637,9 +20638,6 @@ public:
     vertex_shader.info.stage = ShaderType::Vertex;
     vertex_shader.info.info.vertex_fetch_components[0] = 2;
     vertex_shader.info.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
-    // No narrower host format covers the components the stage reads from either attribute.
-    vertex_shader.vertex_formats = {VulkanFormat(Prospero::BufferFormat::k32_32Float),
-                                    VulkanFormat(color_format)};
     ShaderModule pixel_shader{.id = 2, .module = CreateShaderModule(name, fragment.spirv)};
     pixel_shader.info.stage = ShaderType::Pixel;
     pixel_shader.info.info = fragment.program.info;
@@ -44982,9 +44980,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     }
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
-    const auto push_start = layout == Layout::ShiftedPushData ? 3u :
-                            layout == Layout::StorageData ? PushData::NoStart : 0u;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
+    PushData::Window push_data;
+    if (layout == Layout::ShiftedPushData) push_data.begin = 3u;
+    if (layout == Layout::StorageData) push_data.begin = PushData::DwordCount;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_data);
     Require(test.name, "candidate bindings",
             program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
                 program.info.buffers[0].descriptor_index == 0u &&
@@ -50112,6 +50111,117 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   const std::set<uint64_t> ids(forward.begin(), forward.end());
   Require(name, "distinct modules", ids.size() == forward.size(),
           "different code or specialization shared a module id");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A lookup finds the same pixel module whatever the draw data's size, and the same vertex
+// module whatever the pixel shader data's size.
+void CheckGraphicsPushDataModules(VulkanHarness &vulkan) {
+  using ShaderRecompiler::IR::PushData;
+  constexpr const char *name = "GraphicsPushDataModules";
+  // v_mov_b32 v0..v3, s0..s3; exp mrt0 v0..v3
+  const std::vector<u32> pixel{EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+                               EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+                               EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  // v_mov_b32 v0, s8; exp pos0 v0, v0, v0, v0
+  const std::vector<u32> vertex{EncodeVop1(0x01, 0, 8), EncodeExp0(0x0c, 0xf),
+                                EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)};
+  const ShaderParams pixel_params{.code = pixel, .user_data_count = 4, .hash = 1};
+  const ShaderParams vertex_params{.code = vertex, .user_data_count = 1, .hash = 2};
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto lookup = [&](const ShaderParams &params, auto input, PushData::Window push_data) {
+    return PipelineCacheTestAccess::GetProgram(cache, params, input, push_data);
+  };
+  const auto *pixel_module = lookup(pixel_params, ShaderPixelInputInfo{}, {});
+  Require(name, "pixel module",
+          pixel_module->info.bindings.push_data_start_dword == PushData::DwordCount - 4 &&
+              lookup(pixel_params, ShaderPixelInputInfo{}, {.begin = 1}) == pixel_module,
+          "a pixel program's push data moved with the draw's");
+  const auto *vertex_module = lookup(vertex_params, ShaderVertexInputInfo{}, {.end = 28});
+  Require(name, "vertex module",
+          vertex_module->info.bindings.push_data_start_dword == 0 &&
+              lookup(vertex_params, ShaderVertexInputInfo{}, {}) == vertex_module,
+          "a vertex program's push data moved with the pixel program's");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Vertex formats with the same channel count and type class (Uint, Sint, or any other as
+// Float) share a vertex module; each draw's pipeline holds its own format.
+void CheckVertexFormatModules(VulkanHarness &vulkan) {
+  using F = Prospero::BufferFormat;
+  constexpr const char *name = "VertexFormatModules";
+  // s_mov_b32 s0, 0; s_load_dwordx4 s[20:23], s[8:9]; v_cndmask_b32 v0, v8, v5;
+  // buffer_load_format_xyzw v[9:12], v0, s[20:23] idxen; exp pos0 v9..v12
+  const std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                              EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                              EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                              EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
+  const ShaderParams params{.code = code, .user_data_count = 2, .hash = 3};
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  auto &cache = context.GetPipelineCache();
+  // The vertex module and pipeline of a draw fetching attribute 0 in `format`.
+  const auto draw = [&](F format) {
+    DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+    auto &input = state.vertex_info[0];
+    input.has_dynamic_vertex_fetch = true;
+    input.resources_num = input.buffers_num = 1;
+    input.buffers[0].stride = 16;
+    input.resources[0].fields[3] = DstSel(4, 5, 6, 7) | BufferFormat(format) << 12u;
+    input.resources_dst[0] = {.registers_num = 4, .attr_id = 0};
+    const auto *module = PipelineCacheTestAccess::GetProgram(cache, params, input);
+    return std::pair{module, cache.GetGraphicsPipeline(scheduler.Current(), state, {}).pipeline};
+  };
+  const auto uint8 = draw(F::k8_8_8_8UInt);
+  const auto uint16 = draw(F::k16_16_16_16UInt);
+  const auto unorm8 = draw(F::k8_8_8_8UNorm);
+  const auto float32 = draw(F::k32_32_32_32Float);
+  Require(name, "shared module",
+          uint16.first == uint8.first && float32.first == unorm8.first &&
+              uint16.second != uint8.second,
+          "formats differing only in channel widths compiled separate vertex modules or shared "
+          "a pipeline");
+  Require(name, "distinct modules",
+          unorm8.first != uint8.first && draw(F::k8_8_8_8SInt).first != uint8.first &&
+              draw(F::k8_8UInt).first != uint8.first,
+          "a vertex module was shared across integer signedness or channel counts");
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Graphics and async dispatches share a compute module; an async dispatch of one that reads HW_ID2 exits.
+void CheckComputeQueueModules(VulkanHarness &vulkan) {
+  constexpr const char *name = "ComputeQueueModules";
+  const std::vector<u32> plain{EncodeSopp(0x01)};
+  const std::vector<u32> queue_read{0xb96a1818u, EncodeSopp(0x01)}; // s_getreg_b32 vcc_lo, HW_ID2
+  for (const auto *code : {&plain, &queue_read})
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto compile = [&](const std::vector<u32> &code, bool async) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    ShaderComputeInputInfo input{};
+    input.async_compute = async;
+    return cache.GetComputeProgram(regs, input);
+  };
+  const auto *graphics = compile(plain, false);
+  Require(name, "shared module", compile(plain, true) == graphics,
+          "async compute recompiled a shader that does not read its queue");
+  Require(name, "queue read", compile(queue_read, false)->info.info.reads_queue_id,
+          "the graphics module did not record its HW_ID2 queue read");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal(name, [&] { (void)compile(queue_read, true); });
+#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -58325,6 +58435,9 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckComputeQueueModules(vulkan);
+  CheckGraphicsPushDataModules(vulkan);
+  CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
