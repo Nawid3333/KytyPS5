@@ -631,16 +631,15 @@ static const MergedHullSplit& ShaderSplitMergedHull(std::span<const uint32_t> co
 	const auto [entry, inserted] = splits.try_emplace(hash);
 	auto& split                  = entry->second;
 	if (inserted) {
-		::printf("lab merged LS+HS program 0x%016llx words=%zu\n", static_cast<unsigned long long>(hash),
-		         code.size());
+		std::string lab_dump = fmt::format("lab merged LS+HS program 0x{:016x} words={}\n", hash, code.size());
 		for (size_t i = 0; i < code.size(); i += 8) {
-			::printf("lab merged %05zx:", i * sizeof(uint32_t));
+			lab_dump += fmt::format("lab merged {:05x}:", i * sizeof(uint32_t));
 			for (size_t j = i; j < std::min(code.size(), i + 8); ++j) {
-				::printf(" %08x", code[j]);
+				lab_dump += fmt::format(" {:08x}", code[j]);
 			}
-			::printf("\n");
+			lab_dump += "\n";
 		}
-		std::fflush(stdout);
+		Log::WriteToConsoleAndLog(lab_dump);
 		split.halves = ShaderRecompiler::SplitMergedHullProgram(code);
 		split.local_hash =
 		    XXH3_64bits(split.halves.local.data(), split.halves.local.size() * sizeof(uint32_t));
