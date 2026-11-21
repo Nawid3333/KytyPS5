@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
@@ -782,7 +783,7 @@ struct LabFrameLog {
 			const auto cnt   = [&](Cnt c) { return static_cast<unsigned long long>(delta(c)); };
 			const double upload_kb =
 			    (delta(Cnt::TextureUploadBytes) + delta(Cnt::BufferUploadBytes)) / 1024.0;
-			std::printf("[LAB hitch] t=%.1f ms=%.1f gpu_wait_ms=%.1f compile_ms=%.1f compiles=%llu "
+			Log::WriteToConsoleAndLog(fmt::sprintf("[LAB hitch] t=%.1f ms=%.1f gpu_wait_ms=%.1f compile_ms=%.1f compiles=%llu "
 			            "pipeline_ms=%.1f pipelines=%llu meta_readback_ms=%.1f gpu_busy_ms=%.1f "
 			            "present_ms=%.1f upload_kb=%.1f faults=%llu draws=%llu file_read_kb=%.1f\n",
 			            std::chrono::duration<double>(now - first).count(), static_cast<double>(ms),
@@ -790,8 +791,7 @@ struct LabFrameLog {
 			            ms_of(Cnt::PipelineCreateNs), cnt(Cnt::PipelinesCreated),
 			            ms_of(Cnt::ColorMetadataReadbackNs), ms_of(Cnt::GpuThreadBusyNs),
 			            ms_of(Cnt::PresentNs), upload_kb, cnt(Cnt::GpuFaults), cnt(Cnt::Draws),
-			            delta(Cnt::GuestFileReadBytes) / 1024.0);
-			std::fflush(stdout);
+			            delta(Cnt::GuestFileReadBytes) / 1024.0));
 		}
 		snap = cur;
 		intervals.push_back(ms);
@@ -819,7 +819,7 @@ struct LabFrameLog {
 			return static_cast<double>(cur[static_cast<size_t>(c)] - window[static_cast<size_t>(c)]);
 		};
 		const double short_sleeps = in_window(Cnt::GuestShortSleeps);
-		std::printf("[LAB time] seconds=%.1f gpu_wait_ms=%.1f gpu_busy_ms=%.1f compile_ms=%.1f compiles=%.0f "
+		Log::WriteToConsoleAndLog(fmt::sprintf("[LAB time] seconds=%.1f gpu_wait_ms=%.1f gpu_busy_ms=%.1f compile_ms=%.1f compiles=%.0f "
 		            "pipeline_ms=%.1f pipelines=%.0f upload_mb=%.1f present_ms=%.1f late_vblanks=%.0f "
 		            "short_sleeps=%.0f short_sleep_ms=%.1f short_sleep_avg_us=%.1f\n",
 		            seconds, in_window(Cnt::GpuWaitNs) / 1e6, in_window(Cnt::GpuThreadBusyNs) / 1e6,
@@ -828,14 +828,13 @@ struct LabFrameLog {
 		            (in_window(Cnt::TextureUploadBytes) + in_window(Cnt::BufferUploadBytes)) / (1024.0 * 1024.0),
 		            in_window(Cnt::PresentNs) / 1e6, in_window(Cnt::LateVblanks), short_sleeps,
 		            in_window(Cnt::GuestShortSleepNs) / 1e6,
-		            short_sleeps > 0.0 ? in_window(Cnt::GuestShortSleepNs) / short_sleeps / 1e3 : 0.0);
-		std::fflush(stdout);
+		            short_sleeps > 0.0 ? in_window(Cnt::GuestShortSleepNs) / short_sleeps / 1e3 : 0.0));
 		window = cur;
-		std::printf("[LAB fps] fps=%.2f mean_ms=%.2f p50_ms=%.2f p99_ms=%.2f max_ms=%.2f flips=%zu seconds=%.1f draws_per_flip=%.0f hitches=%zu excess_ms=%.1f\n",
+		Log::WriteToConsoleAndLog(fmt::sprintf("[LAB fps] fps=%.2f mean_ms=%.2f p50_ms=%.2f p99_ms=%.2f max_ms=%.2f flips=%zu seconds=%.1f draws_per_flip=%.0f hitches=%zu excess_ms=%.1f\n",
 		            static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
 		            static_cast<double>(at(0.5)), static_cast<double>(at(0.99)), static_cast<double>(sorted.back()),
 		            intervals.size(), seconds,
-		            static_cast<double>(draws - draws0) / static_cast<double>(intervals.size()), hitches, excess);
+		            static_cast<double>(draws - draws0) / static_cast<double>(intervals.size()), hitches, excess));
 		intervals.clear();
 		start  = now;
 		draws0 = draws;
