@@ -73,6 +73,10 @@ namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpSessionSignaling {
+void InitNet_1_NpSessionSignaling(Loader::SymbolDatabase *symbols);
+}
+
 namespace Libs::LibNpCommerce {
 void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
 }
@@ -524,7 +528,7 @@ void TestFileDescriptorFlags() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"8nY19bKoiZk", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"8nY19bKoiZk", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fcntl export resolves");
   const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int)>(symbol->vaddr);
   Check(fcntl(std::numeric_limits<int>::min(), 1, 0) == -1 &&
@@ -549,13 +553,71 @@ void TestFileDescriptorFlags() {
   }
 }
 
+void TestSharedDescriptorTable() {
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  namespace Net = Libs::Network::Net;
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  Check(EventQueue::KernelCreateEqueue(&queue, "descriptors") == OK, "create an event queue");
+  const int epoll = Net::EpollCreate("descriptors", 0);
+  const int socket = Net::Socket(2, 2, 0);
+  Check(static_cast<int>(static_cast<uint32_t>(queue)) == file + 1 && (queue >> 32) > 0 &&
+            epoll == file + 2 && socket == file + 3,
+        "files, event queues, epolls and sockets take consecutive descriptors of one table");
+  Check(FileSystem::KernelClose(file) == OK && Net::Socket(2, 2, 0) == file,
+        "a socket takes the lowest descriptor a file freed");
+  Check(Net::SocketClose(file) == OK && EventQueue::KernelDeleteEqueue(queue) == OK &&
+            Net::EpollDestroy(epoll) == 0 && Net::SocketClose(socket) == OK,
+        "release the shared descriptors");
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelOpen("/dev/urandom", 0, 0) == d, "files reuse every released descriptor");
+  }
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelClose(d) == OK, "close the reopened files");
+  }
+}
+
+void TestSessionSignalingDescriptors() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpSessionSignaling::InitNet_1_NpSessionSignaling(&symbols);
+  const auto *initialize_symbol = symbols.Find(
+      {"ysmw6J-P8Ak", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  const auto *terminate_symbol = symbols.Find(
+      {"CqJuNXo5yiM", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  Check(initialize_symbol != nullptr && terminate_symbol != nullptr,
+        "NpSessionSignaling initialize and terminate exports resolve");
+  const auto initialize =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const void *)>(initialize_symbol->vaddr);
+  const auto terminate = reinterpret_cast<int (KYTY_SYSV_ABI *)()>(terminate_symbol->vaddr);
+  constexpr int NotInitialized = static_cast<int>(0x80553301u);
+  constexpr int AlreadyInitialized = static_cast<int>(0x80553302u);
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(FileSystem::KernelClose(file) == OK, "find the lowest free descriptor");
+  struct InitParam {
+    int http2_context = 0;
+    size_t pool_size = 0x80000;
+    uint64_t cpu_affinity_mask = 0;
+    int32_t thread_priority = 700;
+    size_t thread_stack_size = 0x8000;
+  } param;
+  Check(initialize(&param) == OK && initialize(&param) == AlreadyInitialized,
+        "NpSessionSignaling initializes once");
+  const int after_initialize = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_initialize == file + 3 && FileSystem::KernelClose(after_initialize) == OK,
+        "the initialized library holds three descriptors");
+  Check(terminate() == OK && terminate() == NotInitialized, "NpSessionSignaling terminates once");
+  const int after_terminate = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_terminate == file && FileSystem::KernelClose(after_terminate) == OK,
+        "terminate releases the library's descriptors");
+}
+
 void TestSysmoduleReferences() {
   Loader::SymbolDatabase symbols;
   Libs::InitSysmodule_1(&symbols);
   using ModuleCall = int (KYTY_SYSV_ABI *)(uint16_t);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+        {nid, "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
     Check(symbol != nullptr, "Sysmodule export resolves");
     return reinterpret_cast<ModuleCall>(symbol->vaddr);
   };
@@ -580,7 +642,7 @@ void TestSysmoduleReferences() {
           "last unload restores unloaded status");
   }
   const auto* internal_symbol = symbols.Find(
-      {"hHrGoGoNf+s", "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+      {"hHrGoGoNf+s", "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
   Check(internal_symbol != nullptr, "internal Sysmodule load export resolves");
   const auto internal_load =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
@@ -600,7 +662,7 @@ void TestSystemServiceEntitlementEvents() {
   Libs::InitAppContent_1(&symbols);
   const auto resolve = [&](const char* nid, const char* library, const char* module) {
     const auto* symbol = symbols.Find(
-        {nid, library, 1, module, 1, 1, Loader::SymbolType::Func});
+        {nid, library, module, Loader::SymbolType::Func});
     Check(symbol != nullptr, "entitlement event export resolves");
     return symbol->vaddr;
   };
@@ -870,7 +932,7 @@ void TestFsync() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"juWbTNM+8hw", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fsync export resolves");
   const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
   Check(fsync(std::numeric_limits<int>::min()) == -1 &&
@@ -899,7 +961,7 @@ void TestSaveTruncate() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"WlyEA-sLDf0", "libkernel", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "sceKernelTruncate export resolves");
   const auto truncate =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
@@ -954,7 +1016,7 @@ void TestSaveWritev() {
   Libs::InitLibKernel_1(&symbols);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+        {nid, "libkernel", "libkernel", Loader::SymbolType::Func});
     Check(symbol != nullptr, "vectored write export resolves");
     return symbol->vaddr;
   };
@@ -2660,25 +2722,25 @@ void CheckSocketWakeup() {
   Libs::LibNet::InitNet_1_Net(&symbols);
   Libs::InitLibKernel_1(&symbols);
   const auto *shutdown_symbol = symbols.Find(
-      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"TUuiYS2kE8s", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(shutdown_symbol != nullptr, "POSIX shutdown export resolves");
   const auto shutdown = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int)>(shutdown_symbol->vaddr);
   const auto *connect_symbol = symbols.Find(
-      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"OXXX4mUk3uk", "Net", "Net", Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
-      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"xphrZusl78E", "Net", "Net", Loader::SymbolType::Func});
   const auto *setsockopt_symbol = symbols.Find(
-      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"2mKX2Spso7I", "Net", "Net", Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
-      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"beRjXBn-z+o", "Net", "Net", Loader::SymbolType::Func});
   const auto *sendto_symbol = symbols.Find(
-      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"gvD1greCu0A", "Net", "Net", Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
-      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"9wO9XrMsNhc", "Net", "Net", Loader::SymbolType::Func});
   const auto *recvfrom_symbol = symbols.Find(
-      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"304ooNZxWDY", "Net", "Net", Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
-      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"HQOwnfMGipQ", "Net", "Net", Loader::SymbolType::Func});
   Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
             recv_symbol && recvfrom_symbol && errno_symbol,
         "Net socket and errno exports resolve with the guest ABI versions");
@@ -3040,6 +3102,8 @@ int main(int argc, char** argv) {
   TestAddContent(temporary.Path());
   TestRandomDevices();
   TestFileDescriptorFlags();
+  TestSharedDescriptorTable();
+  TestSessionSignalingDescriptors();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());
