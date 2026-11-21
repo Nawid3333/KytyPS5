@@ -758,6 +758,7 @@ struct LabFrameLog {
 	Clock::time_point  last {};
 	std::vector<float> intervals;
 	Totals             snap {};
+	Totals             window {};
 	uint64_t           draws0  = 0;
 	size_t             printed = 0;
 	void Flip(Clock::time_point now) {
@@ -766,6 +767,7 @@ struct LabFrameLog {
 			start  = now;
 			last   = now;
 			snap   = ReadCounters();
+			window = snap;
 			draws0 = snap[static_cast<size_t>(Cnt::Draws)];
 			return;
 		}
@@ -814,6 +816,22 @@ struct LabFrameLog {
 			}
 		}
 		const uint64_t draws = Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws);
+		const auto     in_window = [&](Cnt c) {
+			return static_cast<double>(cur[static_cast<size_t>(c)] - window[static_cast<size_t>(c)]);
+		};
+		const double short_sleeps = in_window(Cnt::GuestShortSleeps);
+		std::printf("[LAB time] seconds=%.1f gpu_wait_ms=%.1f gpu_busy_ms=%.1f compile_ms=%.1f compiles=%.0f "
+		            "pipeline_ms=%.1f pipelines=%.0f upload_mb=%.1f present_ms=%.1f late_vblanks=%.0f "
+		            "short_sleeps=%.0f short_sleep_ms=%.1f short_sleep_avg_us=%.1f\n",
+		            seconds, in_window(Cnt::GpuWaitNs) / 1e6, in_window(Cnt::GpuThreadBusyNs) / 1e6,
+		            in_window(Cnt::ShaderCompileNs) / 1e6, in_window(Cnt::ShadersCompiled),
+		            in_window(Cnt::PipelineCreateNs) / 1e6, in_window(Cnt::PipelinesCreated),
+		            (in_window(Cnt::TextureUploadBytes) + in_window(Cnt::BufferUploadBytes)) / (1024.0 * 1024.0),
+		            in_window(Cnt::PresentNs) / 1e6, in_window(Cnt::LateVblanks), short_sleeps,
+		            in_window(Cnt::GuestShortSleepNs) / 1e6,
+		            short_sleeps > 0.0 ? in_window(Cnt::GuestShortSleepNs) / short_sleeps / 1e3 : 0.0);
+		std::fflush(stdout);
+		window = cur;
 		std::printf("[LAB fps] fps=%.2f mean_ms=%.2f p50_ms=%.2f p99_ms=%.2f max_ms=%.2f flips=%zu seconds=%.1f draws_per_flip=%.0f hitches=%zu excess_ms=%.1f\n",
 		            static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
 		            static_cast<double>(at(0.5)), static_cast<double>(at(0.99)), static_cast<double>(sorted.back()),
@@ -841,19 +859,24 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 }
 
 bool PerformanceOverlayEnabled() noexcept {
-	return Common::DebugCounters::Enabled();
+	return Common::DebugCounters::Detail::g_lab_overlay_visible.load(std::memory_order_acquire);
 }
 
 void TogglePerformanceOverlay() noexcept {
-	SetOverlayEnabled(!Common::DebugCounters::Enabled());
+	const bool visible = !PerformanceOverlayEnabled();
+	Common::DebugCounters::Detail::g_lab_overlay_visible.store(visible, std::memory_order_release);
+	if (visible) {
+		SetOverlayEnabled(true);
+	}
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TogglePerformanceOverlayDetails() noexcept {
-	if (Common::DebugCounters::Enabled()) {
+	if (PerformanceOverlayEnabled()) {
 		g_details.store(!g_details.load(std::memory_order_acquire), std::memory_order_release);
 	} else {
 		g_details.store(true, std::memory_order_release);
+		Common::DebugCounters::Detail::g_lab_overlay_visible.store(true, std::memory_order_release);
 		SetOverlayEnabled(true);
 	}
 	g_revision.fetch_add(1, std::memory_order_acq_rel);

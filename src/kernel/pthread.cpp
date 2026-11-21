@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/fpEnv.h"
 #include "common/hostException.h"
@@ -26,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -512,6 +514,11 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
+	std::optional<Common::DebugCounters::ScopedTimer> lab_short_sleep;
+	if (microseconds < 500) {
+		lab_short_sleep.emplace(Common::DebugCounters::Counter::GuestShortSleeps,
+		                        Common::DebugCounters::Counter::GuestShortSleepNs);
+	}
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
@@ -525,6 +532,11 @@ static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
+	}
+	std::optional<Common::DebugCounters::ScopedTimer> lab_short_sleep;
+	if (nanoseconds < 500000) {
+		lab_short_sleep.emplace(Common::DebugCounters::Counter::GuestShortSleeps,
+		                        Common::DebugCounters::Counter::GuestShortSleepNs);
 	}
 
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
