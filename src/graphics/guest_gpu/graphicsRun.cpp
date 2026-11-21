@@ -448,7 +448,11 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						Common::DebugCounters::ScopedTimer lab_park(Common::DebugCounters::Counter::QueueParks,
+						                                            Common::DebugCounters::Counter::QueueParkNs);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;

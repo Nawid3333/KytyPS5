@@ -820,15 +820,17 @@ struct LabFrameLog {
 		};
 		const double short_sleeps = in_window(Cnt::GuestShortSleeps);
 		Log::WriteToConsoleAndLog(fmt::sprintf("[LAB time] seconds=%.1f gpu_wait_ms=%.1f gpu_busy_ms=%.1f compile_ms=%.1f compiles=%.0f "
-		            "pipeline_ms=%.1f pipelines=%.0f upload_mb=%.1f present_ms=%.1f late_vblanks=%.0f "
-		            "short_sleeps=%.0f short_sleep_ms=%.1f short_sleep_avg_us=%.1f\n",
+		            "pipeline_ms=%.1f pipelines=%.0f upload_mb=%.1f tex_upload_mb=%.1f buf_upload_mb=%.1f present_ms=%.1f late_vblanks=%.0f "
+		            "short_sleeps=%.0f short_sleep_ms=%.1f short_sleep_avg_us=%.1f parks=%.0f park_ms=%.1f\n",
 		            seconds, in_window(Cnt::GpuWaitNs) / 1e6, in_window(Cnt::GpuThreadBusyNs) / 1e6,
 		            in_window(Cnt::ShaderCompileNs) / 1e6, in_window(Cnt::ShadersCompiled),
 		            in_window(Cnt::PipelineCreateNs) / 1e6, in_window(Cnt::PipelinesCreated),
 		            (in_window(Cnt::TextureUploadBytes) + in_window(Cnt::BufferUploadBytes)) / (1024.0 * 1024.0),
+		            in_window(Cnt::TextureUploadBytes) / (1024.0 * 1024.0), in_window(Cnt::BufferUploadBytes) / (1024.0 * 1024.0),
 		            in_window(Cnt::PresentNs) / 1e6, in_window(Cnt::LateVblanks), short_sleeps,
 		            in_window(Cnt::GuestShortSleepNs) / 1e6,
-		            short_sleeps > 0.0 ? in_window(Cnt::GuestShortSleepNs) / short_sleeps / 1e3 : 0.0));
+		            short_sleeps > 0.0 ? in_window(Cnt::GuestShortSleepNs) / short_sleeps / 1e3 : 0.0,
+		            in_window(Cnt::QueueParks), in_window(Cnt::QueueParkNs) / 1e6));
 		window = cur;
 		Log::WriteToConsoleAndLog(fmt::sprintf("[LAB fps] fps=%.2f mean_ms=%.2f p50_ms=%.2f p99_ms=%.2f max_ms=%.2f flips=%zu seconds=%.1f draws_per_flip=%.0f hitches=%zu excess_ms=%.1f\n",
 		            static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),

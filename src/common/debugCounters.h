@@ -54,6 +54,8 @@ enum class Counter {
 	OverlayNs,
 	GuestShortSleeps,
 	GuestShortSleepNs,
+	QueueParks,
+	QueueParkNs,
 	Count
 };
 
