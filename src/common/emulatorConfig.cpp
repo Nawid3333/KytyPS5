@@ -29,8 +29,9 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(true);
+	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled || cfg.perf_log_enabled);
 	Common::DebugCounters::Detail::g_lab_overlay_visible.store(cfg.perf_overlay_enabled);
+	Common::DebugCounters::Detail::g_lab_log.store(cfg.perf_log_enabled);
 }
 
 uint32_t GetScreenWidth() {

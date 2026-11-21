@@ -183,7 +183,7 @@ void SamplerThread(const std::stop_token& stop) {
 	uint64_t                                sampled_generation = 0;
 	std::unique_lock                        lock(g_host_mutex);
 	while (!stop.stop_requested()) {
-		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled(); });
+		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Detail::g_lab_overlay_visible.load(std::memory_order_acquire); });
 		if (stop.stop_requested()) {
 			break;
 		}
@@ -197,11 +197,11 @@ void SamplerThread(const std::stop_token& stop) {
 		lock.lock();
 		g_host_stats      = std::move(stats);
 		g_host_generation = generation;
-		if (Common::DebugCounters::Enabled() && GuestStalled(Clock::now())) {
+		if (Common::DebugCounters::Detail::g_lab_overlay_visible.load(std::memory_order_acquire) && GuestStalled(Clock::now())) {
 			g_revision.fetch_add(1, std::memory_order_acq_rel);
 		}
 		g_sampler_wait.wait_for(lock, stop, REFRESH_INTERVAL, [generation] {
-			return !Common::DebugCounters::Enabled() ||
+			return !Common::DebugCounters::Detail::g_lab_overlay_visible.load(std::memory_order_acquire) ||
 			       generation != g_generation.load(std::memory_order_acquire);
 		});
 	}
@@ -745,11 +745,10 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 	}
 }
 
-// LAB: frame pacing every 10 s of flips ([LAB fps]); needs the overlay counters on (--perf-overlay).
+// LAB: frame pacing every 10 s of flips ([LAB fps], [LAB time]); only with --perf-log (launcher: Write performance log).
 // [LAB hitch]: one line per frame interval > 100 ms (cap 2000 lines per run). Every field is a
 // Common::DebugCounters delta since the PREVIOUS flip; the snapshot is refreshed at EVERY flip, so
-// a line covers exactly that frame. The flip hook returns early when the counters are off, so runs
-// without --perf-overlay produce neither [LAB fps] nor [LAB hitch] lines.
+// a line covers exactly that frame. Runs without --perf-log print none of these lines.
 struct LabFrameLog {
 	using Cnt    = Common::DebugCounters::Counter;
 	using Totals = std::array<uint64_t, static_cast<size_t>(Cnt::Count)>;
@@ -853,7 +852,9 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 	std::scoped_lock lock(g_frame_mutex);
 	const auto now = Clock::now();
 	g_frames.Record(now, ReadCounters());
-	g_lab_fps.Flip(now);
+	if (Common::DebugCounters::Detail::g_lab_log.load(std::memory_order_acquire)) {
+		g_lab_fps.Flip(now);
+	}
 	g_frames.guest_width  = guest_width;
 	g_frames.guest_height = guest_height;
 }
@@ -867,6 +868,8 @@ void TogglePerformanceOverlay() noexcept {
 	Common::DebugCounters::Detail::g_lab_overlay_visible.store(visible, std::memory_order_release);
 	if (visible) {
 		SetOverlayEnabled(true);
+	} else if (!Common::DebugCounters::Detail::g_lab_log.load(std::memory_order_acquire)) {
+		SetOverlayEnabled(false);
 	}
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
