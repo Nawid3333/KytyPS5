@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/fpEnv.h"
 #include "common/hostException.h"
@@ -26,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -507,6 +509,11 @@ static void SchedulerBackoffOnce() {
 
 // A guest signal queued as a special user APC runs only when the sleep returns.
 static void SleepNanoInSlices(uint64_t nanoseconds) {
+	std::optional<Common::DebugCounters::ScopedTimer> lab_short_sleep;
+	if (nanoseconds != 0 && nanoseconds < 500000) {
+		lab_short_sleep.emplace(Common::DebugCounters::Counter::GuestShortSleeps,
+		                        Common::DebugCounters::Counter::GuestShortSleepNs);
+	}
 	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
 	const auto         start       = Common::SteadyNs();
 	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {

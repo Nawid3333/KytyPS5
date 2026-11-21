@@ -52,6 +52,8 @@ enum class Counter {
 	PresentNs, // Includes image acquire and overlay preparation.
 	PresentAcquireNs,
 	OverlayNs,
+	GuestShortSleeps,
+	GuestShortSleepNs,
 	Count
 };
 
@@ -59,6 +61,7 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_lab_overlay_visible {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
