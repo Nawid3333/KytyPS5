@@ -89,6 +89,31 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+void LabPrintShaderCode(uint64_t hash) {
+	if (g_shader_map == nullptr || hash == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	for (const auto& [addr, entry]: *g_shader_map) {
+		if (entry.hash != hash) {
+			continue;
+		}
+		const auto  words = entry.data.code_size_bytes / sizeof(uint32_t);
+		const auto* code  = reinterpret_cast<const uint32_t*>(addr);
+		::printf("lab shader 0x%016" PRIx64 " at 0x%016" PRIx64 " type=%d words=%zu\n", hash, addr,
+		         static_cast<int>(entry.data.type), words);
+		for (size_t i = 0; i < words; i += 8) {
+			::printf("lab code %05zx:", i * sizeof(uint32_t));
+			for (size_t j = i; j < std::min(words, i + 8); ++j) {
+				::printf(" %08x", code[j]);
+			}
+			::printf("\n");
+		}
+		return;
+	}
+	::printf("lab shader 0x%016" PRIx64 " is not in the shader map\n", hash);
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
