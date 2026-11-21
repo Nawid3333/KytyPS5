@@ -72,15 +72,15 @@ void LabNoteUpload(const ImageInfo& info, bool cpu_dirty, bool buffer_modified) 
 		total_count += entry.count;
 	}
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lab_since).count();
-	LOGF("[lab-upload] window %" PRIu64 ": %" PRIu64 " uploads, %" PRIu64 " MiB in %lld ms, %zu images\n",
-	     lab_window, total_count, total_bytes >> 20, static_cast<long long>(ms), sorted.size());
+	Log::WriteToConsoleAndLog(fmt::sprintf("[lab-upload] window %" PRIu64 ": %" PRIu64 " uploads, %" PRIu64 " MiB in %lld ms, %zu images\n",
+	     lab_window, total_count, total_bytes >> 20, static_cast<long long>(ms), sorted.size()));
 	for (size_t i = 0; i < sorted.size() && i < 10; i++) {
 		const auto& [address, entry] = sorted[i];
-		LOGF("[lab-upload]   0x%016" PRIx64 " %ux%u l%u m%u fmt%u tiled%u: %" PRIu64 " x %" PRIu64
+		Log::WriteToConsoleAndLog(fmt::sprintf("[lab-upload]   0x%016" PRIx64 " %ux%u l%u m%u fmt%u tiled%u: %" PRIu64 " x %" PRIu64
 		     " KiB (cpu_dirty %" PRIu64 ", buffer_modified %" PRIu64 ")\n",
 		     address, entry.width, entry.height, entry.layers, entry.levels, entry.guest_format,
 		     entry.tiled, entry.count, entry.count != 0 ? (entry.bytes / entry.count) >> 10 : 0,
-		     entry.cpu_dirty, entry.buffer_modified);
+		     entry.cpu_dirty, entry.buffer_modified));
 	}
 	lab_tallies.clear();
 	lab_since = now;
@@ -1034,7 +1034,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		if (std::getenv("KYTY_LAB_UPLOAD_LOG") != nullptr) {
+		if (Common::DebugCounters::Detail::g_lab_log.load(std::memory_order_relaxed)) {
 			LabNoteUpload(image.info, image.IsCpuDirty(), image.IsBufferModified());
 		}
 		const auto [source, source_offset] =
