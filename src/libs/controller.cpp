@@ -193,6 +193,31 @@ static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_specia
 static Common::Mutex g_router_mutex;
 static std::vector<std::pair<int, int>> g_pad_players;
 
+static Common::Mutex g_lab2083_mutex;
+static uint32_t      g_lab2083_buttons  = 0xffffffffu;
+static int           g_lab2083_l2       = -1;
+static int           g_lab2083_r2       = -1;
+static int32_t       g_lab2083_state[2] = {-1, -1};
+
+static int Lab2083Bucket(int value) {
+	return value == 0 ? 0 : value >= 255 ? 2 : 1;
+}
+
+static void Lab2083LogRead(const char* what, int handle, const PadData& data) {
+	Common::LockGuard lock(g_lab2083_mutex);
+	const int l2 = Lab2083Bucket(data.analog_buttons_l2);
+	const int r2 = Lab2083Bucket(data.analog_buttons_r2);
+	if (data.buttons == g_lab2083_buttons && l2 == g_lab2083_l2 && r2 == g_lab2083_r2) {
+		return;
+	}
+	g_lab2083_buttons = data.buttons;
+	g_lab2083_l2      = l2;
+	g_lab2083_r2      = r2;
+	LOGF("[lab-2083] %s handle=%d connected=%d buttons=0x%08x l2=%u r2=%u\n", what, handle,
+	     data.connected ? 1 : 0, data.buttons, static_cast<unsigned>(data.analog_buttons_l2),
+	     static_cast<unsigned>(data.analog_buttons_r2));
+}
+
 static uint32_t g_keyboard_player = 0;
 
 static void RefreshPlayers();
@@ -1411,6 +1436,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PlayerForHandle(handle)->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
+	Lab2083LogRead("read_state", handle, *data);
 
 	return OK;
 }
@@ -1444,6 +1470,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
+		Lab2083LogRead("read", handle, data[i]);
 	}
 
 	return ret_num;
@@ -1506,13 +1533,20 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	return PlayerForHandle(handle)->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+	const bool accepted = PlayerForHandle(handle)->SetTriggerEffect(*param);
+	for (int i = 0; i < 2; i++) {
+		const auto& c = param->command[i];
+		LOGF("[lab-2083] set_trigger_effect handle=%d mask=0x%02x %s mode=%u data=%02x %02x %02x %02x "
+		     "%02x %02x %02x %02x %02x %02x %02x -> %s\n",
+		     handle, static_cast<unsigned>(param->trigger_mask), i == 0 ? "L2" : "R2", c.mode,
+		     c.data[0], c.data[1], c.data[2], c.data[3], c.data[4], c.data[5], c.data[6], c.data[7],
+		     c.data[8], c.data[9], c.data[10], accepted ? "OK" : "INVALID_ARG");
+	}
+	return accepted ? OK : PAD_ERROR_INVALID_ARG;
 }
 
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
 	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1522,6 +1556,15 @@ int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInfo
 	}
 
 	PlayerForHandle(handle)->GetTriggerEffectState(info);
+	{
+		Common::LockGuard lock(g_lab2083_mutex);
+		if (info->state[0] != g_lab2083_state[0] || info->state[1] != g_lab2083_state[1]) {
+			g_lab2083_state[0] = info->state[0];
+			g_lab2083_state[1] = info->state[1];
+			LOGF("[lab-2083] trigger_effect_state handle=%d L2=%d R2=%d\n", handle, info->state[0],
+			     info->state[1]);
+		}
+	}
 
 	return OK;
 }

@@ -705,6 +705,13 @@ void HostInputPadButton(int id, int button, bool down) {
 void HostInputPadTrigger(int id, bool left, int value) {
 	const auto  source     = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
 	const auto  control    = GetInputMap().PadControl(source);
+	static bool lab2083_logged[2] = {};
+	if (!lab2083_logged[left ? 0 : 1]) {
+		lab2083_logged[left ? 0 : 1] = true;
+		LOGF("[lab-2083] host trigger %s -> control %zu (invalid %zu), pad button 0x%08x\n",
+		     left ? "L2" : "R2", control, INVALID_CONTROL,
+		     control == INVALID_CONTROL ? 0u : CONTROL_INFO[control].button);
+	}
 	if (control == INVALID_CONTROL) {
 		return;
 	}
