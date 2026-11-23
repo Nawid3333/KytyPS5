@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <limits>
 #include <map>
 #include <mutex>
 #include <span>
@@ -49,6 +50,7 @@ struct GraphicContext {
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
+	vk::DeviceSize                     max_buffer_size = std::numeric_limits<vk::DeviceSize>::max();
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	Common::Mutex                      queue_mutex;
