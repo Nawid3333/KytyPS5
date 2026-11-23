@@ -6504,6 +6504,47 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      {
+        constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+        constexpr uint64_t limit_pages = 4;
+        constexpr uint64_t capped_size = 8 * page;
+        auto &buffer_limit = m_runtime_context.max_buffer_size;
+        const auto original_buffer_limit = buffer_limit;
+        buffer_limit = 2 * (page + BufferCache::STREAM_LEAP_SIZE) + limit_pages * page;
+        const uint64_t free_window = base + 0x4000000 + 0x100;
+        Require(name, "window below the limit unchanged",
+                cache.FitWindow(free_window, 3 * page) == 3 * page &&
+                    cache.FitWindow(free_window, capped_size) == limit_pages * page,
+                "a window without cached overlaps was not capped at the request limit");
+
+        const uint64_t left_begin = base + 0x4100000;
+        const auto left = cache.FindBuffer(left_begin, 2 * page);
+        const uint64_t left_window = left_begin + page + 0x100;
+        const auto left_size = cache.FitWindow(left_window, capped_size);
+        const auto merged = cache.FindBuffer(left_window, left_size);
+        Require(name, "capped window merged within the limit",
+                left && left_size == left_begin + limit_pages * page - left_window &&
+                    cache.GetBuffer(merged).CpuAddress() == left_begin &&
+                    cache.GetBuffer(merged).Size() <= cache.MaxRequestSize() &&
+                    BufferCacheTestAccess::PageOwner(cache, left_begin) == merged,
+                "a capped window merged with a cached buffer above the device limit");
+        Require(name, "capped window keeps its merged buffer",
+                cache.FitWindow(left_window, capped_size) == left_size &&
+                    cache.FindBuffer(left_window, left_size) == merged,
+                "refitting a capped window created another buffer");
+
+        const uint64_t right_window = base + 0x4200000 + 0x100;
+        const uint64_t right_begin = base + 0x4200000 + 3 * page;
+        const auto right = cache.FindBuffer(right_begin, 2 * page);
+        const auto right_size = cache.FitWindow(right_window, capped_size);
+        const auto before_right = cache.FindBuffer(right_window, right_size);
+        Require(name, "capped window ends before a buffer it cannot merge",
+                right && right_size == right_begin - right_window && before_right != right &&
+                    BufferCacheTestAccess::PageOwner(cache, right_begin) == right,
+                "a capped window took a cached buffer past the device limit");
+        buffer_limit = original_buffer_limit;
+      }
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
