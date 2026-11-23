@@ -705,8 +705,9 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (auto& range: merged_ranges) {
 		// PPSA20298
-		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		const auto size = std::min(
+		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize()),
+		    cache.MaxRequestSize());
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 	}
