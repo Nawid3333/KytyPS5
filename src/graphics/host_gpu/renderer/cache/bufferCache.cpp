@@ -421,6 +421,18 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	if (overlap.end - overlap.begin > MaxRequestSize()) {
+		LOGF("BufferCache: buffer above the device limit: request addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " union 0x%016" PRIx64 "..0x%016" PRIx64 " size=0x%016" PRIx64 " limit=0x%016" PRIx64
+		     " stream_leap=%d\n",
+		     vaddr, size, overlap.begin, overlap.end, overlap.end - overlap.begin, MaxRequestSize(),
+		     overlap.has_stream_leap ? 1 : 0);
+		for (auto it = overlap.first; it != overlap.last; ++it) {
+			const auto& merged = m_slot_buffers[it->second];
+			LOGF("BufferCache:   merges cached buffer addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     merged.CpuAddress(), merged.Size());
+		}
+	}
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
