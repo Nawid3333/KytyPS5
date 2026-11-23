@@ -232,6 +232,7 @@ struct RecordedCommandCounter {
   static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
   static inline uint32_t image_copies = 0;
+  static inline std::vector<VkBuffer> copy_sources;
   static inline VertexBuffers vertex_buffers;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
@@ -241,6 +242,7 @@ struct RecordedCommandCounter {
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
     barriers = indirect_barriers = copies = image_copies = 0;
+    copy_sources.clear();
     vertex_buffers = {};
     bind_vertex_buffers = std::exchange(
         dispatcher.vkCmdBindVertexBuffers2,
@@ -263,6 +265,7 @@ struct RecordedCommandCounter {
     });
     copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
       ++copies;
+      copy_sources.push_back(std::get<1>(std::tie(args...)));
       copy_buffer(args...);
     });
   }
@@ -7529,6 +7532,83 @@ public:
               "staged BDA updates were stale, overwritten before their read, or incompletely flushed");
     }
     DestroyBuffer(&readback);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckStagingRingUploadCopies() {
+    constexpr const char *name = "StagingRingUploadCopies";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t ring_size = 4096;
+    constexpr uint64_t page_words = page / sizeof(u32);
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 3 * page, page, 0, &direct) ==
+                    0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 3 * page, 0x3, 0, direct, page) ==
+                    0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto *words = static_cast<u32 *>(mapped);
+    for (uint64_t index = 0; index < 3 * page_words; ++index) {
+      words[index] = static_cast<u32>(index * 0x9e3779b9u + 1u);
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    BufferCacheTestAccess::SetUnusedStagingBufferSize(cache, ring_size);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 3 * page);
+    const auto low = cache.FindBuffer(base, page);
+    const auto high = cache.FindBuffer(base + 2 * page, page);
+    {
+      const RecordedCommandCounter counter;
+      context.PrepareBda();
+      const auto ring =
+          static_cast<VkBuffer>(cache.GetUtilityBuffer(MemoryUsage::Upload).Handle());
+      Require(name, "staging ring",
+              !RecordedCommandCounter::copy_sources.empty() &&
+                  std::ranges::all_of(RecordedCommandCounter::copy_sources,
+                                      [&](VkBuffer source) { return source == ring; }),
+              "uploads larger than the staging ring were not copied from the ring");
+    }
+    Require(name, "uploaded",
+            !cache.IsRegionCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, page),
+            "BDA synchronization left dirty bytes of the two buffers");
+    auto readback = CreateHostBuffer(name, 2 * page, vk::BufferUsageFlagBits::eTransferDst, {});
+    const vk::BufferCopy low_copy{cache.GetBuffer(low).Offset(base), 0, page};
+    const vk::BufferCopy high_copy{cache.GetBuffer(high).Offset(base + 2 * page), page, page};
+    scheduler.Current().Handle().copyBuffer(cache.GetBuffer(low).Handle(), readback.buffer, 1,
+                                            &low_copy);
+    scheduler.Current().Handle().copyBuffer(cache.GetBuffer(high).Handle(), readback.buffer, 1,
+                                            &high_copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    std::vector<u32> expected(words, words + page_words);
+    expected.insert(expected.end(), words + 2 * page_words, words + 3 * page_words);
+    Require(name, "GPU contents", ReadBuffer(name, readback, 2 * page_words) == expected,
+            "bytes staged through the wrapping ring were stale or overwritten before their copy");
+    context.UnmapMemory(base, 3 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, 3 * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, 3 * page) == 0,
+            "guest allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -59177,6 +59257,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckStagingRingUploadCopies();
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
     return 0;
@@ -59450,6 +59531,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckStagingRingUploadCopies();
   vulkan.CheckBvhMirror();
   vulkan.CheckRayQueryTraversal();
   vulkan.CheckFaultBufferScan();
