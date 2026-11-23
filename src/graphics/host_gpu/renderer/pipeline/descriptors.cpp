@@ -820,7 +820,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				// in pieces, so they end at their last committed range.
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size, true);
 			}
-			size   = std::min(size, cache.MaxRequestSize());
+			size   = cache.FitWindow(address, size);
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
