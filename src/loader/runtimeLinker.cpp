@@ -622,6 +622,61 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static std::string LabGuestBytes(uint64_t addr) {
+	constexpr int Count = 32;
+	if (!IsReadableRange(addr, Count)) {
+		return "   (not readable)\n";
+	}
+	const auto* bytes = reinterpret_cast<const uint8_t*>(addr);
+	std::string text  = "   bytes:";
+	for (int i = 0; i < Count; i++) {
+		text += fmt::format(" {:02x}", bytes[i]);
+	}
+	text += "\n   text: \"";
+	for (int i = 0; i < Count && bytes[i] != 0; i++) {
+		text += (bytes[i] >= 0x20 && bytes[i] < 0x7f) ? static_cast<char>(bytes[i]) : '.';
+	}
+	return text + "\"\n";
+}
+
+static std::string LabFaultOperands(const uint8_t* code, uint64_t base, size_t size) {
+	std::string text =
+	    fmt::format("[lab-947] fault pc=0x{:016x} code window from 0x{:016x}:", base + 48, base);
+	for (size_t i = 0; i < size; i++) {
+		text += fmt::format("{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
+	}
+	text += "\n[lab-947] RIP-relative operands and call targets in the window (byte scan):\n";
+	for (size_t i = 0; i < size;) {
+		const size_t  at       = ((code[i] & 0xf0u) == 0x40u) ? i + 1 : i;
+		const uint8_t op       = at < size ? code[at] : 0;
+		const bool    rip_form = op == 0x8b || op == 0x8d || op == 0x89 || op == 0x3b || op == 0x39;
+		if (rip_form && at + 6 <= size && (code[at + 1] & 0xc7u) == 0x05u) {
+			int32_t disp = 0;
+			std::memcpy(&disp, code + at + 2, sizeof(disp));
+			const uint64_t target = base + at + 6 + static_cast<int64_t>(disp);
+			text += fmt::format("  +{} op {:02x} -> 0x{:016x}\n", i, op, target);
+			text += LabGuestBytes(target);
+			if (op == 0x8b && IsReadableRange(target, sizeof(uint64_t))) {
+				uint64_t pointer = 0;
+				std::memcpy(&pointer, reinterpret_cast<const void*>(target), sizeof(pointer));
+				text += fmt::format("   qword 0x{:016x} points to:\n", pointer);
+				text += LabGuestBytes(pointer);
+			}
+			i = at + 6;
+			continue;
+		}
+		if (code[i] == 0xe8 && i + 5 <= size) {
+			int32_t rel = 0;
+			std::memcpy(&rel, code + i + 1, sizeof(rel));
+			const uint64_t target = base + i + 5 + static_cast<int64_t>(rel);
+			text += fmt::format("  +{} call -> 0x{:016x}\n", i, target);
+			text += LabGuestBytes(target);
+		}
+		i++;
+	}
+	return text;
+}
+
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -685,6 +740,8 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
 			std::printf("\n");
+			std::fflush(stdout);
+			Log::WriteToConsoleAndLog(LabFaultOperands(code, info->exception_address - 48, 96));
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
