@@ -330,23 +330,46 @@ uint64_t BufferCache::MaxRequestSize() const noexcept {
 	return m_graphics.max_buffer_size - 2 * (CACHING_PAGESIZE + STREAM_LEAP_SIZE);
 }
 
+uint64_t BufferCache::FitWindow(uint64_t vaddr, uint64_t size) {
+	const auto limit = MaxRequestSize();
+	if (size <= limit) {
+		return size;
+	}
+	auto begin       = vaddr;
+	auto covered_end = vaddr;
+	auto end         = vaddr + limit;
+	for (auto it = FirstOverlap(vaddr); it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer       = m_slot_buffers[it->second];
+		const auto  buffer_end   = buffer.CpuAddress() + buffer.Size();
+		const auto  merged_begin = std::min(begin, buffer.CpuAddress());
+		if (std::max(covered_end, buffer_end) - merged_begin > limit) {
+			end = it->first > vaddr ? it->first : std::min(end, buffer_end);
+			break;
+		}
+		begin       = merged_begin;
+		covered_end = std::max(covered_end, buffer_end);
+	}
+	return std::min(end, begin + limit) - vaddr;
+}
+
+BufferCache::BufferMap::iterator BufferCache::FirstOverlap(uint64_t address) {
+	auto first = m_buffers.lower_bound(address);
+	if (first != m_buffers.begin()) {
+		const auto  previous = std::prev(first);
+		const auto& buffer   = m_slot_buffers[previous->second];
+		if (buffer.CpuAddress() + buffer.Size() > address) {
+			first = previous;
+		}
+	}
+	return first;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int StreamLeapThreshold = 16;
 
-	auto       begin      = vaddr;
-	auto       end        = vaddr + size;
-	const auto find_first = [&](uint64_t address) {
-		auto first = m_buffers.lower_bound(address);
-		if (first != m_buffers.begin()) {
-			const auto  previous = std::prev(first);
-			const auto& buffer   = m_slot_buffers[previous->second];
-			if (buffer.CpuAddress() + buffer.Size() > address) {
-				first = previous;
-			}
-		}
-		return first;
-	};
-	auto first           = find_first(begin);
+	auto begin           = vaddr;
+	auto end             = vaddr + size;
+	auto first           = FirstOverlap(begin);
 	auto last            = first;
 	int  stream_score    = 0;
 	bool has_stream_leap = false;
@@ -374,7 +397,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 				if (begin > minimum) {
 					begin -= std::min(STREAM_LEAP_SIZE, begin - minimum);
 				}
-				first = find_first(begin);
+				first = FirstOverlap(begin);
 				begin = std::min(begin, first->first);
 			}
 		}
