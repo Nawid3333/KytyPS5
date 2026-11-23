@@ -436,6 +436,35 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	if (copies.empty()) {
 		return;
 	}
+	if (const auto ring = m_staging_buffer.Size(); total_size > ring) {
+		std::vector<BufferUpload>   batch_uploads;
+		std::vector<vk::BufferCopy> batch_copies;
+		uint64_t                    batch_size = 0;
+		size_t                      first      = 0;
+		for (const auto& upload: uploads) {
+			for (const auto& copy: copies.subspan(first, upload.end - first)) {
+				for (uint64_t done = 0; done < copy.size;) {
+					const auto piece = std::min(copy.size - done, ring - batch_size);
+					if (batch_uploads.empty() || batch_uploads.back().buffer != upload.buffer) {
+						batch_uploads.push_back({upload.buffer, 0});
+					}
+					batch_copies.emplace_back(batch_size, copy.dstOffset + done, piece);
+					batch_uploads.back().end = batch_copies.size();
+					batch_size += piece;
+					done += piece;
+					if (batch_size == ring) {
+						UploadCopies(batch_uploads, batch_copies, batch_size);
+						batch_uploads.clear();
+						batch_copies.clear();
+						batch_size = 0;
+					}
+				}
+			}
+			first = upload.end;
+		}
+		UploadCopies(batch_uploads, batch_copies, batch_size);
+		return;
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	const auto source = UploadMemory(
