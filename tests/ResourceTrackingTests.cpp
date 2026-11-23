@@ -3840,8 +3840,8 @@ void TestGraphicsPointerTableMaterialKeys() {
 void TestGraphicsThreadBitMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
-    Avatar, ComputeBallot, UnguardedEntry, OtherWitness, NotLive, ZeroBranch, WrongHalf, WrongBit, OtherLane,
-    OtherSelect
+    Avatar, ComputeBallot, PixelBallot, UnguardedEntry, OtherWitness, NotLive, ZeroBranch, WrongHalf, WrongBit,
+    OtherLane, OtherSelect
   };
   const auto make = [](Variant variant) {
     auto fixture =
@@ -3856,8 +3856,8 @@ void TestGraphicsThreadBitMaterialKeys() {
     header->AddBranch(body);
     body->AddBranch(header);
     body->AddBranch(done);
-    const auto live = variant == Variant::ComputeBallot ? f.Emit(ValueOpcode::Ballot, {Value(true)})
-                                                        : f.Emit(ValueOpcode::LiveMask);
+    const bool ballot_words = variant == Variant::ComputeBallot || variant == Variant::PixelBallot;
+    const auto live = ballot_words ? f.Emit(ValueOpcode::Ballot, {Value(true)}) : f.Emit(ValueOpcode::LiveMask);
     const auto lane = f.Emit(ValueOpcode::LaneId);
     const auto discarded = f.Emit(ValueOpcode::IEqual32, {lane, Value(7u)});
     const auto ballot = f.Emit(ValueOpcode::Ballot, {discarded});
@@ -3951,8 +3951,9 @@ void TestGraphicsThreadBitMaterialKeys() {
     fixture->PlanAndTrack();
     return fixture;
   };
-  for (const auto variant : {Variant::UnguardedEntry, Variant::OtherWitness, Variant::NotLive, Variant::ZeroBranch,
-                             Variant::WrongHalf, Variant::WrongBit, Variant::OtherLane, Variant::OtherSelect}) {
+  for (const auto variant : {Variant::PixelBallot, Variant::UnguardedEntry, Variant::OtherWitness, Variant::NotLive,
+                             Variant::ZeroBranch, Variant::WrongHalf, Variant::WrongBit, Variant::OtherLane,
+                             Variant::OtherSelect}) {
     CheckFatal([&] { make(variant); }, "not a valid runtime value",
                "thread-bit material key accepted without a nonzero live mask on entry");
   }

@@ -1219,7 +1219,8 @@ private:
 		const auto* extract = InstOf(word, ValueOpcode::CompositeExtractU32x4);
 		if (extract == nullptr || !ImmediateIs(extract->Arg(1), index)) return false;
 		return InstOf(extract->Arg(0), ValueOpcode::LiveMask) != nullptr ||
-		       InstOf(extract->Arg(0), ValueOpcode::Ballot) != nullptr;
+		       (m_program.stage != ShaderType::Pixel &&
+		        InstOf(extract->Arg(0), ValueOpcode::Ballot) != nullptr);
 	}
 
 	Value MaskWord(Value word, uint32_t index) const {
