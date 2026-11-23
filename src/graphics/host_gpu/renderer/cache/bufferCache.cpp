@@ -326,9 +326,12 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+uint64_t BufferCache::MaxRequestSize() const noexcept {
+	return m_graphics.max_buffer_size - 2 * (CACHING_PAGESIZE + STREAM_LEAP_SIZE);
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
-	static constexpr int      StreamLeapThreshold = 16;
-	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
+	static constexpr int StreamLeapThreshold = 16;
 
 	auto       begin      = vaddr;
 	auto       end        = vaddr + size;
@@ -360,7 +363,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 			// Reserve space in the incoming stream's direction of growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
-				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
+				end += std::min(STREAM_LEAP_SIZE, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
 				                                       : LibKernel::Memory::kExtendedMemoryBase +
 				                                             LibKernel::Memory::kExtendedMemorySize) - end);
 			}
@@ -369,7 +372,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 				                         ? CACHING_PAGESIZE * 2
 				                         : LibKernel::Memory::kExtendedMemoryBase;
 				if (begin > minimum) {
-					begin -= std::min(StreamLeapSize, begin - minimum);
+					begin -= std::min(STREAM_LEAP_SIZE, begin - minimum);
 				}
 				first = find_first(begin);
 				begin = std::min(begin, first->first);

@@ -17311,6 +17311,13 @@ public:
         Require(name, "finite read exceeds mock cap unchanged", writer_bindings.buffer_sources[0].size == 0x3000,
                 "read-only window changed a finite descriptor's declared range");
         storage_limit = original_limit;
+        auto &buffer_limit = graphics.max_buffer_size;
+        const auto original_buffer_limit = buffer_limit;
+        buffer_limit = 2 * (BufferCache::CACHING_PAGESIZE + BufferCache::STREAM_LEAP_SIZE) + 0x2000;
+        executor.FindBuffers(stages);
+        buffer_limit = original_buffer_limit;
+        Require(name, "finite window within device buffer size", writer_bindings.buffer_sources[0].size == 0x2000,
+                "a finite descriptor window exceeded the device's buffer size limit");
         check_range(0x3000, "finite structured read preserves native range");
         value.dwords[2] = UINT32_MAX;
         check_range(mapped_tail, "read-only structured sentinel preserves smaller mapping");
