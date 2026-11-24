@@ -1,0 +1,39 @@
+# Fork-only: keeps this fork's "Upstream digest" issue body a rolling list of ALL KytyPS5/KytyPS5
+# activity of the last 48 hours (see .github/scripts/upstream_digest.py). It only reads from
+# upstream and only edits that one issue body here: no comments, so no notifications.
+name: Upstream digest
+
+on:
+  schedule:
+    - cron: "5,15,25,35,45,55 * * * *"
+  workflow_dispatch:
+
+# Without pull-requests read, GITHUB_TOKEN gets upstream issue lists with the PRs left out;
+# discussions read is for the upstream discussions (GraphQL).
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+  discussions: read
+
+concurrency:
+  group: upstream-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    if: github.repository == 'Nawid3333/KytyPS5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout the scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Rewrite the digest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: KytyPS5/KytyPS5
+          WATCH_USER: Nawid3333
+        run: python3 -I .github/scripts/upstream_digest.py
