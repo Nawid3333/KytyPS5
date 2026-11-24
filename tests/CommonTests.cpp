@@ -250,6 +250,39 @@ TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
 	    testing::ExitedWithCode(0), "");
 }
 
+TEST(Assert, FatalReportNamesTheGameOnceItIsKnown) {
+	const auto dir = std::filesystem::temp_directory_path() / "kyty_fatal_report_game_test";
+	std::error_code ec;
+	std::filesystem::remove_all(dir, ec);
+	for (const bool known: {false, true}) {
+		EXPECT_EXIT(
+		    {
+			    std::filesystem::create_directories(dir);
+			    std::freopen((dir / "console.txt").string().c_str(), "wb", stdout);
+			    Config::Initialize();
+			    Config::ConfigOptions options;
+			    options.printf_direction   = Config::LogDirection::File;
+			    options.printf_output_file = dir / "log.txt";
+			    Config::Load(options);
+			    Log::Initialize();
+			    if (known) {
+				    Common::SetDbgReportGame("Demon's Souls, PPSA01341, 01.000.000");
+			    }
+			    EXIT("stop\n");
+		    },
+		    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+		const auto log = ReadAll(dir / "log.txt");
+		EXPECT_TRUE(log.starts_with("--- Build ---\n")) << log;
+		EXPECT_EQ(log.find("\nGame: Demon's Souls, PPSA01341, 01.000.000\n--- Error ---\nstop\n in ") !=
+		              std::string::npos,
+		          known)
+		    << log;
+		EXPECT_NE(log.find("--- Error ---\nstop\n in "), std::string::npos) << log;
+		EXPECT_EQ(ReadAll(dir / "console.txt"), log);
+		std::filesystem::remove_all(dir, ec);
+	}
+}
+
 TEST(StringUtils, PathRoundTripsUtf8) {
 	constexpr std::string_view Utf8 = "dir/\xc3\xa9-\xe6\x97\xa5.bin";
 	EXPECT_EQ(Common::PathToString(Common::PathFromUtf8(Utf8)), Utf8);
