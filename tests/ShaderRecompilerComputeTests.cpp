@@ -7453,11 +7453,11 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckStagingRingUploadCopies() {
-    constexpr const char *name = "StagingRingUploadCopies";
+  void CheckStagingRingUploadCopies(const char *name, uint64_t ring_size,
+                                    std::initializer_list<uint64_t> rewritten_pages) {
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
-    constexpr uint64_t ring_size = 4096;
     constexpr uint64_t page_words = page / sizeof(u32);
+    constexpr uint64_t tracker_words = TRACKER_PAGE_SIZE / sizeof(u32);
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;
@@ -7485,21 +7485,41 @@ public:
     context.MapMemory(base, 3 * page);
     const auto low = cache.FindBuffer(base, page);
     const auto high = cache.FindBuffer(base + 2 * page, page);
-    {
-      const RecordedCommandCounter counter;
-      context.PrepareBda();
-      const auto ring =
-          static_cast<VkBuffer>(cache.GetUtilityBuffer(MemoryUsage::Upload).Handle());
-      Require(name, "staging ring",
-              !RecordedCommandCounter::copy_sources.empty() &&
-                  std::ranges::all_of(RecordedCommandCounter::copy_sources,
-                                      [&](VkBuffer source) { return source == ring; }),
-              "uploads larger than the staging ring were not copied from the ring");
+    const auto upload = [&](uint64_t dirty_bytes) {
+      {
+        const RecordedCommandCounter counter;
+        const auto staged =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::BufferUploadBytes);
+        context.PrepareBda();
+        const auto ring =
+            static_cast<VkBuffer>(cache.GetUtilityBuffer(MemoryUsage::Upload).Handle());
+        Require(name, "staging ring",
+                !RecordedCommandCounter::copy_sources.empty() &&
+                    std::ranges::all_of(RecordedCommandCounter::copy_sources,
+                                        [&](VkBuffer source) { return source == ring; }),
+                "uploads larger than the staging ring were not copied from the ring");
+        Require(name, "staged bytes",
+                Common::DebugCounters::Get(Common::DebugCounters::Counter::BufferUploadBytes) ==
+                    staged + dirty_bytes,
+                "batches staged a dirty byte more than once or skipped one");
+      }
+      Require(name, "uploaded",
+              !cache.IsRegionCpuModified(base, page) &&
+                  !cache.IsRegionCpuModified(base + 2 * page, page),
+              "BDA synchronization left dirty bytes of the two buffers");
+    };
+    Common::DebugCounters::SetEnabled(true);
+    upload(2 * page);
+    for (const auto index : rewritten_pages) {
+      cache.InvalidateMemory(base + index * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+      for (uint64_t word = index * tracker_words; word < (index + 1) * tracker_words; ++word) {
+        words[word] = ~words[word];
+      }
     }
-    Require(name, "uploaded",
-            !cache.IsRegionCpuModified(base, page) &&
-                !cache.IsRegionCpuModified(base + 2 * page, page),
-            "BDA synchronization left dirty bytes of the two buffers");
+    if (rewritten_pages.size() != 0) {
+      upload(rewritten_pages.size() * TRACKER_PAGE_SIZE);
+    }
+    Common::DebugCounters::SetEnabled(false);
     auto readback = CreateHostBuffer(name, 2 * page, vk::BufferUsageFlagBits::eTransferDst, {});
     const vk::BufferCopy low_copy{cache.GetBuffer(low).Offset(base), 0, page};
     const vk::BufferCopy high_copy{cache.GetBuffer(high).Offset(base + 2 * page), page, page};
@@ -58780,7 +58800,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
-    vulkan.CheckStagingRingUploadCopies();
+    vulkan.CheckStagingRingUploadCopies("StagingRingUploadCopies", 4096, {});
+    vulkan.CheckStagingRingUploadCopies("StagingRingMixedBatches", 6144, {0, 2, 8, 9, 11});
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
     return 0;
@@ -59054,7 +59075,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
-  vulkan.CheckStagingRingUploadCopies();
+  vulkan.CheckStagingRingUploadCopies("StagingRingUploadCopies", 4096, {});
+  vulkan.CheckStagingRingUploadCopies("StagingRingMixedBatches", 6144, {0, 2, 8, 9, 11});
   vulkan.CheckBvhMirror();
   vulkan.CheckRayQueryTraversal();
   vulkan.CheckFaultBufferScan();
