@@ -664,6 +664,45 @@ static std::unordered_map<uint64_t, CommandBufferState> g_command_buffers;
 static std::unordered_map<uint64_t, uint64_t>           g_command_buffer_aliases;
 // AMM and APR share 256 32-bit counters; only the first 128 are application-writable.
 static std::array<std::atomic<uint32_t>, 256> g_counters {};
+
+static constexpr uint32_t    LabEngineMaxLines  = 1500;
+static constexpr size_t      LabEngineShownCmds = 12;
+static constexpr auto        LabWaitReportAfter = std::chrono::seconds(2);
+static std::atomic<uint32_t> g_lab_engine_lines {0};
+
+static void LabEngineLine(const std::string& text) {
+	if (g_lab_engine_lines.fetch_add(1) < LabEngineMaxLines) {
+		Log::WriteToConsoleAndLog("[lab-947-ampr] " + text + "\n");
+	}
+}
+
+static uint64_t LabWaitValue(const CommandBufferState::WaitCommand& wait) {
+	return wait.is_counter ? g_counters[wait.source].load(std::memory_order_acquire)
+	                       : std::atomic_ref(*reinterpret_cast<uint64_t*>(wait.source))
+	                             .load(std::memory_order_acquire);
+}
+
+static std::string LabCommandText(const CommandBufferState::Command& command) {
+	if (const auto* read = std::get_if<CommandBufferState::ReadFileCommand>(&command.data)) {
+		return fmt::format("read(file {} off 0x{:x} size 0x{:x})", read->file_id, read->file_offset,
+		                   read->size);
+	}
+	if (const auto* event = std::get_if<CommandBufferState::KernelEventCommand>(&command.data)) {
+		return fmt::format("event(id {} data 0x{:x})", event->id, event->data);
+	}
+	if (const auto* wait = std::get_if<CommandBufferState::WaitCommand>(&command.data)) {
+		return fmt::format("wait({} 0x{:x} cmp {} val 0x{:x})",
+		                   wait->is_counter ? "counter" : "addr", wait->source,
+		                   static_cast<int>(wait->compare), wait->value);
+	}
+	if (const auto* counter = std::get_if<CommandBufferState::WriteCounterCommand>(&command.data)) {
+		return fmt::format("counter({}=0x{:x})", static_cast<int>(counter->index), counter->value);
+	}
+	if (const auto* write = std::get_if<CommandBufferState::WriteAddressCommand>(&command.data)) {
+		return fmt::format("write(0x{:x}=0x{:x})", write->address, write->value);
+	}
+	return "amm";
+}
 using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::iterator;
 
 static void RegisterCommandBufferAliasLocked(uint64_t command_buffer, uint64_t buffer) {
@@ -1173,6 +1212,10 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
 		    eq, static_cast<uintptr_t>(command.id), LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
 		    reinterpret_cast<void*>(command.data));
+		if (result == OK) {
+			LabEngineLine(fmt::format("event eq 0x{:x} id {} data 0x{:x}", command.eq, command.id,
+			                          command.data));
+		}
 		if (result != OK) {
 			LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
 			     ", result=0x%08" PRIx32 "\n",
@@ -1213,7 +1256,27 @@ struct Submission {
 	size_t                                   cursor = 0;
 	void*                                    result = nullptr;
 	uint32_t                                 id     = 0;
+	size_t                                   lab_blocked_cursor = SIZE_MAX;
+	std::chrono::steady_clock::time_point    lab_blocked_since {};
+	bool                                     lab_wait_reported = false;
 };
+
+static void LabNoteBlocked(Submission& submission, const CommandBufferState::WaitCommand& wait) {
+	const auto now = std::chrono::steady_clock::now();
+	if (submission.lab_blocked_cursor != submission.cursor) {
+		submission.lab_blocked_cursor = submission.cursor;
+		submission.lab_blocked_since  = now;
+		submission.lab_wait_reported  = false;
+		return;
+	}
+	if (!submission.lab_wait_reported && now - submission.lab_blocked_since >= LabWaitReportAfter) {
+		submission.lab_wait_reported = true;
+		LabEngineLine(fmt::format(
+		    "wait stuck sub {} cmd {}/{} {} 0x{:x} cmp {} want 0x{:x} have 0x{:x}", submission.id,
+		    submission.cursor, submission.commands.size(), wait.is_counter ? "counter" : "addr",
+		    wait.source, static_cast<int>(wait.compare), wait.value, LabWaitValue(wait)));
+	}
+}
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 	const uint64_t value = wait.is_counter
@@ -1234,8 +1297,9 @@ static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 
 class CommandEngine {
 public:
-	explicit CommandEngine(size_t priorities)
-	    : m_queues(priorities), m_worker([this](std::stop_token stop) { Run(stop); }) {}
+	explicit CommandEngine(size_t priorities, bool lab_trace)
+	    : m_lab_trace(lab_trace), m_queues(priorities),
+	      m_worker([this](std::stop_token stop) { Run(stop); }) {}
 
 	~CommandEngine() {
 		std::scoped_lock lock(m_mutex);
@@ -1265,6 +1329,9 @@ private:
 					const auto* wait = std::get_if<CommandBufferState::WaitCommand>(
 					    &submission.commands[submission.cursor].data);
 					if (wait != nullptr && !IsWaitSatisfied(*wait)) {
+						if (m_lab_trace) {
+							LabNoteBlocked(submission, *wait);
+						}
 						continue;
 					}
 				}
@@ -1296,6 +1363,11 @@ private:
 			if (complete) {
 				AprShared::WriteResult(submission.result, result, error_offset);
 				AprShared::SetSubmissionComplete(submission.id);
+				if (m_lab_trace) {
+					LabEngineLine(fmt::format("done sub {} cmds {} result 0x{:08x} err_off 0x{:x}",
+					                          submission.id, submission.commands.size(),
+					                          static_cast<uint32_t>(result), error_offset));
+				}
 			}
 			lock.lock();
 			if (complete) {
@@ -1306,6 +1378,7 @@ private:
 
 	std::mutex                          m_mutex;
 	std::condition_variable             m_cv;
+	bool                                m_lab_trace = false;
 	std::vector<std::deque<Submission>> m_queues;
 	std::jthread                        m_worker;
 };
@@ -1341,8 +1414,19 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
-	static CommandEngine apr_engine(7);
-	static CommandEngine amm_engine(3);
+	if (!amm) {
+		std::string lab_cmds;
+		for (size_t i = 0; i < state.commands.size() && i < LabEngineShownCmds; i++) {
+			lab_cmds += ' ' + LabCommandText(state.commands[i]);
+		}
+		if (state.commands.size() > LabEngineShownCmds) {
+			lab_cmds += fmt::format(" ... +{}", state.commands.size() - LabEngineShownCmds);
+		}
+		LabEngineLine(fmt::format("submit prio {} sub {} end 0x{:x} cmds {}:{}", priority, id, end,
+		                          state.commands.size(), lab_cmds));
+	}
+	static CommandEngine apr_engine(7, true);
+	static CommandEngine amm_engine(3, false);
 	(amm ? amm_engine : apr_engine)
 	    .Submit(priority, {std::move(state.commands), 0, result, id});
 	return OK;
