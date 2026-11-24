@@ -20,9 +20,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <fmt/format.h>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -151,6 +155,87 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 static std::atomic<uint64_t> g_lab_host_image_bytes {0};
 static std::atomic<uint64_t> g_lab_host_image_count {0};
 
+struct LabImageRecord {
+	uint64_t            size;
+	uint32_t            heap;
+	vk::Extent3D        extent;
+	vk::Format          format;
+	vk::ImageUsageFlags usage;
+	uint32_t            layers;
+	uint32_t            mips;
+};
+
+static constexpr size_t                                  LabTopImages = 12;
+static std::mutex                                        g_lab_images_mutex;
+static std::unordered_map<VmaAllocation, LabImageRecord> g_lab_images;
+
+static void LabTrackImage(VmaAllocator allocator, VmaAllocation allocation,
+                          const vk::ImageCreateInfo& info) {
+	VmaAllocationInfo alloc {};
+	vmaGetAllocationInfo(allocator, allocation, &alloc);
+	const VkPhysicalDeviceMemoryProperties* props = nullptr;
+	vmaGetMemoryProperties(allocator, &props);
+	std::scoped_lock lock(g_lab_images_mutex);
+	g_lab_images[allocation] = {alloc.size,    props->memoryTypes[alloc.memoryType].heapIndex,
+	                            info.extent,   info.format,
+	                            info.usage,    info.arrayLayers,
+	                            info.mipLevels};
+}
+
+static void LabForgetImage(VmaAllocation allocation) {
+	std::scoped_lock lock(g_lab_images_mutex);
+	g_lab_images.erase(allocation);
+}
+
+static void LabLogImageCensus(VmaAllocator allocator, const vk::ImageCreateInfo& info) {
+	const VkPhysicalDeviceMemoryProperties* props = nullptr;
+	vmaGetMemoryProperties(allocator, &props);
+	uint32_t allowed = 0;
+	for (uint32_t type = 0; type < props->memoryTypeCount; type++) {
+		VmaAllocationCreateInfo probe {};
+		probe.memoryTypeBits = 1u << type;
+		uint32_t index       = 0;
+		if (vmaFindMemoryTypeIndexForImageInfo(
+		        allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(info), &probe,
+		        &index) == VK_SUCCESS) {
+			allowed |= 1u << type;
+		}
+	}
+	Log::WriteToConsoleAndLog(
+	    fmt::format("[lab-2331] memory types this image may use: 0x{:x}\n", allowed));
+	std::vector<LabImageRecord> images;
+	{
+		std::scoped_lock lock(g_lab_images_mutex);
+		images.reserve(g_lab_images.size());
+		for (const auto& entry: g_lab_images) {
+			images.push_back(entry.second);
+		}
+	}
+	std::array<uint64_t, VK_MAX_MEMORY_HEAPS> bytes {};
+	std::array<uint64_t, VK_MAX_MEMORY_HEAPS> count {};
+	for (const auto& record: images) {
+		bytes[record.heap] += record.size;
+		count[record.heap]++;
+	}
+	for (uint32_t heap = 0; heap < props->memoryHeapCount; heap++) {
+		Log::WriteToConsoleAndLog(fmt::format("[lab-2331] live images in heap {}: {} ({} bytes)\n",
+		                                      heap, count[heap], bytes[heap]));
+	}
+	const auto shown = std::min(images.size(), LabTopImages);
+	std::partial_sort(
+	    images.begin(), images.begin() + static_cast<std::ptrdiff_t>(shown), images.end(),
+	    [](const LabImageRecord& a, const LabImageRecord& b) { return a.size > b.size; });
+	for (size_t i = 0; i < shown; i++) {
+		const auto& record = images[i];
+		Log::WriteToConsoleAndLog(
+		    fmt::format("[lab-2331] image {} bytes heap {}: {}x{}x{} layers {} mips {} format {} "
+		                "usage 0x{:x}\n",
+		                record.size, record.heap, record.extent.width, record.extent.height,
+		                record.extent.depth, record.layers, record.mips,
+		                static_cast<int>(record.format), static_cast<uint32_t>(record.usage)));
+	}
+}
+
 static bool LabIsHostHeap(VmaAllocator allocator, VmaAllocation allocation, uint64_t* size) {
 	VmaAllocationInfo info {};
 	vmaGetAllocationInfo(allocator, allocation, &info);
@@ -207,12 +292,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		LabLogImageFailure(allocator, image_info, result);
+		LabLogImageCensus(allocator, image_info);
 		return false;
 	}
 	if (uint64_t size = 0; LabIsHostHeap(allocator, image.allocation, &size)) {
 		g_lab_host_image_bytes += size;
 		g_lab_host_image_count++;
 	}
+	LabTrackImage(allocator, image.allocation, image_info);
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -236,6 +323,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		g_lab_host_image_bytes -= size;
 		g_lab_host_image_count--;
 	}
+	LabForgetImage(image.allocation);
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;
