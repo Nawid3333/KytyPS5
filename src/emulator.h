@@ -16,6 +16,7 @@ struct RunOptions {
 	std::filesystem::path                game_patch;
 	std::filesystem::path                addcont_dir;
 	std::vector<Common::AddContentEntry> addcont;
+	std::vector<std::string>             arguments;
 };
 
 void Run(const RunOptions& options);

@@ -283,6 +283,13 @@ TEST(Assert, FatalReportNamesTheGameOnceItIsKnown) {
 	}
 }
 
+TEST(StringUtils, JoinArgumentsQuotesEmptyArgumentsAndArgumentsWithSpaces) {
+	EXPECT_EQ(Common::JoinArguments({}), "");
+	EXPECT_EQ(Common::JoinArguments({"--game", "D:/My Games/Demon's Souls", "--playgo-hack", "",
+	                                 "a\tb"}),
+	          "--game \"D:/My Games/Demon's Souls\" --playgo-hack \"\" \"a\tb\"");
+}
+
 TEST(StringUtils, PathRoundTripsUtf8) {
 	constexpr std::string_view Utf8 = "dir/\xc3\xa9-\xe6\x97\xa5.bin";
 	EXPECT_EQ(Common::PathToString(Common::PathFromUtf8(Utf8)), Utf8);

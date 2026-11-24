@@ -42,6 +42,18 @@ inline bool EqualNoCase(std::string_view lhs, std::string_view rhs) {
 	return true;
 }
 
+inline std::string JoinArguments(const std::vector<std::string>& arguments) {
+	std::string text;
+	for (const auto& argument: arguments) {
+		if (!text.empty()) {
+			text += ' ';
+		}
+		const bool quote = argument.empty() || argument.find_first_of(" \t") != std::string::npos;
+		text += quote ? '"' + argument + '"' : argument;
+	}
+	return text;
+}
+
 inline std::string ToLower(std::string_view text) {
 	std::string ret(text);
 	std::transform(ret.begin(), ret.end(), ret.begin(),
