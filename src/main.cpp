@@ -84,6 +84,8 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf(
+	    "  --log-repeat-limit <num>             Log <num> calls per line, then 2^k; 0 is off.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
@@ -447,6 +449,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--log-repeat-limit") {
+			if (!ParseUint32(value, options.config.log_repeat_limit)) {
+				::printf("invalid log repeat limit: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

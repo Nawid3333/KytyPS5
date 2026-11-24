@@ -203,6 +203,10 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
+uint32_t GetLogRepeatLimit() {
+	return g_config->log_repeat_limit;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }

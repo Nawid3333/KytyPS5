@@ -2,6 +2,9 @@
 
 #include "common/emulatorConfig.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -20,6 +23,34 @@ static bool g_console     = false;
 // threads keep logging while exit runs static destructors.
 static spdlog::logger* g_logger = nullptr;
 
+struct RepeatSite {
+	std::atomic<const void*> site {nullptr};
+	std::atomic<uint64_t>    calls {0};
+};
+
+static constexpr uint32_t REPEAT_SITE_BITS   = 13;
+static constexpr size_t   REPEAT_SITE_SLOTS  = size_t {1} << REPEAT_SITE_BITS;
+static constexpr size_t   REPEAT_SITE_PROBES = 64;
+static constexpr uint64_t FIBONACCI_HASH     = 0x9e3779b97f4a7c15ull;
+
+static std::array<RepeatSite, REPEAT_SITE_SLOTS> g_repeat_sites;
+
+static RepeatSite* FindRepeatSite(const void* site) {
+	const auto first =
+	    (reinterpret_cast<uintptr_t>(site) * FIBONACCI_HASH) >> (64 - REPEAT_SITE_BITS);
+	for (size_t probe = 0; probe < REPEAT_SITE_PROBES; probe++) {
+		auto&       slot    = g_repeat_sites[(first + probe) % REPEAT_SITE_SLOTS];
+		const void* claimed = slot.site.load(std::memory_order_acquire);
+		if (claimed == nullptr && slot.site.compare_exchange_strong(claimed, site)) {
+			claimed = site;
+		}
+		if (claimed == site) {
+			return &slot;
+		}
+	}
+	return nullptr;
+}
+
 static void WriteStdout(std::string_view text, fmt::text_style style) {
 	if (style == fmt::text_style {}) {
 		std::fwrite(text.data(), 1, text.size(), stdout);
@@ -34,6 +65,11 @@ void Initialize() {
 	const auto direction = Config::GetPrintfDirection();
 	const auto path      = Config::GetPrintfOutputFile();
 	g_console            = direction == Config::LogDirection::Console;
+	Detail::g_repeat_limit = Config::GetLogRepeatLimit();
+	for (auto& slot: g_repeat_sites) {
+		slot.site.store(nullptr);
+		slot.calls.store(0);
+	}
 	delete g_logger;
 	g_logger = nullptr;
 
@@ -80,6 +116,30 @@ void Write(fmt::text_style style, std::string_view text) {
 	} else {
 		g_logger->log(spdlog::level::info, spdlog::string_view_t(text.data(), text.size()));
 	}
+}
+
+bool AdmitRepeat(const void* site, uint64_t* skipped) {
+	const uint64_t limit = Detail::g_repeat_limit;
+	*skipped             = 0;
+	auto* slot           = FindRepeatSite(site);
+	if (slot == nullptr) {
+		return true;
+	}
+	const uint64_t call = slot->calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (call <= limit) {
+		return true;
+	}
+	if ((call & (call - 1)) != 0) {
+		return false;
+	}
+	*skipped = call - std::max(limit, call / 2) - 1;
+	return true;
+}
+
+void WriteRepeatNote(fmt::text_style style, uint64_t skipped, std::string_view text) {
+	Write(style,
+	      fmt::format("[log-repeat] {} calls of the next line's call site were not printed\n{}",
+	                  skipped, text));
 }
 
 void WriteToConsoleAndLog(std::string_view text) {

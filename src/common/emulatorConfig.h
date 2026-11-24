@@ -92,6 +92,7 @@ struct ConfigOptions {
 	bool                   graphics_debug_dump_enabled = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
+	uint32_t               log_repeat_limit            = 0;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -171,6 +172,7 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
+uint32_t              GetLogRepeatLimit();
 
 bool ProfilerEnabled();
 

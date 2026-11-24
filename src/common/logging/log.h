@@ -28,6 +28,25 @@ void Write(fmt::text_style style, std::string_view text);
 // Also shown on the console when the log goes to a file or nowhere.
 void WriteToConsoleAndLog(std::string_view text);
 
+namespace Detail {
+inline uint64_t g_repeat_limit = 0;
+} // namespace Detail
+
+bool AdmitRepeat(const void* site, uint64_t* skipped);
+void WriteRepeatNote(fmt::text_style style, uint64_t skipped, std::string_view text);
+
+inline bool RepeatLimited() {
+	return Detail::g_repeat_limit != 0;
+}
+
+inline void WriteRepeat(fmt::text_style style, uint64_t skipped, std::string_view text) {
+	if (skipped == 0) {
+		Write(style, text);
+	} else {
+		WriteRepeatNote(style, skipped, text);
+	}
+}
+
 namespace Color {
 
 inline constexpr auto Default       = fmt::text_style {};
@@ -46,7 +65,9 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 // Out of line, so callers on small guest stacks (fibers) do not reserve the formatting frame.
 template <typename... Args>
 [[gnu::noinline]] void Printf(fmt::text_style style, const char* format, const Args&... args) {
-	Write(style, fmt::sprintf(format, args...));
+	if (uint64_t skipped = 0; !RepeatLimited() || AdmitRepeat(format, &skipped)) {
+		WriteRepeat(style, skipped, fmt::sprintf(format, args...));
+	}
 }
 
 } // namespace Log

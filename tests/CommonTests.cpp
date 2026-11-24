@@ -250,6 +250,56 @@ TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
 	    testing::ExitedWithCode(0), "");
 }
 
+std::filesystem::path RepeatLogFile(uint32_t repeat_limit) {
+	return std::filesystem::temp_directory_path() /
+	       ("kyty_log_repeat_" + std::to_string(repeat_limit) + ".txt");
+}
+
+std::string LogNineCallsAndOneOther(uint32_t repeat_limit) {
+	const auto            log_file = RepeatLogFile(repeat_limit);
+	Config::ConfigOptions options;
+	options.printf_direction   = Config::LogDirection::File;
+	options.printf_output_file = log_file;
+	options.log_repeat_limit   = repeat_limit;
+	Config::Load(options);
+	Log::Initialize();
+	for (int call = 1; call <= 9; call++) {
+		LOGF("call %d\n", call);
+	}
+	LOGF("other\n");
+	Log::Flush();
+	return ReadAll(log_file);
+}
+
+TEST(Log, RepeatLimitPrintsTheFirstCallsOfASiteThenPowersOfTwoWithSkipCounts) {
+	EXPECT_EXIT(
+	    {
+		    Config::Initialize();
+		    const bool off_ok = LogNineCallsAndOneOther(0) ==
+		                        "call 1\ncall 2\ncall 3\ncall 4\ncall 5\ncall 6\ncall 7\ncall 8\n"
+		                        "call 9\nother\n";
+		    const bool limited_ok =
+		        LogNineCallsAndOneOther(2) ==
+		        "call 1\ncall 2\n"
+		        "[log-repeat] 1 calls of the next line's call site were not printed\ncall 4\n"
+		        "[log-repeat] 3 calls of the next line's call site were not printed\ncall 8\n"
+		        "other\n";
+		    const bool above_limit_ok =
+		        LogNineCallsAndOneOther(5) ==
+		        "call 1\ncall 2\ncall 3\ncall 4\ncall 5\n"
+		        "[log-repeat] 2 calls of the next line's call site were not printed\ncall 8\n"
+		        "other\n";
+		    Config::Load({});
+		    Log::Initialize();
+		    for (const uint32_t limit: {0u, 2u, 5u}) {
+			    std::error_code ec;
+			    std::filesystem::remove(RepeatLogFile(limit), ec);
+		    }
+		    std::_Exit(off_ok && limited_ok && above_limit_ok ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
 void LogFatalReportToFile(const std::filesystem::path& dir) {
 	std::filesystem::create_directories(dir);
 	std::freopen((dir / "console.txt").string().c_str(), "wb", stdout);
