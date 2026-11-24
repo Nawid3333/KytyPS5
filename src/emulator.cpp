@@ -165,6 +165,17 @@ void Run(const RunOptions& options) {
 	if (!title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
+	std::string title;
+	std::string version;
+	Loader::SystemContentParamSfoGetString("TITLE", &title);
+	Loader::SystemContentParamSfoGetString("APP_VER", &version);
+	std::string game;
+	for (const auto& part: {title, title_id, version}) {
+		if (!part.empty()) {
+			game += game.empty() ? part : ", " + part;
+		}
+	}
+	Common::SetDbgReportGame(game);
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);

@@ -12,6 +12,8 @@ namespace Common {
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);
 
+void SetDbgReportGame(std::string_view game);
+
 } // namespace Common
 
 #ifndef KYTY_FINAL
