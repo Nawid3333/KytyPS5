@@ -475,6 +475,11 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 		return;
 	}
 	if (const auto ring = m_staging_buffer.Size(); total_size > ring) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "BufferCache: split upload of 0x{:x} bytes into {} staging batches (ring 0x{:x}, "
+		    "buffers={}, copies={}, tick={})\n",
+		    total_size, (total_size + ring - 1) / ring, ring, uploads.size(), copies.size(),
+		    m_scheduler.CurrentTick()));
 		std::vector<BufferUpload>   batch_uploads;
 		std::vector<vk::BufferCopy> batch_copies;
 		uint64_t                    batch_size = 0;
