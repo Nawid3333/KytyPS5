@@ -92,6 +92,20 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+std::span<const uint32_t> ShaderFindCodeByHash(uint64_t hash) {
+	if (g_shader_map == nullptr) {
+		return {};
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	for (const auto& [addr, entry] : *g_shader_map) {
+		if (entry.hash == hash) {
+			return {reinterpret_cast<const uint32_t*>(addr),
+			        entry.data.code_size_bytes / sizeof(uint32_t)};
+		}
+	}
+	return {};
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

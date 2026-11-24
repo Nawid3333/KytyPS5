@@ -2,6 +2,8 @@
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +23,9 @@ constexpr uint32_t ContextEntries    = 24;
 constexpr uint32_t ArgsSlots         = 4096;
 constexpr uint32_t ArgsSlotWords     = 8;
 constexpr uint32_t ArgsReportedEarly = 8;
+constexpr uint32_t WriteRingSize     = 1u << 18u;
+constexpr uint32_t WritersReported   = 24;
+constexpr uint32_t ListingsReported  = 4;
 
 struct Entry {
 	std::atomic<uint32_t> id {0};
@@ -32,7 +37,18 @@ struct Entry {
 	IndirectArgs          args;
 };
 
+struct WriteEntry {
+	std::atomic<uint64_t> serial {0};
+	uint32_t              next_command = 0;
+	WriteSource           source       = WriteSource::Bound;
+	uint64_t              vaddr        = 0;
+	uint64_t              size         = 0;
+	uint64_t              value        = 0;
+};
+
 GraphicContext*             g_graphics = nullptr;
+std::vector<WriteEntry>     g_writes(WriteRingSize);
+std::atomic<uint64_t>       g_next_write {0};
 std::array<Entry, RingSize> g_ring;
 std::atomic<uint32_t>       g_next_id {0};
 std::atomic<bool>           g_reported {false};
@@ -54,6 +70,19 @@ const char* KindName(Kind kind) {
 		case Kind::Dispatch: return "dispatch";
 		case Kind::DispatchIndirect: return "dispatch-indirect";
 		case Kind::Internal: return "kyty-internal";
+	}
+	return "?";
+}
+
+const char* SourceName(WriteSource source) {
+	switch (source) {
+		case WriteSource::Bound: return "bound-written";
+		case WriteSource::Fill: return "fill-gpu";
+		case WriteSource::CpuFill: return "fill-cpu";
+		case WriteSource::Copy: return "copy-gpu";
+		case WriteSource::CpuCopy: return "copy-cpu";
+		case WriteSource::WriteData: return "write-data";
+		case WriteSource::Label: return "eop-label";
 	}
 	return "?";
 }
@@ -164,6 +193,11 @@ std::string DescribeArgs(uint32_t id) {
 		const uint32_t word = slot[1 + i];
 		text += fmt::format("{}0x{:08x}", i == 0 ? "" : " ", word);
 	}
+	text += a.cpu_read ? fmt::format(" | guest memory at record 0x{:08x} 0x{:08x} 0x{:08x}",
+	                                 a.cpu_words[0], a.cpu_words[1], a.cpu_words[2])
+	                   : " | guest memory at record unreadable";
+	text += fmt::format(" gpu_modified={} cpu_modified={} image={}", a.gpu_modified,
+	                    a.cpu_modified, a.image);
 	return text;
 }
 
@@ -186,6 +220,64 @@ void ReportIndirectArgs(uint32_t focus) {
 		if (HasArgs(id)) {
 			Write(fmt::format("[DEVLOST]   {}\n", DescribeArgs(id)));
 			shown++;
+		}
+	}
+}
+
+void ReportListing(uint64_t hash, const char* role) {
+	const auto code = ShaderFindCodeByHash(hash);
+	if (code.empty()) {
+		Write(fmt::format("[DEVLOST] {} shader hash=0x{:016x}: code not in the shader map\n", role,
+		                  hash));
+		return;
+	}
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+	Write(fmt::format("[DEVLOST] {} shader hash=0x{:016x} address=0x{:016x} listing:\n{}\n", role,
+	                  hash, reinterpret_cast<uint64_t>(code.data()),
+	                  ShaderRecompiler::Decoder::ProgramToString(decoded)));
+}
+
+void ReportWriters(uint32_t focus) {
+	if (!HasArgs(focus)) {
+		return;
+	}
+	const auto& entry = g_ring[focus % RingSize];
+	const auto  begin = entry.args.guest_address;
+	const auto  end   = begin + entry.args.size;
+	Write(fmt::format("[DEVLOST] writes recorded over 0x{:016x}..0x{:016x} (newest first, ring of "
+	                  "{}):\n",
+	                  begin, end, WriteRingSize));
+	const uint64_t        last  = g_next_write.load(std::memory_order_acquire);
+	const uint64_t        first = last > WriteRingSize ? last - WriteRingSize : 0;
+	std::vector<uint64_t> listed;
+	uint32_t              shown = 0;
+	for (uint64_t serial = last; serial > first && shown < WritersReported; serial--) {
+		const auto& w = g_writes[serial % WriteRingSize];
+		if (w.serial.load(std::memory_order_acquire) != serial || w.vaddr >= end ||
+		    w.vaddr + w.size <= begin) {
+			continue;
+		}
+		const auto command = w.next_command;
+		Write(fmt::format("[DEVLOST]   {} 0x{:016x}+0x{:x} value=0x{:x} before command #{} | next "
+		                  "recorded {}\n",
+		                  SourceName(w.source), w.vaddr, w.size, w.value, command,
+		                  Describe(command)));
+		shown++;
+		const auto& next = g_ring[command % RingSize];
+		if (w.source == WriteSource::Bound && next.id.load(std::memory_order_acquire) == command &&
+		    next.kind != Kind::Internal && listed.size() < ListingsReported &&
+		    std::find(listed.begin(), listed.end(), next.hash0) == listed.end()) {
+			listed.push_back(next.hash0);
+		}
+	}
+	if (shown == 0) {
+		Write("[DEVLOST]   none\n");
+	}
+	ReportListing(entry.hash0, "dispatch-indirect");
+	for (const auto hash : listed) {
+		if (hash != entry.hash0) {
+			ReportListing(hash, "writer");
 		}
 	}
 }
@@ -288,6 +380,21 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	return id;
 }
 
+void NoteWrite(WriteSource source, uint64_t vaddr, uint64_t size, uint64_t value) {
+	if (g_graphics == nullptr || size == 0) {
+		return;
+	}
+	const uint64_t serial = g_next_write.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&          w      = g_writes[serial % WriteRingSize];
+	w.serial.store(0, std::memory_order_relaxed);
+	w.next_command = g_next_id.load(std::memory_order_relaxed) + 1;
+	w.source       = source;
+	w.vaddr        = vaddr;
+	w.size         = size;
+	w.value        = value;
+	w.serial.store(serial, std::memory_order_release);
+}
+
 uint32_t Begin(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1, uint64_t tick,
                const IndirectArgs& args) {
 	return Record(buffer, kind, hash0, hash1, tick, nullptr, args);
@@ -342,6 +449,7 @@ void Report(const char* where, vk::Result result, uint64_t known_gpu_tick) {
 		                  id == focus ? "   <== first unfinished" : ""));
 	}
 	ReportIndirectArgs(focus);
+	ReportWriters(focus);
 	Write("[DEVLOST] ===== end =====\n");
 }
 
