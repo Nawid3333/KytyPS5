@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
 #include <fmt/format.h>
 #include <string>
 #include <vector>
@@ -15,8 +16,11 @@ namespace Libs::Graphics::DeviceLossDiag {
 
 namespace {
 
-constexpr uint32_t RingSize       = 1u << 16u;
-constexpr uint32_t ContextEntries = 24;
+constexpr uint32_t RingSize          = 1u << 16u;
+constexpr uint32_t ContextEntries    = 24;
+constexpr uint32_t ArgsSlots         = 4096;
+constexpr uint32_t ArgsSlotWords     = 8;
+constexpr uint32_t ArgsReportedEarly = 8;
 
 struct Entry {
 	std::atomic<uint32_t> id {0};
@@ -25,6 +29,7 @@ struct Entry {
 	uint64_t              hash1 = 0;
 	uint64_t              tick  = 0;
 	const char*           site  = nullptr;
+	IndirectArgs          args;
 };
 
 GraphicContext*             g_graphics = nullptr;
@@ -34,6 +39,9 @@ std::atomic<bool>           g_reported {false};
 vk::Buffer                  g_marker_buffer = nullptr;
 vk::DeviceMemory            g_marker_memory = nullptr;
 volatile uint32_t*          g_markers       = nullptr;
+vk::Buffer                  g_args_buffer   = nullptr;
+vk::DeviceMemory            g_args_memory   = nullptr;
+volatile uint32_t*          g_args          = nullptr;
 
 constexpr vk::DeviceSize StartedOffset  = 0;
 constexpr vk::DeviceSize FinishedOffset = 4;
@@ -70,17 +78,18 @@ std::string Describe(uint32_t id) {
 	                   e.tick, e.hash0, e.hash1);
 }
 
-void CreateMarkerBuffer(GraphicContext& graphics) {
+volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize size,
+                                    vk::Buffer& buffer, vk::DeviceMemory& memory_out) {
 	vk::BufferCreateInfo info {};
-	info.size        = 64;
+	info.size        = size;
 	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
 	info.sharingMode = vk::SharingMode::eExclusive;
-	if (graphics.device.createBuffer(&info, nullptr, &g_marker_buffer) != vk::Result::eSuccess) {
-		g_marker_buffer = nullptr;
-		return;
+	if (graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+		buffer = nullptr;
+		return nullptr;
 	}
 	vk::MemoryRequirements requirements {};
-	graphics.device.getBufferMemoryRequirements(g_marker_buffer, &requirements);
+	graphics.device.getBufferMemoryRequirements(buffer, &requirements);
 	vk::PhysicalDeviceMemoryProperties memory {};
 	graphics.physical_device.getMemoryProperties(&memory);
 	const auto wanted =
@@ -98,19 +107,87 @@ void CreateMarkerBuffer(GraphicContext& graphics) {
 	allocate.memoryTypeIndex = type;
 	void* mapped             = nullptr;
 	if (type == UINT32_MAX ||
-	    graphics.device.allocateMemory(&allocate, nullptr, &g_marker_memory) !=
-	        vk::Result::eSuccess ||
-	    graphics.device.bindBufferMemory(g_marker_buffer, g_marker_memory, 0) !=
-	        vk::Result::eSuccess ||
-	    graphics.device.mapMemory(g_marker_memory, 0, VK_WHOLE_SIZE, {}, &mapped) !=
+	    graphics.device.allocateMemory(&allocate, nullptr, &memory_out) != vk::Result::eSuccess ||
+	    graphics.device.bindBufferMemory(buffer, memory_out, 0) != vk::Result::eSuccess ||
+	    graphics.device.mapMemory(memory_out, 0, VK_WHOLE_SIZE, {}, &mapped) !=
 	        vk::Result::eSuccess) {
-		graphics.device.destroyBuffer(g_marker_buffer, nullptr);
-		g_marker_buffer = nullptr;
-		return;
+		graphics.device.destroyBuffer(buffer, nullptr);
+		buffer = nullptr;
+		return nullptr;
 	}
-	g_markers    = static_cast<volatile uint32_t*>(mapped);
-	g_markers[0] = 0;
-	g_markers[1] = 0;
+	std::memset(mapped, 0, static_cast<size_t>(size));
+	return static_cast<volatile uint32_t*>(mapped);
+}
+
+void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, const IndirectArgs& args) {
+	const vk::DeviceSize slot = vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords * sizeof(uint32_t);
+	const vk::MemoryBarrier before {.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+	                                                 vk::AccessFlagBits::eTransferWrite,
+	                                .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+	buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader |
+	                           vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1, &before,
+	                       0, nullptr, 0, nullptr);
+	buffer.fillBuffer(g_args_buffer, slot, sizeof(uint32_t), id);
+	const vk::BufferCopy copy {
+	    args.offset, slot + sizeof(uint32_t),
+	    std::min<vk::DeviceSize>(args.size, (ArgsSlotWords - 1) * sizeof(uint32_t))};
+	buffer.copyBuffer(args.buffer, g_args_buffer, 1, &copy);
+	buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eDrawIndirect, vk::DependencyFlags {}, 0,
+	                       nullptr, 0, nullptr, 0, nullptr);
+}
+
+bool HasArgs(uint32_t id) {
+	const auto& e = g_ring[id % RingSize];
+	return e.id.load(std::memory_order_acquire) == id && e.args.buffer;
+}
+
+std::string DescribeArgs(uint32_t id) {
+	const auto& e = g_ring[id % RingSize];
+	const auto& a = e.args;
+	const auto  handle =
+	    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(a.buffer)));
+	auto text =
+	    fmt::format("#{} {} hash0=0x{:016x} guest=0x{:016x} buffer=0x{:016x}+0x{:x} words=", id,
+	                KindName(e.kind), e.hash0, a.guest_address, handle, a.offset);
+	if (g_args == nullptr) {
+		return text + "not captured";
+	}
+	const auto*    slot   = g_args + vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords;
+	const uint32_t holder = slot[0];
+	if (holder != id) {
+		return text + fmt::format("not copied (slot holds #{})", holder);
+	}
+	const uint32_t words = std::min<uint32_t>(a.size / sizeof(uint32_t), ArgsSlotWords - 1);
+	for (uint32_t i = 0; i < words; i++) {
+		const uint32_t word = slot[1 + i];
+		text += fmt::format("{}0x{:08x}", i == 0 ? "" : " ", word);
+	}
+	return text;
+}
+
+void ReportIndirectArgs(uint32_t focus) {
+	Write(fmt::format("[DEVLOST] dispatch-indirect arguments copied on the GPU before each "
+	                  "dispatch-indirect ({} slots):\n",
+	                  ArgsSlots));
+	if (HasArgs(focus)) {
+		Write(fmt::format("[DEVLOST]   {}   <== first unfinished\n", DescribeArgs(focus)));
+	} else {
+		Write(fmt::format("[DEVLOST]   #{} has no indirect arguments   <== first unfinished\n",
+		                  focus));
+	}
+	uint32_t shown = 0;
+	for (uint32_t id = focus - 1; id != 0 && shown < ArgsReportedEarly && focus - id < RingSize;
+	     id--) {
+		if (g_ring[id % RingSize].id.load(std::memory_order_acquire) != id) {
+			break;
+		}
+		if (HasArgs(id)) {
+			Write(fmt::format("[DEVLOST]   {}\n", DescribeArgs(id)));
+			shown++;
+		}
+	}
 }
 
 void ReportFault() {
@@ -169,16 +246,19 @@ void ReportNvCheckpoints() {
 void Init(GraphicContext& graphics) {
 	g_graphics = &graphics;
 	if (graphics.amd_buffer_marker_enabled) {
-		CreateMarkerBuffer(graphics);
+		g_markers = CreateHostBuffer(graphics, 64, g_marker_buffer, g_marker_memory);
 	}
+	g_args =
+	    CreateHostBuffer(graphics, vk::DeviceSize {ArgsSlots} * ArgsSlotWords * sizeof(uint32_t),
+	                     g_args_buffer, g_args_memory);
 	Write(fmt::format("[DEVLOST] device-loss diagnostics: device_fault={} nv_checkpoints={} "
-	                  "amd_buffer_marker={}\n",
+	                  "amd_buffer_marker={} indirect_args={}\n",
 	                  graphics.device_fault_enabled, graphics.nv_checkpoints_enabled,
-	                  g_markers != nullptr));
+	                  g_markers != nullptr, g_args != nullptr));
 }
 
 static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1,
-                       uint64_t tick, const char* site) {
+                       uint64_t tick, const char* site, const IndirectArgs& args) {
 	if (g_graphics == nullptr) {
 		return 0;
 	}
@@ -193,7 +273,11 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	e.hash1 = hash1;
 	e.tick  = tick;
 	e.site  = site;
+	e.args  = args;
 	e.id.store(id, std::memory_order_release);
+	if (g_args != nullptr && args.buffer) {
+		CaptureArgs(buffer, id, args);
+	}
 	if (g_graphics->nv_checkpoints_enabled) {
 		buffer.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(id) << 1u));
 	}
@@ -204,12 +288,13 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	return id;
 }
 
-uint32_t Begin(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1, uint64_t tick) {
-	return Record(buffer, kind, hash0, hash1, tick, nullptr);
+uint32_t Begin(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1, uint64_t tick,
+               const IndirectArgs& args) {
+	return Record(buffer, kind, hash0, hash1, tick, nullptr, args);
 }
 
 uint32_t BeginInternal(vk::CommandBuffer buffer, const char* site) {
-	return Record(buffer, Kind::Internal, 0, 0, 0, site);
+	return Record(buffer, Kind::Internal, 0, 0, 0, site, {});
 }
 
 void End(vk::CommandBuffer buffer, uint32_t id) {
@@ -256,6 +341,7 @@ void Report(const char* where, vk::Result result, uint64_t known_gpu_tick) {
 		Write(fmt::format("[DEVLOST]   {}{}\n", Describe(id),
 		                  id == focus ? "   <== first unfinished" : ""));
 	}
+	ReportIndirectArgs(focus);
 	Write("[DEVLOST] ===== end =====\n");
 }
 
