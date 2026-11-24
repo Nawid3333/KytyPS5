@@ -847,12 +847,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
+		     " type=%u/%u tile=%u/%u extent=%ux%ux%u/%ux%ux%u pitch=%u/%u format=%u/%u"
+		     " guest_format=%u/%u samples=%u/%u\n",
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		     static_cast<uint32_t>(cached.info.tile_mode), requested.extent.width,
+		     requested.extent.height, requested.extent.depth, cached.info.extent.width,
+		     cached.info.extent.height, cached.info.extent.depth, requested.pitch,
+		     cached.info.pitch, static_cast<uint32_t>(requested.pixel_format),
+		     static_cast<uint32_t>(cached.info.pixel_format),
+		     static_cast<uint32_t>(requested.guest_format),
+		     static_cast<uint32_t>(cached.info.guest_format), requested.samples,
+		     cached.info.samples);
 	}
 
 	if (const auto view = requested.SubresourceOf(cached.info); view.mip >= 0) {
