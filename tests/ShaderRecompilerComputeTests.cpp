@@ -7655,6 +7655,68 @@ public:
                   wide_download != nullptr && wide_download_offset % 16 == 0,
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
+      {
+        struct VolumeGrowth {
+          uint64_t offset;
+          Prospero::TileMode tile;
+          uint32_t levels;
+          vk::Extent3D shallow;
+          vk::Extent3D deep;
+          uint64_t shallow_size;
+        };
+        constexpr std::array<VolumeGrowth, 3> volume_growths{{
+            {0x2e60000, Prospero::TileMode::kStandard64KB, 1, {20, 32, 16},
+             {32, 32, 32}, 0x10000},
+            {0x2e80000, Prospero::TileMode::kStandard4KB, 3, {4, 4, 8},
+             {8, 4, 16}, 0x1000},
+            {0x2ea0000, Prospero::TileMode::kRenderTarget, 1, {100, 128, 2},
+             {128, 128, 4}, 0x20000},
+        }};
+        constexpr uint32_t volume_clear = 0x11223344u;
+        constexpr uint32_t volume_guest = 0x5a5a5a5au;
+        for (const auto &growth : volume_growths) {
+          std::memset(memory + growth.offset, 0x5a, 2 * growth.shallow_size);
+          auto shallow = MakeLinearDesc(
+              base + growth.offset, 0, vk::Format::eR32Uint,
+              Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor3D,
+              growth.shallow, 1, 4, 1);
+          shallow.info.pitch = 0;
+          shallow.info.resources.levels = growth.levels;
+          shallow.info.tile_mode = growth.tile;
+          shallow.view_info.level_count = growth.levels;
+          shallow.info.UpdateSize();
+          auto deep = shallow;
+          deep.info.data.size = 0;
+          deep.info.pitch = 0;
+          deep.info.extent = growth.deep;
+          deep.info.UpdateSize();
+          Require(name, "volume growth footprints",
+                  shallow.info.data.size == growth.shallow_size &&
+                      deep.info.data.size == 2 * growth.shallow_size &&
+                      shallow.info.BlockExtent() == deep.info.BlockExtent(),
+                  "the fixture does not double the volume footprint at one pitch");
+          const auto shallow_id = texture_cache.FindImage(shallow);
+          (void)texture_cache.FindTexture(shallow_id, shallow);
+          vk::ClearValue clear{};
+          clear.color.uint32.fill(volume_clear);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), shallow_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+          const auto deep_id = texture_cache.FindImage(deep);
+          Require(name, "volume depth growth at another unpadded extent",
+                  deep_id != shallow_id &&
+                      !TextureCacheTestAccess::Contains(texture_cache, shallow_id) &&
+                      texture_cache.GetImage(deep_id).backing.extent == growth.deep &&
+                      ReadCachedTexel(name, context, deep_id) ==
+                          std::vector<u32>{volume_clear} &&
+                      ReadCachedTexel(name, context, deep_id,
+                                      {0, 0, static_cast<int32_t>(growth.shallow.depth)}) ==
+                          std::vector<u32>{volume_guest},
+                  "a deeper volume at the same block-slice layout did not expand the "
+                  "cached volume");
+          TextureCacheTestAccess::DeleteImage(texture_cache, deep_id);
+        }
+      }
 
       auto sampled =
           MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
