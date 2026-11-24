@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -414,6 +415,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[lab-pipeline] createGraphicsPipelines failed: {} stage_ids {:016x} {:016x} {:016x} {:016x}\n",
+		    vk::to_string(result), key.stage_ids[0], key.stage_ids[1], key.stage_ids[2], key.stage_ids[3]));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -450,6 +456,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		Log::WriteToConsoleAndLog(fmt::format("[lab-pipeline] createComputePipelines failed: {} module {:016x}\n",
+		                                      vk::to_string(result), module.id));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

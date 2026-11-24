@@ -253,6 +253,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	Log::WriteToConsoleAndLog(fmt::format("[lab-pipeline] module {:016x} = {} 0x{:016x}\n", id, stage, key.hash));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
