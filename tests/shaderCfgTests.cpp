@@ -11665,6 +11665,115 @@ void TestUniformSelectedDescriptorLoadAddress() {
   }
 }
 
+void TestWorkgroupSelectedBufferPairStore() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint32_t RowCount = 5u;
+  constexpr uint32_t RowTableOffset = 0x2a0u;
+  constexpr uint32_t PairStride = 8u;
+  constexpr uint32_t PairRecords = 64u;
+  constexpr uint32_t CountRecords = RowCount * 32u;
+  constexpr uint32_t StructuredBounds = 0u;
+  const uint32_t shader[] = {
+      EncodeSopp(0x20, 1),
+      EncodeSopc(0x0a, 11, 133),
+      EncodeSopp(0x04, 28),
+      EncodeVop3Word0(0x346, 2), EncodeVop3Word1(10, 134, 256),
+      EncodeSop2(0x1e, 4, 11, 133),
+      EncodeSmem0(0x01, 106, 4), (125u << 25u) | 8u,
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeSmem0(0x02, 0, 53), (125u << 25u) | 64u,
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeSmem0(0x08, 106, 0), (4u << 25u) | 12u,
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeVopc(0xd4, 106, 2),
+      EncodeSopp(0x08, 14),
+      EncodeVop1(0x01, 0, 255), 0xffffd8f1u,
+      EncodeVop1(0x01, 1, 255), 0x0000270fu,
+      EncodeSop2(0x31, 4, 11, 255), RowTableOffset,
+      EncodeSmem0(0x01, 106, 4), (125u << 25u) | 32u,
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeSmem0(0x02, 0, 53), 4u << 25u,
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeMubuf0(0x1d, 0, true), EncodeMubuf1(0, 0, 2),
+      EncodeSopp(0x01),
+  };
+  const auto buffer = [](uint32_t *words, const void *data, uint32_t stride,
+                         uint32_t count, uint32_t mode) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    words[0] = static_cast<uint32_t>(address);
+    words[1] = static_cast<uint32_t>(address >> 32u) | (stride << 16u);
+    words[2] = count;
+    words[3] = 0x5004u | (mode << 28u);
+  };
+  const auto pointer = [](uint32_t *words, const void *data) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    words[0] = static_cast<uint32_t>(address);
+    words[1] = static_cast<uint32_t>(address >> 32u);
+  };
+  std::array<uint32_t, CountRecords / 4u> counts{};
+  std::array<std::array<uint32_t, PairRecords * PairStride / 4u>, RowCount> pairs{};
+  std::array<uint32_t, 20> count_table{};
+  std::array<uint32_t, RowTableOffset / 4u + RowCount * 4u> pair_table{};
+  std::array<uint32_t, 10> root{};
+  buffer(count_table.data() + 16u, counts.data(), 0u, CountRecords, 3u);
+  const auto row = [&](uint32_t index) {
+    return pair_table.data() + RowTableOffset / 4u + index * 4u;
+  };
+  for (uint32_t index = 0; index < RowCount; ++index)
+    buffer(row(index), pairs[index].data(), PairStride, PairRecords, StructuredBounds);
+  pointer(root.data() + 2u, count_table.data());
+  pointer(root.data() + 8u, pair_table.data());
+  std::array<uint32_t, 10> user_data{};
+  pointer(user_data.data() + 8u, root.data());
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.workgroup_register = 10;
+  compute.thread_ids_num = 1;
+  compute.group_id[0] = compute.group_id[2] = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ExtractResourcePlan(translated.program);
+  const auto store = std::ranges::find_if(plan.info.buffers, [&](const auto &resource) {
+    return resource.written &&
+           plan.descriptor_sources[resource.source].indirect_descriptor.has_value();
+  });
+  Check(store != plan.info.buffers.end() && store->max_byte_extent == PairStride,
+        "workgroup-selected pair store was not planned as one indirect buffer");
+  const auto &indirect = *plan.descriptor_sources[store->source].indirect_descriptor;
+  Check(indirect.indexed && indirect.table_stride == 16u &&
+            indirect.table_offset == RowTableOffset &&
+            indirect.key_count == Value(RowCount),
+        "workgroup-selected pair store lost its row table or its branch bound");
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_specialization_memory = ReadHostTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] {
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + RowCount - 1u,
+        "workgroup-selected pair store did not bind every reachable row");
+  for (uint32_t index = 0; index < RowCount; ++index) {
+    const auto address = reinterpret_cast<uint64_t>(pairs[index].data());
+    Check(std::ranges::any_of(snapshot.buffers, [&](const auto &value) {
+            return value.dwords[0] == static_cast<uint32_t>(address) &&
+                   value.dwords[2] == PairRecords;
+          }),
+          "workgroup-selected pair store dropped a reachable row");
+  }
+  for (const uint32_t stride : {4u, 16u}) {
+    buffer(row(3), pairs[3].data(), stride, PairRecords, StructuredBounds);
+    Check(!materialize(), "pair store accepted records that are not exactly two DWORDs");
+  }
+  buffer(row(3), pairs[3].data(), PairStride, PairRecords, StructuredBounds);
+  Check(materialize(), "restored pair rows failed to materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestBoundedScalarMaterialImageKeys() {
   using namespace ShaderRecompiler::IR;
   // SAROS 9fba2edffc549531: min(header count,64), scalar rows of 160 bytes,
@@ -13753,6 +13862,7 @@ int main() {
   TestPatternFill();
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
+  TestWorkgroupSelectedBufferPairStore();
   TestUniformSelectedDescriptorLoadAddress();
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();

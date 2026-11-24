@@ -2963,8 +2963,10 @@ private:
 	bool IndirectBufferAccess(const Inst& inst) const {
 		const auto opcode = inst.GetOpcode();
 		if (opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::StoreBufferU8 &&
-		    opcode != ValueOpcode::StoreBufferU32x4 && opcode != ValueOpcode::LoadBufferU32x2 &&
-		    opcode != ValueOpcode::LoadBufferU32x3 && opcode != ValueOpcode::LoadBufferU32x4) return false;
+		    opcode != ValueOpcode::StoreBufferU32x2 && opcode != ValueOpcode::StoreBufferU32x4 &&
+		    opcode != ValueOpcode::LoadBufferU32x2 && opcode != ValueOpcode::LoadBufferU32x3 &&
+		    opcode != ValueOpcode::LoadBufferU32x4)
+			return false;
 		const auto index = inst.Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) return false;
 		const auto& memory = m_program.memory_info[index];
@@ -2976,6 +2978,8 @@ private:
 		if (!memory.idxen) return false;
 		if (opcode == ValueOpcode::StoreBufferU8)
 			return !memory.formatted && memory.data_bits == 8u;
+		if (opcode == ValueOpcode::StoreBufferU32x2)
+			return !memory.formatted && memory.data_bits == 32u && memory.data_dwords == 2u;
 		if (opcode == ValueOpcode::StoreBufferU32x4)
 			return memory.formatted && memory.data_bits == 32u && memory.data_dwords == 4u &&
 			       memory.component_count == 4u;
