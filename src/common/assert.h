@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -12,6 +13,19 @@ namespace Common {
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);
 
+using DbgReportContextWriter = std::string (*)(const void* context);
+
+class DbgReportContext final {
+public:
+	DbgReportContext(DbgReportContextWriter writer, const void* context);
+	~DbgReportContext();
+	DbgReportContext(const DbgReportContext&)            = delete;
+	DbgReportContext& operator=(const DbgReportContext&) = delete;
+
+private:
+	DbgReportContextWriter m_previous_writer;
+	const void*            m_previous_context;
+};
 void SetDbgReportGame(std::string_view game);
 
 } // namespace Common

@@ -13601,6 +13601,33 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+void TestFatalStopDescribesTheDecodedShader() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+
+  const uint32_t shader[] = {
+      EncodeSop2(0x23, 8, 255, 129), 0xfffffffeu,
+      EncodeSopp(0x01),
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  const auto listing = Decoder::ProgramToString(decoded);
+  Check(decoded.instructions.size() == 2u &&
+            listing.find("0x00000008: ") != std::string::npos,
+        "fatal shader listing fixture did not decode two instructions");
+
+  const auto text = ShaderRecompiler::DescribeFatalShader(
+      {.stage = ShaderType::Pixel, .hash = 0x0123456789abcdefull, .code = shader});
+  Check(text == "--- Shader ---\nShaderRecompiler PS decoded RDNA2: "
+                "hash=0x0123456789abcdef\n" +
+                    listing,
+        "fatal stop did not describe the decoded shader with its stage and hash");
+  Check(ShaderRecompiler::DescribeFatalShader(
+            {.stage = ShaderType::Compute, .hash = 1u}) ==
+            "--- Shader ---\nShaderRecompiler CS decoded RDNA2: "
+            "hash=0x0000000000000001\n",
+        "fatal stop without shader code wrote a listing");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -13823,6 +13850,7 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+  TestFatalStopDescribesTheDecodedShader();
 
   return 0;
 }

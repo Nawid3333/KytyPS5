@@ -250,6 +250,70 @@ TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
 	    testing::ExitedWithCode(0), "");
 }
 
+void LogFatalReportToFile(const std::filesystem::path& dir) {
+	std::filesystem::create_directories(dir);
+	std::freopen((dir / "console.txt").string().c_str(), "wb", stdout);
+	Config::Initialize();
+	Config::ConfigOptions options;
+	options.printf_direction   = Config::LogDirection::File;
+	options.printf_output_file = dir / "log.txt";
+	Config::Load(options);
+	Log::Initialize();
+}
+
+std::string WriteContext(const void* context) {
+	return *static_cast<const std::string*>(context);
+}
+
+std::string FailToWriteContext(const void*) {
+	EXIT("context failed\n");
+}
+
+TEST(Assert, FatalReportWritesTheCurrentContextBeforeTheError) {
+	const auto dir = std::filesystem::temp_directory_path() / "kyty_fatal_report_context_test";
+	std::error_code ec;
+	std::filesystem::remove_all(dir, ec);
+	EXPECT_EXIT(
+	    {
+		    LogFatalReportToFile(dir);
+		    const std::string              outer_text = "outer context\n";
+		    const std::string              inner_text = "inner context\n";
+		    const Common::DbgReportContext outer(WriteContext, &outer_text);
+		    {
+			    const Common::DbgReportContext inner(WriteContext, &inner_text);
+		    }
+		    EXIT("stop\n");
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+	const auto log = ReadAll(dir / "log.txt");
+	EXPECT_TRUE(log.starts_with("outer context\n--- Build ---\n")) << log;
+	EXPECT_NE(log.find("--- Error ---\nstop\n in "), std::string::npos) << log;
+	EXPECT_EQ(log.find("inner context"), std::string::npos) << log;
+	EXPECT_EQ(ReadAll(dir / "console.txt"), log);
+	std::filesystem::remove_all(dir, ec);
+}
+
+TEST(Assert, FatalReportKeepsTheErrorWhenItsContextFails) {
+	const auto dir = std::filesystem::temp_directory_path() / "kyty_fatal_report_failed_context_test";
+	std::error_code ec;
+	std::filesystem::remove_all(dir, ec);
+	EXPECT_EXIT(
+	    {
+		    LogFatalReportToFile(dir);
+		    const Common::DbgReportContext context(FailToWriteContext, nullptr);
+		    EXIT("stop\n");
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+	const auto log    = ReadAll(dir / "log.txt");
+	const auto stop   = log.find("--- Error ---\nstop\n in ");
+	const auto failed = log.find("--- Error ---\ncontext failed\n in ");
+	EXPECT_NE(stop, std::string::npos) << log;
+	EXPECT_NE(failed, std::string::npos) << log;
+	EXPECT_LT(stop, failed) << log;
+	EXPECT_EQ(ReadAll(dir / "console.txt"), log);
+	std::filesystem::remove_all(dir, ec);
+}
+
 TEST(Assert, FatalReportNamesTheGameOnceItIsKnown) {
 	const auto dir = std::filesystem::temp_directory_path() / "kyty_fatal_report_game_test";
 	std::error_code ec;
