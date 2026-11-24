@@ -20,7 +20,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -146,6 +148,49 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+static std::atomic<uint64_t> g_lab_host_image_bytes {0};
+static std::atomic<uint64_t> g_lab_host_image_count {0};
+
+static bool LabIsHostHeap(VmaAllocator allocator, VmaAllocation allocation, uint64_t* size) {
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	const VkPhysicalDeviceMemoryProperties* props = nullptr;
+	vmaGetMemoryProperties(allocator, &props);
+	const auto heap = props->memoryTypes[info.memoryType].heapIndex;
+	*size           = info.size;
+	return (props->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+}
+
+static void LabLogImageFailure(VmaAllocator allocator, const vk::ImageCreateInfo& info,
+                               vk::Result result) {
+	Log::WriteToConsoleAndLog(
+	    fmt::format("[lab-2331] vmaCreateImage result {} usage 0x{:x} tiling {} flags 0x{:x} "
+	                "samples {} format {}\n",
+	                vk::to_string(result), static_cast<uint32_t>(info.usage),
+	                vk::to_string(info.tiling), static_cast<uint32_t>(info.flags),
+	                static_cast<uint32_t>(info.samples), static_cast<int>(info.format)));
+	Log::WriteToConsoleAndLog(fmt::format("[lab-2331] images in host heaps: {} ({} bytes)\n",
+	                                      g_lab_host_image_count.load(),
+	                                      g_lab_host_image_bytes.load()));
+	VmaTotalStatistics stats {};
+	vmaCalculateStatistics(allocator, &stats);
+	const VkPhysicalDeviceMemoryProperties* props = nullptr;
+	vmaGetMemoryProperties(allocator, &props);
+	for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+		const auto& type = stats.memoryType[i];
+		if (type.statistics.blockCount == 0) {
+			continue;
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[lab-2331] type {} heap {} flags 0x{:x}: blocks {} ({} bytes), allocations {} ({} "
+		    "bytes), "
+		    "largest {}\n",
+		    i, props->memoryTypes[i].heapIndex, props->memoryTypes[i].propertyFlags,
+		    type.statistics.blockCount, type.statistics.blockBytes, type.statistics.allocationCount,
+		    type.statistics.allocationBytes, type.allocationSizeMax));
+	}
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -161,7 +206,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
+		LabLogImageFailure(allocator, image_info, result);
 		return false;
+	}
+	if (uint64_t size = 0; LabIsHostHeap(allocator, image.allocation, &size)) {
+		g_lab_host_image_bytes += size;
+		g_lab_host_image_count++;
 	}
 
 	image.format     = image_info.format;
@@ -182,6 +232,10 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	if (uint64_t size = 0; LabIsHostHeap(allocator, image.allocation, &size)) {
+		g_lab_host_image_bytes -= size;
+		g_lab_host_image_count--;
+	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;
