@@ -32,8 +32,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <limits>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -622,22 +625,46 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static constexpr int      LabMaxLines          = 2000;
-static constexpr uint32_t LabMaxEntries        = 1024;
-static constexpr uint64_t LabEntryBytes        = 16;
-static constexpr uint64_t LabOperandBytes      = 32;
-static constexpr uint64_t LabRegistryBytes     = 64;
-static constexpr uint64_t LabSecondArrayOffset = 16;
-static constexpr uint64_t LabTargetBytes       = 64;
-static constexpr uint64_t LabInnerQwords       = 4;
-static constexpr uint64_t LabInnerBytes        = 48;
-static constexpr uint64_t LabCallBytes         = 256;
-static constexpr uint64_t LabRowBytes          = 16;
-static constexpr uint64_t LabFaultWindowOffset = 48;
+static constexpr int              LabMaxLines          = 2000;
+static constexpr uint32_t         LabMaxEntries        = 1024;
+static constexpr uint64_t         LabEntryBytes        = 16;
+static constexpr uint64_t         LabOperandBytes      = 32;
+static constexpr uint64_t         LabRegistryBytes     = 64;
+static constexpr uint64_t         LabObjectBytes       = 0xa0;
+static constexpr uint64_t         LabNameRefOffset     = 0x80;
+static constexpr uint64_t         LabNameLengthOffset  = 0x84;
+static constexpr uint64_t         LabNameShownBytes    = 64;
+static constexpr uint32_t         LabNameSlotShift     = 24;
+static constexpr uint32_t         LabNameOffsetMask    = 0xffffff;
+static constexpr uint64_t         LabNameOffsetUnit    = 8;
+static constexpr uint64_t         LabLookupBytes       = 768;
+static constexpr uint64_t         LabCallBytes         = 256;
+static constexpr int64_t          LabNearCallRange     = 0x4000000;
+static constexpr int              LabMaxCalleeDumps    = 8;
+static constexpr uint64_t         LabRowBytes          = 16;
+static constexpr uint64_t         LabFaultWindowOffset = 48;
+static constexpr uint64_t         LabSearchRadius      = 0x10000000;
+static constexpr uint64_t         LabSearchChunk       = 0x10000;
+static constexpr uint64_t         LabContextBefore     = 48;
+static constexpr uint64_t         LabContextAfter      = 24;
+static constexpr int              LabMaxStemMatches    = 32;
+static constexpr int              LabMaxSuffixMatches  = 256;
+static constexpr std::string_view LabQueryStem         = "gpupipe_culling";
+static constexpr std::string_view LabNameSuffix        = ".rfx";
 
 struct LabText {
 	std::string text;
 	int         lines = 0;
+};
+
+struct LabRange {
+	uint64_t low  = std::numeric_limits<uint64_t>::max();
+	uint64_t high = 0;
+};
+
+struct LabCodeScan {
+	std::vector<uint64_t> operands;
+	std::vector<uint64_t> calls;
 };
 
 static void LabLine(LabText* out, const std::string& line) {
@@ -657,16 +684,32 @@ static std::string LabBytes(const uint8_t* bytes, uint64_t size) {
 	return hex;
 }
 
+static bool LabPrintableByte(uint8_t byte) {
+	return byte >= 0x20 && byte < 0x7f;
+}
+
+static std::string LabPrintable(const uint8_t* bytes, uint64_t size) {
+	std::string text;
+	for (uint64_t i = 0; i < size; i++) {
+		text += LabPrintableByte(bytes[i]) ? static_cast<char>(bytes[i]) : '.';
+	}
+	return text;
+}
+
 static std::string LabHexText(uint64_t addr, uint64_t size) {
 	if (!IsReadableRange(addr, size)) {
 		return "(not readable)";
 	}
 	const auto* bytes = reinterpret_cast<const uint8_t*>(addr);
-	std::string text;
-	for (uint64_t i = 0; i < size; i++) {
-		text += (bytes[i] >= 0x20 && bytes[i] < 0x7f) ? static_cast<char>(bytes[i]) : '.';
+	return LabBytes(bytes, size) + " |" + LabPrintable(bytes, size) + "|";
+}
+
+static bool LabIsText(uint64_t addr, uint64_t size) {
+	if (!IsReadableRange(addr, size)) {
+		return false;
 	}
-	return LabBytes(bytes, size) + " |" + text + "|";
+	const auto* bytes = reinterpret_cast<const uint8_t*>(addr);
+	return std::all_of(bytes, bytes + size, LabPrintableByte);
 }
 
 static bool LabReadQword(uint64_t addr, uint64_t* value) {
@@ -686,34 +729,115 @@ static bool LabReadArray(uint64_t field, uint64_t* entries, uint32_t* count) {
 	return *count > 0 && IsReadableRange(*entries, std::min(*count, LabMaxEntries) * LabEntryBytes);
 }
 
-static void LabDumpEntries(LabText* out, const char* name, uint64_t entries, uint32_t count) {
-	const uint32_t shown = std::min(count, LabMaxEntries);
-	LabLine(out, fmt::format(" {} array 0x{:016x}: count {}, {} entries of {} bytes shown", name,
-	                         entries, count, shown, LabEntryBytes));
-	for (uint32_t e = 0; e < shown && out->lines < LabMaxLines; e++) {
-		const uint64_t entry = entries + e * LabEntryBytes;
-		LabLine(out, fmt::format("  {}[{}] 0x{:016x}: {}", name, e, entry,
-		                         LabHexText(entry, LabEntryBytes)));
-		for (uint64_t q = 0; q < LabEntryBytes; q += sizeof(uint64_t)) {
-			uint64_t target = 0;
-			if (!LabReadQword(entry + q, &target) || !IsReadableRange(target, LabTargetBytes)) {
-				continue;
+static LabCodeScan LabScanCode(LabText* out, const uint8_t* code, uint64_t base, size_t size) {
+	LabCodeScan scan;
+	for (size_t i = 0; i < size;) {
+		const size_t  at    = ((code[i] & 0xf0u) == 0x40u) ? i + 1 : i;
+		const uint8_t op    = at < size ? code[at] : 0;
+		const bool rip_form = op == 0x8b || op == 0x8d || op == 0x89 || op == 0x3b || op == 0x39 ||
+		                      op == 0x03 || op == 0x2b;
+		if (rip_form && at + 6 <= size && (code[at + 1] & 0xc7u) == 0x05u) {
+			int32_t disp = 0;
+			std::memcpy(&disp, code + at + 2, sizeof(disp));
+			const uint64_t target = base + at + 6 + static_cast<int64_t>(disp);
+			LabLine(out, fmt::format("  +{} op {:02x} -> 0x{:016x}: {}", i, op, target,
+			                         LabHexText(target, LabOperandBytes)));
+			uint64_t pointer = 0;
+			if (op == 0x8b && LabReadQword(target, &pointer)) {
+				LabLine(out, fmt::format("   qword 0x{:016x} points to: {}", pointer,
+				                         LabHexText(pointer, LabOperandBytes)));
 			}
-			LabLine(out, fmt::format("   +{} -> 0x{:016x}: {}", q, target,
-			                         LabHexText(target, LabTargetBytes)));
-			for (uint64_t inner = 0; inner < LabInnerQwords * sizeof(uint64_t);
-			     inner += sizeof(uint64_t)) {
-				uint64_t next = 0;
-				if (LabReadQword(target + inner, &next) && IsReadableRange(next, LabInnerBytes)) {
-					LabLine(out, fmt::format("    +{}+{} -> 0x{:016x}: {}", q, inner, next,
-					                         LabHexText(next, LabInnerBytes)));
-				}
-			}
+			scan.operands.push_back(target);
+			i = at + 6;
+			continue;
+		}
+		if (code[i] == 0xe8 && i + 5 <= size) {
+			int32_t rel = 0;
+			std::memcpy(&rel, code + i + 1, sizeof(rel));
+			const uint64_t target = base + i + 5 + static_cast<int64_t>(rel);
+			LabLine(out, fmt::format("  +{} call -> 0x{:016x}", i, target));
+			scan.calls.push_back(target);
+		}
+		i++;
+	}
+	return scan;
+}
+
+static bool LabCodeRows(LabText* out, uint64_t target, uint64_t size) {
+	if (!IsReadableRange(target, size)) {
+		LabLine(out, "   (not readable)");
+		return false;
+	}
+	const auto* bytes = reinterpret_cast<const uint8_t*>(target);
+	for (uint64_t row = 0; row < size; row += LabRowBytes) {
+		LabLine(out,
+		        fmt::format("   0x{:016x}: {}", target + row, LabBytes(bytes + row, LabRowBytes)));
+	}
+	return true;
+}
+
+static void LabNameVia(LabText* out, const char* via, uint64_t table, uint64_t base, uint64_t slot,
+                       uint64_t offset, uint64_t shown) {
+	uint64_t chunk = 0;
+	if (!LabReadQword(base + slot, &chunk) || !LabIsText(chunk + offset, shown)) {
+		return;
+	}
+	LabLine(out, fmt::format("   name via {} 0x{:016x}: \"{}\" at 0x{:016x}", via, table,
+	                         LabPrintable(reinterpret_cast<const uint8_t*>(chunk + offset), shown),
+	                         chunk + offset));
+}
+
+static void LabNameCandidates(LabText* out, uint32_t ref, uint32_t length,
+                              const std::vector<uint64_t>& tables) {
+	const uint64_t slot   = static_cast<uint64_t>(ref >> LabNameSlotShift) * sizeof(uint64_t);
+	const uint64_t offset = static_cast<uint64_t>(ref & LabNameOffsetMask) * LabNameOffsetUnit;
+	const uint64_t shown  = std::min<uint64_t>(length, LabNameShownBytes);
+	if (shown == 0) {
+		return;
+	}
+	for (const uint64_t table: tables) {
+		LabNameVia(out, "table", table, table, slot, offset, shown);
+		uint64_t holder = 0;
+		if (LabReadQword(table, &holder)) {
+			LabNameVia(out, "*table", table, holder, slot, offset, shown);
 		}
 	}
 }
 
-static void LabDumpRegistry(LabText* out, uint64_t holder, std::vector<uint64_t>* seen) {
+static void LabDumpEntries(LabText* out, uint64_t entries, uint32_t count,
+                           const std::vector<uint64_t>& tables, LabRange* objects) {
+	const uint32_t shown = std::min(count, LabMaxEntries);
+	LabLine(out, fmt::format(" entries 0x{:016x}: count {}, {} shown: entry -> object bytes "
+	                         "+0x00..+0x{:x}, name ref +0x{:x}, name length +0x{:x}",
+	                         entries, count, shown, LabObjectBytes, LabNameRefOffset,
+	                         LabNameLengthOffset));
+	for (uint32_t e = 0; e < shown && out->lines < LabMaxLines; e++) {
+		const uint64_t entry  = entries + e * LabEntryBytes;
+		uint64_t       object = 0;
+		LabReadQword(entry, &object);
+		LabLine(out, fmt::format("  [{}] 0x{:016x}: {} -> 0x{:016x}: {}", e, entry,
+		                         LabHexText(entry, LabEntryBytes), object,
+		                         LabHexText(object, LabObjectBytes)));
+		if (!IsReadableRange(object, LabObjectBytes)) {
+			continue;
+		}
+		objects->low    = std::min(objects->low, object);
+		objects->high   = std::max(objects->high, object);
+		uint32_t ref    = 0;
+		uint32_t length = 0;
+		std::memcpy(&ref, reinterpret_cast<const void*>(object + LabNameRefOffset), sizeof(ref));
+		std::memcpy(&length, reinterpret_cast<const void*>(object + LabNameLengthOffset),
+		            sizeof(length));
+		LabLine(out, fmt::format("   name ref 0x{:08x}: slot {} offset 0x{:x}, length {}", ref,
+		                         ref >> LabNameSlotShift,
+		                         static_cast<uint64_t>(ref & LabNameOffsetMask) * LabNameOffsetUnit,
+		                         length));
+		LabNameCandidates(out, ref, length, tables);
+	}
+}
+
+static void LabDumpRegistry(LabText* out, uint64_t holder, const std::vector<uint64_t>& tables,
+                            std::vector<uint64_t>* seen, LabRange* objects) {
 	uint64_t registry = 0;
 	uint64_t entries  = 0;
 	uint32_t count    = 0;
@@ -725,30 +849,40 @@ static void LabDumpRegistry(LabText* out, uint64_t holder, std::vector<uint64_t>
 	LabLine(out,
 	        fmt::format("registry 0x{:016x} (qword at 0x{:016x}), first {} bytes: {}", registry,
 	                    holder, LabRegistryBytes, LabHexText(registry, LabRegistryBytes)));
-	LabDumpEntries(out, "first", entries, count);
-	uint64_t second_entries = 0;
-	uint32_t second_count   = 0;
-	if (LabReadArray(registry + LabSecondArrayOffset, &second_entries, &second_count)) {
-		LabDumpEntries(out, "second", second_entries, second_count);
-	} else {
-		LabLine(out,
-		        fmt::format(" second array at +{}: empty or not readable", LabSecondArrayOffset));
-	}
+	LabDumpEntries(out, entries, count, tables, objects);
 }
 
-static void LabCallRows(LabText* out, uint64_t target) {
-	if (!IsReadableRange(target, LabCallBytes)) {
-		LabLine(out, "   (not readable)");
-		return;
+static std::vector<uint64_t> LabDumpLookups(LabText* out, const std::vector<uint64_t>& lookups) {
+	std::vector<uint64_t> tables;
+	for (const uint64_t lookup: lookups) {
+		LabLine(out, fmt::format("call target 0x{:016x}, first {} bytes:", lookup, LabLookupBytes));
+		if (!LabCodeRows(out, lookup, LabLookupBytes)) {
+			continue;
+		}
+		LabLine(out, fmt::format("RIP-relative operands and calls inside 0x{:016x} (byte scan):",
+		                         lookup));
+		const auto inner =
+		    LabScanCode(out, reinterpret_cast<const uint8_t*>(lookup), lookup, LabLookupBytes);
+		tables.insert(tables.end(), inner.operands.begin(), inner.operands.end());
+		int dumped = 0;
+		for (const uint64_t callee: inner.calls) {
+			const auto distance = static_cast<int64_t>(callee - lookup);
+			if (dumped == LabMaxCalleeDumps || distance > LabNearCallRange ||
+			    distance < -LabNearCallRange) {
+				continue;
+			}
+			LabLine(out, fmt::format(" callee 0x{:016x}, first {} bytes:", callee, LabCallBytes));
+			LabCodeRows(out, callee, LabCallBytes);
+			dumped++;
+		}
 	}
-	const auto* bytes = reinterpret_cast<const uint8_t*>(target);
-	for (uint64_t row = 0; row < LabCallBytes; row += LabRowBytes) {
-		LabLine(out,
-		        fmt::format("   0x{:016x}: {}", target + row, LabBytes(bytes + row, LabRowBytes)));
-	}
+	std::sort(tables.begin(), tables.end());
+	tables.erase(std::unique(tables.begin(), tables.end()), tables.end());
+	return tables;
 }
 
-static std::string LabFaultOperands(const uint8_t* code, uint64_t base, size_t size) {
+static std::string LabFaultOperands(const uint8_t* code, uint64_t base, size_t size,
+                                    LabRange* objects) {
 	LabText out;
 	LabLine(&out, fmt::format("fault pc=0x{:016x} code window from 0x{:016x}:",
 	                          base + LabFaultWindowOffset, base));
@@ -756,44 +890,61 @@ static std::string LabFaultOperands(const uint8_t* code, uint64_t base, size_t s
 		LabLine(&out, " " + LabBytes(code + row, std::min<uint64_t>(LabRowBytes, size - row)));
 	}
 	LabLine(&out, "RIP-relative operands and call targets in the window (byte scan):");
-	std::vector<uint64_t> holders;
-	for (size_t i = 0; i < size;) {
-		const size_t  at       = ((code[i] & 0xf0u) == 0x40u) ? i + 1 : i;
-		const uint8_t op       = at < size ? code[at] : 0;
-		const bool    rip_form = op == 0x8b || op == 0x8d || op == 0x89 || op == 0x3b || op == 0x39;
-		if (rip_form && at + 6 <= size && (code[at + 1] & 0xc7u) == 0x05u) {
-			int32_t disp = 0;
-			std::memcpy(&disp, code + at + 2, sizeof(disp));
-			const uint64_t target = base + at + 6 + static_cast<int64_t>(disp);
-			LabLine(&out, fmt::format("  +{} op {:02x} -> 0x{:016x}: {}", i, op, target,
-			                          LabHexText(target, LabOperandBytes)));
-			uint64_t pointer = 0;
-			if (op == 0x8b && LabReadQword(target, &pointer)) {
-				LabLine(&out, fmt::format("   qword 0x{:016x} points to: {}", pointer,
-				                          LabHexText(pointer, LabOperandBytes)));
-			}
-			holders.push_back(target);
-			i = at + 6;
-			continue;
-		}
-		if (code[i] == 0xe8 && i + 5 <= size) {
-			int32_t rel = 0;
-			std::memcpy(&rel, code + i + 1, sizeof(rel));
-			const uint64_t target = base + i + 5 + static_cast<int64_t>(rel);
-			LabLine(&out, fmt::format("  +{} call -> 0x{:016x}, first {} bytes:", i, target,
-			                          LabCallBytes));
-			LabCallRows(&out, target);
-		}
-		i++;
-	}
-	LabLine(&out, "registries: {qword entries, dword count} behind each operand's qword");
+	const auto window = LabScanCode(&out, code, base, size);
+	const auto tables = LabDumpLookups(&out, window.calls);
+	LabLine(&out,
+	        fmt::format("name tables tried (RIP operands of the call targets): {}", tables.size()));
+	LabLine(&out, "registries: {qword entries, dword count} behind each window operand's qword");
 	std::vector<uint64_t> seen;
-	for (const uint64_t holder: holders) {
-		LabDumpRegistry(&out, holder, &seen);
+	for (const uint64_t holder: window.operands) {
+		LabDumpRegistry(&out, holder, tables, &seen, objects);
 	}
 	if (seen.empty()) {
 		LabLine(&out, " none found");
 	}
+	return out.text;
+}
+
+static int LabFindInChunk(LabText* out, std::string_view bytes, uint64_t chunk,
+                          std::string_view needle, int found, int limit) {
+	for (size_t at = bytes.find(needle); at != std::string_view::npos;
+	     at        = bytes.find(needle, at + 1)) {
+		if (found < limit) {
+			const uint64_t match = chunk + at;
+			const uint64_t from  = match - LabContextBefore;
+			const uint64_t size  = LabContextBefore + needle.size() + LabContextAfter;
+			LabLine(out,
+			        fmt::format(" {} at 0x{:016x}: |{}|", needle, match,
+			                    IsReadableRange(from, size)
+			                        ? LabPrintable(reinterpret_cast<const uint8_t*>(from), size)
+			                        : std::string(needle)));
+		}
+		found++;
+	}
+	return found;
+}
+
+static std::string LabFindNames(const LabRange& objects) {
+	LabText        out;
+	const uint64_t low =
+	    (objects.low - std::min(objects.low, LabSearchRadius)) & ~(LabSearchChunk - 1);
+	const uint64_t high     = objects.high + LabSearchRadius;
+	int            stems    = 0;
+	int            suffixes = 0;
+	uint64_t       readable = 0;
+	LabLine(&out, fmt::format("text search 0x{:016x}..0x{:016x} for \"{}\" and \"{}\":", low, high,
+	                          LabQueryStem, LabNameSuffix));
+	for (uint64_t chunk = low; chunk < high; chunk += LabSearchChunk) {
+		if (!IsReadableRange(chunk, LabSearchChunk)) {
+			continue;
+		}
+		readable += LabSearchChunk;
+		const std::string_view bytes(reinterpret_cast<const char*>(chunk), LabSearchChunk);
+		stems    = LabFindInChunk(&out, bytes, chunk, LabQueryStem, stems, LabMaxStemMatches);
+		suffixes = LabFindInChunk(&out, bytes, chunk, LabNameSuffix, suffixes, LabMaxSuffixMatches);
+	}
+	LabLine(&out, fmt::format("text search done: {} readable bytes, {} \"{}\", {} \"{}\"", readable,
+	                          stems, LabQueryStem, suffixes, LabNameSuffix));
 	return out.text;
 }
 
@@ -861,7 +1012,12 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			}
 			std::printf("\n");
 			std::fflush(stdout);
-			Log::WriteToConsoleAndLog(LabFaultOperands(code, info->exception_address - 48, 96));
+			LabRange objects;
+			Log::WriteToConsoleAndLog(
+			    LabFaultOperands(code, info->exception_address - 48, 96, &objects));
+			if (objects.low <= objects.high) {
+				Log::WriteToConsoleAndLog(LabFindNames(objects));
+			}
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);

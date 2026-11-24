@@ -14,19 +14,19 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fmt/format.h>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <atomic>
-#include <cinttypes>
-#include <iterator>
 #include <variant>
 #include <vector>
 
@@ -59,6 +59,16 @@ static std::condition_variable                           g_submission_cv;
 // Resolved files by ID - 1; IDs are never released.
 static std::vector<HostFile>                             g_files;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+
+static constexpr uint32_t    LabAprMaxLines    = 700;
+static constexpr uint64_t    LabAprHeadBytes   = 16;
+static constexpr char        LabAprExtension[] = ".binrfx";
+static std::atomic<uint32_t> g_lab_apr_lines {0};
+
+static bool LabAprTraced(const std::filesystem::path& host_path) {
+	return host_path.extension() == LabAprExtension &&
+	       g_lab_apr_lines.fetch_add(1) < LabAprMaxLines;
+}
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -188,6 +198,11 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		}
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(info.host_path).c_str());
+		}
+		if (LabAprTraced(info.host_path)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[lab-947-apr] resolve {} -> id {} size {} result 0x{:08x}\n", guest_path,
+			    info.file_id, info.file_size, static_cast<uint32_t>(info.result)));
 		}
 	}
 
@@ -1131,6 +1146,20 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 			     ", read=0x%016" PRIx64 ", result=0x%08" PRIx32 "\n",
 			     command.file_id, command.file_offset, command.size, bytes_read,
 			     static_cast<uint32_t>(result));
+		}
+		if (AprShared::LabAprTraced(host_path)) {
+			const auto* head  = reinterpret_cast<const uint8_t*>(command.destination);
+			const auto  shown = std::min<uint64_t>(bytes_read, AprShared::LabAprHeadBytes);
+			std::string bytes;
+			for (uint64_t i = 0; i < shown; i++) {
+				bytes += fmt::format(" {:02x}", head[i]);
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[lab-947-apr] read id {} {} offset 0x{:x} size 0x{:x} read 0x{:x} result 0x{:08x} "
+			    "dst 0x{:016x}:{}\n",
+			    command.file_id, Common::PathToString(host_path.filename()), command.file_offset,
+			    command.size, bytes_read, static_cast<uint32_t>(result), command.destination,
+			    bytes));
 		}
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
