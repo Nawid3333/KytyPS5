@@ -488,6 +488,13 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	options.arguments.assign(argv + 1, argv + argc);
+	for (size_t i = 1; i < options.arguments.size(); i++) {
+		if (options.arguments[i - 1] == "--user-name") {
+			options.arguments[i] = "<hidden>";
+		}
+	}
+
 	Run(options);
 
 	return 0;

@@ -32,7 +32,7 @@
 
 namespace Emulator {
 
-static void PrintSystemInfo() {
+static void PrintSystemInfo(const std::vector<std::string>& arguments) {
 	const Common::SystemInfo info = Common::GetSystemInfo();
 
 #if defined(__APPLE__)
@@ -47,12 +47,14 @@ static void PrintSystemInfo() {
 
 	LOGF("Build\n"
 	     "  version: %s\n\n"
+	     "Arguments\n"
+	     "  %s\n\n"
 	     "Host\n"
 	     "  os:      %s\n"
 	     "  cpu:     %s\n"
 	     "  threads: %u\n\n",
-	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
-	     std::thread::hardware_concurrency());
+	     KYTY_BUILD_LABEL, Common::JoinArguments(arguments).c_str(), platform_name,
+	     info.ProcessorName.c_str(), std::thread::hardware_concurrency());
 }
 
 static void KytyClose() {
@@ -152,7 +154,7 @@ void Run(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 
-	PrintSystemInfo();
+	PrintSystemInfo(options.arguments);
 	std::string title_id;
 	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
 	if (title_id.empty()) {
