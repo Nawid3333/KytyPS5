@@ -1019,11 +1019,30 @@ static bool InitializeAprReservedState(uint64_t command_buffer, uint64_t reserve
 
 static constexpr uint32_t    LabBufferMaxLines = 300;
 static std::atomic<uint32_t> g_lab_buffer_lines {0};
-static std::atomic<uint32_t> g_lab_fail_lines {0};
+static std::atomic<uint32_t> g_lab_read_fail_lines {0};
+static std::atomic<uint32_t> g_lab_event_fail_lines {0};
+static constexpr uint32_t    LabCallerDumps     = 2;
+static constexpr uint64_t    LabCallerDumpStart = 0x40;
+static constexpr uint64_t    LabCallerDumpBytes = 0x100;
+static constexpr uint64_t    LabDumpRow         = 16;
+
+static void LabDumpCaller(uint64_t caller) {
+	const auto* code = reinterpret_cast<const uint8_t*>(caller - LabCallerDumpStart);
+	for (uint64_t row = 0; row < LabCallerDumpBytes; row += LabDumpRow) {
+		std::string line =
+		    fmt::format("[lab-947-ampr]  code 0x{:016x}:", caller - LabCallerDumpStart + row);
+		for (uint64_t i = 0; i < LabDumpRow; i++) {
+			line += fmt::format(" {:02x}", code[row + i]);
+		}
+		Log::WriteToConsoleAndLog(line + "\n");
+	}
+}
 
 static void LabBufferLine(const char* what, uint64_t command_buffer, uint64_t caller,
-                          std::atomic<uint32_t>& counter, const std::string& detail) {
-	if (counter.fetch_add(1) >= LabBufferMaxLines) {
+                          std::atomic<uint32_t>& counter, const std::string& detail,
+                          bool dump_caller = false) {
+	const auto index = counter.fetch_add(1);
+	if (index >= LabBufferMaxLines) {
 		return;
 	}
 	CommandBufferState state {};
@@ -1032,6 +1051,9 @@ static void LabBufferLine(const char* what, uint64_t command_buffer, uint64_t ca
 	    "[lab-947-ampr] {} cb 0x{:x} caller 0x{:x} write_offset 0x{:x} size 0x{:x} cmds {}{}: {}\n",
 	    what, command_buffer, caller, state.write_offset, state.size, state.commands.size(),
 	    known ? "" : " (no state)", detail));
+	if (dump_caller && index < LabCallerDumps) {
+		LabDumpCaller(caller);
+	}
 }
 
 static bool LabHasRead(const CommandBufferState& state) {
@@ -1679,7 +1701,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint6
 	if (command_buffer == nullptr || !IsValidAprReadRange(destination_addr, size) ||
 	    !IsValidAprFileOffset(file_offset)) {
 		LabBufferLine("read refused EINVAL", reinterpret_cast<uint64_t>(command_buffer), lab_caller,
-		              g_lab_fail_lines, lab_detail);
+		              g_lab_read_fail_lines, lab_detail, true);
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
@@ -1688,7 +1710,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint6
 	                                            AprReadFileRecordSize(file_offset));
 	if (!append_ok) {
 		LabBufferLine("read append failed EFAULT", reinterpret_cast<uint64_t>(command_buffer),
-		              lab_caller, g_lab_fail_lines, lab_detail);
+		              lab_caller, g_lab_read_fail_lines, lab_detail, true);
 	}
 	return append_ok ? OK : LibKernel::KERNEL_ERROR_EFAULT;
 }
@@ -1958,8 +1980,8 @@ static int KYTY_SYSV_ABI CommandBufferWriteKernelEventQueue(void* command_buffer
 		return OK;
 	}
 	LabBufferLine("event append failed EFAULT", reinterpret_cast<uint64_t>(command_buffer),
-	              reinterpret_cast<uint64_t>(__builtin_return_address(0)), g_lab_fail_lines,
-	              fmt::format("eq 0x{:x} id {} data 0x{:x}", eq, id, data));
+	              reinterpret_cast<uint64_t>(__builtin_return_address(0)), g_lab_event_fail_lines,
+	              fmt::format("eq 0x{:x} id {} data 0x{:x}", eq, id, data), true);
 	return LibKernel::KERNEL_ERROR_EFAULT;
 }
 
