@@ -545,13 +545,22 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	DeviceLossDiag::IndirectArgs diag_args {.buffer        = args_buffer->Handle(),
+	                                        .offset        = args_offset,
+	                                        .size          = sizeof(vk::DispatchIndirectCommand),
+	                                        .guest_address = args_addr};
+	diag_args.cpu_read = LibKernel::Memory::TryReadBacking(args_addr, diag_args.cpu_words.data(),
+	                                                       sizeof(diag_args.cpu_words));
+	diag_args.gpu_modified =
+	    m_context.GetBufferCache().IsRegionGpuModified(args_addr, diag_args.size);
+	diag_args.cpu_modified =
+	    m_context.GetBufferCache().IsRegionCpuModified(args_addr, diag_args.size);
+	diag_args.image = static_cast<bool>(
+	    m_context.GetTextureCache().FindImageFromRange(args_addr, diag_args.size, false));
 	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::DispatchIndirect,
 	                                           program.shader_hash, cs_regs.cs_regs.data_addr,
 	                                           m_context.GetCommandScheduler().CurrentTick(),
-	                                           {.buffer = args_buffer->Handle(),
-	                                            .offset = args_offset,
-	                                            .size   = sizeof(vk::DispatchIndirectCommand),
-	                                            .guest_address = args_addr});
+	                                           diag_args);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	DeviceLossDiag::End(vk_buffer, diag_id);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
