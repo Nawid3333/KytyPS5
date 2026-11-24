@@ -309,6 +309,10 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 	for (const auto id: released) {
 		m_slot_images[id].ReleaseBacking();
 	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[lab-vram] image allocation failed: released {} idle images ({} bytes) for 0x{:x} bytes "
+	    "at 0x{:016x}, frame {}\n",
+	    released.size(), released_size, requested.size, requested.address, m_gc_tick));
 	return true;
 }
 
