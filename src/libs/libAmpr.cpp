@@ -1056,6 +1056,22 @@ static void LabBufferLine(const char* what, uint64_t command_buffer, uint64_t ca
 	}
 }
 
+static constexpr uint32_t    LabMeasureMaxLines = 64;
+static std::atomic<uint32_t> g_lab_measure_lines {0};
+
+static void LabMeasureLine(const char* what, uint64_t caller, uint64_t result,
+                           const std::string& detail) {
+	const auto index = g_lab_measure_lines.fetch_add(1);
+	if (index >= LabMeasureMaxLines) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("[lab-947-ampr] {} caller 0x{:x} result 0x{:x}: {}\n",
+	                                      what, caller, result, detail));
+	if (index == 0) {
+		LabDumpCaller(caller);
+	}
+}
+
 static bool LabHasRead(const CommandBufferState& state) {
 	return std::any_of(state.commands.begin(), state.commands.end(), [](const auto& command) {
 		return std::holds_alternative<CommandBufferState::ReadFileCommand>(command.data);
@@ -1728,9 +1744,13 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFile(uint64_t, uint64_t dest
                                                          uint64_t size, uint64_t file_offset) {
 	PRINT_NAME();
 
-	return IsValidAprReadRange(destination, size) && IsValidAprFileOffset(file_offset)
-	           ? AprReadFileRecordSize(file_offset)
-	           : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
+	const auto result = IsValidAprReadRange(destination, size) && IsValidAprFileOffset(file_offset)
+	                        ? AprReadFileRecordSize(file_offset)
+	                        : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
+	LabMeasureLine(
+	    "measure read", reinterpret_cast<uint64_t>(__builtin_return_address(0)), result,
+	    fmt::format("dst 0x{:x} size 0x{:x} off 0x{:x}", destination, size, file_offset));
+	return result;
 }
 
 static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteKernelEventQueue(uint64_t, uint64_t, uint64_t,
@@ -1738,6 +1758,8 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteKernelEventQueue(uint64_t, 
                                                                       uint64_t) {
 	PRINT_NAME();
 
+	LabMeasureLine("measure event", reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	               KERNEL_EVENT_RECORD_SIZE, "");
 	return KERNEL_EVENT_RECORD_SIZE;
 }
 
