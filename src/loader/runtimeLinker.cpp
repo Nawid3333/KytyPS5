@@ -647,8 +647,8 @@ static constexpr uint64_t         LabSearchRadius      = 0x10000000;
 static constexpr uint64_t         LabSearchChunk       = 0x10000;
 static constexpr uint64_t         LabContextBefore     = 48;
 static constexpr uint64_t         LabContextAfter      = 24;
-static constexpr int              LabMaxStemMatches    = 32;
-static constexpr int              LabMaxSuffixMatches  = 256;
+static constexpr size_t           LabMaxStemMatches    = 32;
+static constexpr size_t           LabMaxSuffixMatches  = 256;
 static constexpr std::string_view LabQueryStem         = "gpupipe_culling";
 static constexpr std::string_view LabNameSuffix        = ".rfx";
 
@@ -905,46 +905,59 @@ static std::string LabFaultOperands(const uint8_t* code, uint64_t base, size_t s
 	return out.text;
 }
 
-static int LabFindInChunk(LabText* out, std::string_view bytes, uint64_t chunk,
-                          std::string_view needle, int found, int limit) {
-	for (size_t at = bytes.find(needle); at != std::string_view::npos;
-	     at        = bytes.find(needle, at + 1)) {
-		if (found < limit) {
-			const uint64_t match = chunk + at;
-			const uint64_t from  = match - LabContextBefore;
-			const uint64_t size  = LabContextBefore + needle.size() + LabContextAfter;
-			LabLine(out,
-			        fmt::format(" {} at 0x{:016x}: |{}|", needle, match,
-			                    IsReadableRange(from, size)
-			                        ? LabPrintable(reinterpret_cast<const uint8_t*>(from), size)
-			                        : std::string(needle)));
+struct LabMatches {
+	std::string_view      needle;
+	size_t                limit = 0;
+	std::vector<uint64_t> shown;
+	uint64_t              total = 0;
+};
+
+static void LabFindInChunk(std::string_view bytes, uint64_t chunk, LabMatches* matches) {
+	for (size_t at = bytes.find(matches->needle); at != std::string_view::npos;
+	     at        = bytes.find(matches->needle, at + 1)) {
+		if (matches->shown.size() < matches->limit) {
+			matches->shown.push_back(chunk + at);
 		}
-		found++;
+		matches->total++;
 	}
-	return found;
+}
+
+static void LabPrintMatches(LabText* out, const LabMatches& matches) {
+	const uint64_t size = LabContextBefore + matches.needle.size() + LabContextAfter;
+	for (const uint64_t match: matches.shown) {
+		const uint64_t from = match - LabContextBefore;
+		LabLine(out, fmt::format(" {} at 0x{:016x}: |{}|", matches.needle, match,
+		                         IsReadableRange(from, size)
+		                             ? LabPrintable(reinterpret_cast<const uint8_t*>(from), size)
+		                             : std::string(matches.needle)));
+	}
 }
 
 static std::string LabFindNames(const LabRange& objects) {
-	LabText        out;
 	const uint64_t low =
 	    (objects.low - std::min(objects.low, LabSearchRadius)) & ~(LabSearchChunk - 1);
 	const uint64_t high     = objects.high + LabSearchRadius;
-	int            stems    = 0;
-	int            suffixes = 0;
 	uint64_t       readable = 0;
-	LabLine(&out, fmt::format("text search 0x{:016x}..0x{:016x} for \"{}\" and \"{}\":", low, high,
-	                          LabQueryStem, LabNameSuffix));
+	LabMatches     stems {LabQueryStem, LabMaxStemMatches};
+	LabMatches     suffixes {LabNameSuffix, LabMaxSuffixMatches};
+	stems.shown.reserve(stems.limit);
+	suffixes.shown.reserve(suffixes.limit);
 	for (uint64_t chunk = low; chunk < high; chunk += LabSearchChunk) {
 		if (!IsReadableRange(chunk, LabSearchChunk)) {
 			continue;
 		}
 		readable += LabSearchChunk;
 		const std::string_view bytes(reinterpret_cast<const char*>(chunk), LabSearchChunk);
-		stems    = LabFindInChunk(&out, bytes, chunk, LabQueryStem, stems, LabMaxStemMatches);
-		suffixes = LabFindInChunk(&out, bytes, chunk, LabNameSuffix, suffixes, LabMaxSuffixMatches);
+		LabFindInChunk(bytes, chunk, &stems);
+		LabFindInChunk(bytes, chunk, &suffixes);
 	}
-	LabLine(&out, fmt::format("text search done: {} readable bytes, {} \"{}\", {} \"{}\"", readable,
-	                          stems, LabQueryStem, suffixes, LabNameSuffix));
+	LabText out;
+	LabLine(&out, fmt::format("text search 0x{:016x}..0x{:016x}: {} readable bytes, {} \"{}\" "
+	                          "({} shown), {} \"{}\" ({} shown)",
+	                          low, high, readable, stems.total, stems.needle, stems.shown.size(),
+	                          suffixes.total, suffixes.needle, suffixes.shown.size()));
+	LabPrintMatches(&out, stems);
+	LabPrintMatches(&out, suffixes);
 	return out.text;
 }
 
