@@ -808,8 +808,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
 		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
-		      requested.extent.width == cached.info.extent.width &&
-		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
 			return {ExpandImage(requested, cached_id)};
 		}
