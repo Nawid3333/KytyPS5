@@ -231,14 +231,16 @@ struct RecordedCommandCounter {
   static inline uint32_t barriers = 0;
   static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
+  static inline uint32_t image_copies = 0;
   static inline VertexBuffers vertex_buffers;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+  static inline PFN_vkCmdCopyImage copy_image = nullptr;
   static inline PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers = nullptr;
 
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
-    barriers = indirect_barriers = copies = 0;
+    barriers = indirect_barriers = copies = image_copies = 0;
     vertex_buffers = {};
     bind_vertex_buffers = std::exchange(
         dispatcher.vkCmdBindVertexBuffers2,
@@ -255,6 +257,10 @@ struct RecordedCommandCounter {
       indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
       pipeline_barrier(args...);
     });
+    copy_image = std::exchange(dispatcher.vkCmdCopyImage, [](auto... args) {
+      ++image_copies;
+      copy_image(args...);
+    });
     copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
       ++copies;
       copy_buffer(args...);
@@ -262,6 +268,7 @@ struct RecordedCommandCounter {
   }
   ~RecordedCommandCounter() {
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyImage = copy_image;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindVertexBuffers2 = bind_vertex_buffers;
   }
@@ -1562,9 +1569,10 @@ struct TestCase {
   std::vector<u32> storage_buffer_offsets;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
-  std::optional<uint64_t> fault_free_address;
-  // A BDA load from this unbacked address must record its page.
-  std::optional<uint64_t> fault_address;
+  struct {
+    uint64_t address = 0;
+    std::vector<u32> words;
+  } faults;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -4764,6 +4772,26 @@ public:
     bool walker_unmapped_zero = false;
     LibKernel::Memory::InstallGpuResources(&resources);
     gpu.SendCommandSync([&] {
+      constexpr uint64_t fill = fault_base + 0x22000;
+      constexpr uint32_t bytes = 2 * TRACKER_PAGE_SIZE;
+      (void)buffer_cache.FindBuffer(fill, bytes);
+      (void)buffer_cache.ObtainBufferForImage(fill, bytes);
+      Require("GpuCommandLane", "watched CPU fill setup",
+              !buffer_cache.IsRegionCpuModified(fill, bytes) &&
+                  !buffer_cache.IsRegionGpuModified(fill, bytes),
+              "the fill destination was not fully write-watched");
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      buffer_cache.FillBuffer(fill, bytes, 0xababababu, false);
+      const auto after = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      Common::DebugCounters::SetEnabled(false);
+      const auto *words = reinterpret_cast<const uint32_t *>(fill);
+      Require("GpuCommandLane", "CPU fill of watched pages",
+              after == faults && std::all_of(words, words + bytes / sizeof(*words),
+                                             [](uint32_t word) { return word == 0xababababu; }) &&
+                  buffer_cache.IsRegionCpuModified(fill, 1) &&
+                  buffer_cache.IsRegionCpuModified(fill + bytes - 1, 1),
+              "the fill faulted, left a page clean, or wrote incorrect bytes");
       (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
                                       false);
       buffer_cache.FillBuffer(table_gpu_address, sizeof(uint32_t), 0x7ab1e5u,
@@ -5004,6 +5032,19 @@ public:
                         Pm4ProcessResult::Complete &&
                     release(0, silent_address, written),
                 "a GL2-writeback release without a signal copied nothing back");
+        constexpr uint64_t args_address = fault_base + 0x39000;
+        (void)buffer_cache.ObtainBuffer(args_address + 0xc00, 4, true, false);
+        (void)shader_write(args_address, {8, 8, 1}, linear);
+        Require("GpuCommandLane", "pending command data",
+                texture_cache.WriteBackImages() &&
+                    texture_cache.WriteBackTick(args_address, sizeof(written)) != 0 &&
+                    buffer_cache.IsRegionGpuModified(args_address, sizeof(written)) &&
+                    !buffer_cache.HasGpuDirtyBytes(args_address, sizeof(written)),
+                "the pending image and neighboring buffer did not share a tracked page");
+        std::array<uint32_t, 4> args{};
+        LibKernel::Memory::ReadGuestMemory(args_address, args.data(), sizeof(args));
+        Require("GpuCommandLane", "command data from a pending image",
+                args == written, "the command processor read stale image data");
         (void)shader_write(shared_page, {8, 8, 1}, linear);
         (void)shader_write(shared_page + 0x800, {8, 4, 1}, linear);
         resources.GetCommandScheduler().DeferPriorityOperation(
@@ -8754,7 +8795,11 @@ public:
         htile_storage.info.resources.layers = layers;
         htile_storage.info.mip_layout[0].size = htile_storage.info.data.size;
         htile_storage.view_info.layer_count = layers;
+        const RecordedCommandCounter counter;
         const auto id = texture_cache.FindImage(htile_storage);
+        Require(name, "HTile array copy commands",
+                counter.image_copies == (layers == 1 ? 1u : 0u),
+                "the depth array did not convert in a single image copy");
         const auto &owner = texture_cache.GetImage(id);
         Require(name, "HTile depth storage prefix layout",
                 id != htile_depth_image &&
@@ -8788,6 +8833,32 @@ public:
                   std::vector<u32>(htile_layers, std::bit_cast<u32>(0.25f)),
               "partial storage conversion lost native depth data outside its view");
       DestroyBuffer(&htile_readback);
+
+      auto depth_prefix = htile_depth;
+      depth_prefix.info.resources.layers = 2;
+      depth_prefix.info.data.size = 2 * htile_slice_size;
+      depth_prefix.info.mip_layout[0].size = depth_prefix.info.data.size;
+      depth_prefix.info.metadata.range.size = 2 * 0x8000;
+      depth_prefix.view_info.base_layer = 1;
+      depth_prefix.view_info.layer_count = 1;
+      // Exercise the buffer fallback in the reverse direction.
+      ImageId prefix_id{};
+      {
+        const RecordedCommandCounter counter;
+        m_runtime_context.maintenance8_enabled = false;
+        prefix_id = texture_cache.FindImage(depth_prefix);
+        m_runtime_context.maintenance8_enabled = true;
+        Require(name, "HTile array copy without maintenance8", counter.image_copies == 0,
+                "a cross-aspect image copy requires maintenance8");
+      }
+      const auto prefix_view = texture_cache.FindDepthTarget(prefix_id, depth_prefix);
+      const auto &prefix_owner = texture_cache.GetImage(prefix_id);
+      Require(name, "HTile depth prefix after storage",
+              prefix_view != nullptr && prefix_owner.info.data == htile_depth.info.data &&
+                  prefix_owner.info.metadata.range == depth_prefix.info.metadata.range &&
+                  ReadCachedTexel(name, context, prefix_id, {}, {1, 1, 1}, htile_layers - 1) ==
+                      std::vector<u32>{std::bit_cast<u32>(0.25f)},
+              "rebinding a depth prefix discarded the remaining storage layers");
 
       auto layered_stencil_desc = MakeLinearDesc(
           base + 0x27d4000, 6 * 4 * sizeof(float),
@@ -13729,7 +13800,10 @@ public:
                 "empty arguments did not retain independent byte ownership");
         const auto tick = scheduler.CurrentTick();
         for (size_t i = 0; i < empty_dimensions.size(); ++i) {
-          processor.DispatchIndirect(empty_args + i * sizeof(empty_dimensions[0]), 0x41u);
+          const auto address = empty_args + i * sizeof(empty_dimensions[0]);
+          processor.DispatchIndirect(address, 0x41u);
+          processor.DispatchIndirect(
+              address, 0x41u | Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS);
         }
         Require(name, "empty dispatch avoids readback",
                 scheduler.CurrentTick() == tick &&
@@ -20976,20 +21050,20 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    const auto fault_address =
-        test.fault_address ? test.fault_address : test.fault_free_address;
-    if (fault_address) {
+    const auto fault_words = static_cast<u32>(test.faults.words.size());
+    if (fault_words != 0) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
-      fault_result = CreateHostBuffer(test.name, sizeof(u32),
-                                     vk::BufferUsageFlagBits::eTransferDst, {});
+      fault_result =
+          CreateHostBuffer(test.name, fault_words * sizeof(u32),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::MemoryBarrier ready{
           .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
       const vk::BufferCopy region{
-          (BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32), 0,
-          sizeof(u32)};
+          (BufferCache::PageIndex(test.faults.address) >> 5u) * sizeof(u32), 0,
+          fault_words * sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                         .dstAccessMask = vk::AccessFlagBits::eHostRead};
@@ -20997,14 +21071,15 @@ public:
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
-    if (fault_address) {
-      const u32 expected_fault =
-          test.fault_address
-              ? 1u << (BufferCache::PageIndex(*test.fault_address) & 31u)
-              : 0u;
-      Require(test.name, "fault check",
-              ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
-              "an access recorded a suppressed page or missed an unbacked one");
+    if (fault_words != 0) {
+      const auto words = ReadBuffer(test.name, fault_result, fault_words);
+      for (u32 i = 0; i < fault_words; ++i) {
+        Require(test.name, "fault check",
+                words[i] == test.faults.words[i],
+                "fault word " + std::to_string(i) + " = " +
+                    std::to_string(words[i]) + ", expected " +
+                    std::to_string(test.faults.words[i]));
+      }
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -37596,7 +37671,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 0}};
-  test.fault_free_address = GuestBase + 0x100000u;
+  test.faults = {GuestBase + 0x100000u, {0u}};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
@@ -39862,7 +39937,7 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   }
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
-  if (high) test.fault_free_address = uint64_t{Marker} + 0x70u;
+  if (high) test.faults = {uint64_t{Marker} + 0x70u, {0u}};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -40231,6 +40306,44 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+// Every lane of one wave loads from its own unmapped page. All pages share
+// fault-bitmap words, so the lanes' bits must be merged atomically rather than
+// stored over each other.
+TestCase GlobalLoadFaultsReportEveryLanePage(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t Unmapped = GuestBase + 0x100000u;
+  static_assert(((Unmapped >> BufferCache::CACHING_PAGEBITS) & 31u) == 0u);
+  std::vector<u32> code;
+  code.push_back(
+      EncodeVop2(0x1a, 1, InlineU32(BufferCache::CACHING_PAGEBITS), 0));
+  AppendVMovLiteral(&code, 2, static_cast<u32>(Unmapped));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(2), 1));
+  AppendVMovU32(&code, 5, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 2));
+  code.push_back(EncodeFlat1(3, 0x7d, 0, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32u ? "GlobalLoadFaultsReportEveryLanePage32"
+                               : "GlobalLoadFaultsReportEveryLanePage64";
+  test.code = std::move(code);
+  test.initial.assign(wave_size, 0xdeadbeefu);
+  test.expected.assign(wave_size, 0u);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.faults = {Unmapped, {0xffffffffu, wave_size == 64u ? 0xffffffffu : 0u, 0u}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_LSHLREV_B32,   O::V_MOV_B32,          O::V_ADD_NC_U32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -40260,7 +40373,8 @@ TestCase GlobalLoadRecordsUnbackedPage() {
   auto test = GlobalSignedImmediateRebasesBeforeSaddr();
   test.name = "GlobalLoadRecordsUnbackedPage";
   test.expected = {0u};
-  test.fault_address = test.bda_mappings.front().guest_base + 4;
+  const auto address = test.bda_mappings.front().guest_base + 4;
+  test.faults = {address, {1u << (BufferCache::PageIndex(address) & 31u)}};
   test.bda_mappings.front().guest_base += BufferCache::CACHING_PAGESIZE;
   return test;
 }
@@ -50307,6 +50421,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16HiMergesOldDestination(64));
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(32));
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(32));
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnbackedPage);
@@ -58178,6 +58294,8 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, GlobalLoadShortD16HiMergesOldDestination(wave));
       RunCase(&vulkan, FlatLoadShortD16HiIntoAddressHighVgpr(wave));
     }
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(32));
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(64));
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());

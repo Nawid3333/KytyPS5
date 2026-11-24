@@ -526,6 +526,23 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	return true;
 }
 
+// maintenance8 allows bitwise copies between these color formats and a depth or stencil aspect.
+static bool CanCopyAspectToColor(vk::Format depth, vk::Format color) {
+	switch (DepthStencilTransferBytes(depth)) {
+		case 1:
+			return color == vk::Format::eR8Uint || color == vk::Format::eR8Sint ||
+			       color == vk::Format::eR8Unorm || color == vk::Format::eR8Snorm;
+		case 2:
+			return color == vk::Format::eR16Uint || color == vk::Format::eR16Sint ||
+			       color == vk::Format::eR16Unorm || color == vk::Format::eR16Snorm ||
+			       color == vk::Format::eR16Sfloat;
+		case 4:
+			return color == vk::Format::eR32Uint || color == vk::Format::eR32Sint ||
+			       color == vk::Format::eR32Sfloat;
+		default: return false;
+	}
+}
+
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
@@ -547,7 +564,11 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
-	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)) ||
+	     (m_graphics.maintenance8_enabled && source_depth != dest_depth &&
+	      source.backing.image_type == destination.backing.image_type &&
+	      CanCopyAspectToColor(source_depth ? source.backing.format : destination.backing.format,
+	                           source_depth ? destination.backing.format : source.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -591,15 +612,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
 	// PPSA04264, PPSA04288
-	// A partial view retains the entire matching array layout. HTile belongs to
-	// the depth source, independently of the data slices copied into color storage.
+	// A depth or storage view can cover a prefix of the same array. HTile describes the
+	// depth view separately from the texel layout preserved in either direction.
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
-	    requested.bytes_per_block == cached.info.bytes_per_block &&
-	    requested.data.address == cached.info.data.address &&
 	    requested.data.size < cached.info.data.size && requested.extent == cached.info.extent &&
 	    requested.resources.levels == 1 && cached.info.resources.levels == 1 &&
-	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
+	    requested.resources.layers != 0 &&
 	    requested.resources.layers < cached.info.resources.layers &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    requested.mip_layout[0].offset == 0 &&
@@ -610,7 +629,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    cached.info.data.size % cached.info.resources.layers == 0 &&
 	    requested.data.size / requested.resources.layers ==
 	        cached.info.data.size / cached.info.resources.layers &&
-	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    !requested.HasStencil() && !cached.info.HasStencil() &&
+	    (requested.metadata.kind == ImageMetadataKind::None ||
+	     requested.metadata.kind == ImageMetadataKind::Htile) &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
 	// Depth bytes sampled through a color format no depth view provides (16_UINT, 8_8_UNORM)
