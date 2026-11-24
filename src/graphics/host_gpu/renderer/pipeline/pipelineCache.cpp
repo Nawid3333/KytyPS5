@@ -317,6 +317,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
+	const ShaderRecompiler::FatalShaderScope fatal_shader({.stage     = options.stage,
+	                                                       .hash      = params.hash,
+	                                                       .code      = params.code,
+	                                                       .back_code = params.back_code});
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;

@@ -709,4 +709,29 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	return result;
 }
 
+std::string DescribeFatalShader(const FatalShader& shader) {
+	auto text = fmt::format("--- Shader ---\nShaderRecompiler {} decoded RDNA2: hash=0x{:016x}\n",
+	                        StageName(shader.stage), shader.hash);
+	if (shader.code.empty()) {
+		return text;
+	}
+	Decoder::Program      decoded;
+	std::vector<uint32_t> joined_code;
+	if (!shader.back_code.empty()) {
+		decoded = DecodeFusedProgram(shader.code, shader.back_code, joined_code);
+	} else if (shader.stage == ShaderType::Local) {
+		decoded = Decoder::DecodeFrontProgram(shader.code);
+	} else {
+		Decoder::DecodeProgram(shader.code, decoded);
+	}
+	return text + Decoder::ProgramToString(decoded);
+}
+
+static std::string DescribeFatalShaderContext(const void* context) {
+	return DescribeFatalShader(*static_cast<const FatalShader*>(context));
+}
+
+FatalShaderScope::FatalShaderScope(const FatalShader& shader)
+    : m_shader(shader), m_context(DescribeFatalShaderContext, &m_shader) {}
+
 } // namespace Libs::Graphics::ShaderRecompiler

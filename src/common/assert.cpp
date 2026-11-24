@@ -9,8 +9,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <utility>
 
 namespace Common {
+
+static thread_local DbgReportContextWriter g_context_writer = nullptr;
+static thread_local const void*            g_context        = nullptr;
+static thread_local const std::string*     g_pending_report = nullptr;
+
+DbgReportContext::DbgReportContext(DbgReportContextWriter writer, const void* context)
+    : m_previous_writer(std::exchange(g_context_writer, writer)),
+      m_previous_context(std::exchange(g_context, context)) {}
+
+DbgReportContext::~DbgReportContext() {
+	g_context_writer = m_previous_writer;
+	g_context        = m_previous_context;
+}
 
 static std::array<char, 256> g_game {};
 static std::atomic<size_t>   g_game_size {0};
@@ -27,8 +41,18 @@ void SetDbgReportGame(std::string_view game) {
 	const auto game = game_size != 0
 	                      ? fmt::format("Game: {}\n", std::string_view(g_game.data(), game_size))
 	                      : std::string();
-	Log::WriteToConsoleAndLog(fmt::format("--- Build ---\n{}\n{}{}\n{} in {}:{}\n",
-	                                      KYTY_BUILD_LABEL, game, title, text, file, line));
+	const auto report = fmt::format("--- Build ---\n{}\n{}{}\n{} in {}:{}\n", KYTY_BUILD_LABEL, game,
+	                                title, text, file, line);
+	if (g_pending_report != nullptr) {
+		if (*g_pending_report != report) {
+			Log::WriteToConsoleAndLog(*g_pending_report);
+		}
+	} else if (const auto writer = std::exchange(g_context_writer, nullptr); writer != nullptr) {
+		g_pending_report = &report;
+		Log::WriteToConsoleAndLog(writer(g_context));
+		g_pending_report = nullptr;
+	}
+	Log::WriteToConsoleAndLog(report);
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(321);

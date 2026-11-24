@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_
 
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -81,6 +82,24 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
                                            const CompileOptions& options,
                                            const IR::ResourceSpecialization& specialization,
 	                                       IR::PushData::Window push_data = {});
+
+struct FatalShader {
+	ShaderType                stage = ShaderType::Compute;
+	uint64_t                  hash  = 0;
+	std::span<const uint32_t> code;
+	std::span<const uint32_t> back_code;
+};
+
+[[nodiscard]] std::string DescribeFatalShader(const FatalShader& shader);
+
+class FatalShaderScope final {
+public:
+	explicit FatalShaderScope(const FatalShader& shader);
+
+private:
+	FatalShader              m_shader;
+	Common::DbgReportContext m_context;
+};
 
 } // namespace Libs::Graphics::ShaderRecompiler
 
