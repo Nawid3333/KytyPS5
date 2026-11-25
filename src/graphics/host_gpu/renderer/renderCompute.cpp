@@ -591,7 +591,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	DeviceLossDiag::IndirectArgs diag_args {.buffer        = args_buffer->Handle(),
 	                                        .offset        = args_offset,
 	                                        .size          = sizeof(vk::DispatchIndirectCommand),
-	                                        .guest_address = args_addr};
+	                                        .guest_address = args_addr,
+	                                        .guest_mapped  = args_buffer->CpuAddress() != 0};
 	diag_args.cpu_read = LibKernel::Memory::TryReadBacking(args_addr, diag_args.cpu_words.data(),
 	                                                       sizeof(diag_args.cpu_words));
 	diag_args.gpu_modified =

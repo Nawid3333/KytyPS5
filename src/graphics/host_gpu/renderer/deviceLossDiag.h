@@ -23,6 +23,7 @@ struct IndirectArgs {
 	bool                    gpu_modified = false;
 	bool                    cpu_modified = false;
 	bool                    image        = false;
+	bool                    guest_mapped = false;
 };
 
 enum class WriteSource : uint8_t { Bound, Fill, CpuFill, Copy, CpuCopy, WriteData, Label };

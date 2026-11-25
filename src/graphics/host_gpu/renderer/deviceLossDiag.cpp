@@ -154,7 +154,7 @@ volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize siz
 }
 
 vk::DeviceSize WindowBefore(const IndirectArgs& args) {
-	return std::min<vk::DeviceSize>(args.offset, ArgsWindowBefore);
+	return args.guest_mapped ? std::min<vk::DeviceSize>(args.offset, ArgsWindowBefore) : 0;
 }
 
 void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, uint32_t args_slot,
@@ -214,7 +214,17 @@ std::string DescribeArgs(uint32_t id) {
 }
 
 void ReportArgsWindow(uint32_t id) {
-	const auto& e    = g_ring[id % RingSize];
+	if (g_args == nullptr) {
+		return;
+	}
+	const auto& e = g_ring[id % RingSize];
+	if (!e.args.guest_mapped) {
+		Write(fmt::format(
+		    "[DEVLOST]     no guest window for #{}: its arguments were read through the "
+		    "stream ring\n",
+		    id));
+		return;
+	}
 	const auto* slot = g_args + vk::DeviceSize {e.args_slot} * ArgsSlotWords;
 	if (slot[0] != id) {
 		return;
