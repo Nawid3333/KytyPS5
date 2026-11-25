@@ -90,8 +90,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		     " limit=0x%016" PRIx64 "\n",
 		     vk::to_string(result).c_str(), size, static_cast<int>(usage), cpu_address, graphics.max_buffer_size);
 		graphics.LogMemoryBudget();
+		EXIT_NOT_IMPLEMENTED(cpu_address == 0);
+		return;
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {

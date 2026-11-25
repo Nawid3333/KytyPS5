@@ -94,6 +94,7 @@ public:
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
+	[[nodiscard]] bool     ReleaseIdleImages(GuestRange requested);
 
 private:
 	struct MetaDataInfo {
@@ -211,7 +212,6 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] bool        ReleaseIdleImages(GuestRange requested);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
