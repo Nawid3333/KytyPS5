@@ -37618,6 +37618,63 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
+TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
+  TestCase test;
+  test.name = components == 4u ? "BufferStoreDwordx4PaddedDescriptors"
+            : components == 2u && groups == 1u ? "BufferStoreDwordx2SingleGuardedWorkgroup"
+            : components == 2u ? "BufferStoreDwordx2WorkgroupDescriptors"
+            : groups == 1u ? "BufferStoreOneWorkgroupDescriptor" : "BufferStoreTwoWorkgroupDescriptors";
+  test.has_user_data = test.has_compute_info = true;
+  test.user_data[0] = 128u;
+  test.compute_info.workgroup_register = 10u;
+  test.compute_info.group_id[2] = true;
+  test.compute_info.wave_size = test.compute_info.threads_num[0] = 32u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.dispatch_z = groups;
+  auto &code = test.code;
+  u32 key = 10u;
+  if (components == 2u) code = {EncodeSopc(0x0a, key, InlineU32(2)), 0u};
+  if (components == 4u) {
+    test.user_data[6] = 2u;
+    // Lane zero selects the group row. Other lanes have different local selectors.
+    code = {EncodeVop2(0x1d, 6, key, 0), EncodeVopc(0xc4, 6, 6),
+            EncodeVop2(0x01, 7, InlineU32(0), 6), EncodeVop1(0x02, 11, Vgpr(7))};
+    key = 11u;
+  }
+  code.insert(code.end(), {EncodeSop2(0x31, 4, key, 255), 0x2a0u,
+      EncodeSmem0(0x02, 12), EncodeSmem1(0u, 4), EncodeSopp(0x0c, 0),
+      EncodeVop1(0x01, 2, 10)});
+  for (u32 word = 1u; word < components; ++word)
+    code.push_back(EncodeVop1(0x01, 2u + word, InlineU32(6u + word)));
+  const u32 opcode = components == 4u ? 0x1eu : components == 2u ? 0x1du : 0x1cu;
+  const u32 field_offset = components == 4u ? 8u : 0u;
+  code.insert(code.end(), {EncodeMubuf0(opcode, field_offset, true, false), EncodeMubuf1(2, 3, 0)});
+  if (components == 2u) code[1] = EncodeSopp(0x04, code.size() - 2u);
+  AppendEnd(&code);
+  test.initial.assign(2064u, 0xdeadbeefu);
+  const u32 stride = components == 4u ? 32u : components * 4u;
+  test.expected_buffer_resources.emplace();
+  for (u32 row = 0; row < std::min(groups, 2u); ++row) {
+    const u32 output = 4096u * (row + 1u);
+    const std::array descriptor{output, stride << 16u, 2u, 0x5204u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
+    test.expected_buffer_resources->push_back(row);
+    const u32 bytes = components > 1u && row == 1u ? stride + field_offset + (components - 1u) * 4u : 2u * stride;
+    test.storage_buffer_ranges.emplace_back(output, bytes);
+  }
+  test.expected = test.initial;
+  for (const auto &[output, bytes] : test.storage_buffer_ranges)
+    for (u32 record = 0; record < 2u; ++record)
+      for (u32 component = 0; component < components; ++component) {
+        const u32 offset = record * stride + field_offset + component * 4u;
+        if (offset < bytes)
+          test.expected[(output + offset) / 4u] = component == 0u ? output / 4096u - 1u : 6u + component;
+      }
+  return test;
+}
+
 TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
   const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
@@ -50425,6 +50482,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  cases.push_back(BufferStoreWorkgroupDescriptors(2u, 4u));
+  for (u32 groups : {1u, 3u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups, 2u));
+  for (u32 groups : {1u, 2u}) cases.push_back(BufferStoreWorkgroupDescriptors(groups));
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
@@ -58413,6 +58473,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
+    RunCase(&vulkan, BufferStoreWorkgroupDescriptors(2u, 4u));
+    for (u32 groups : {1u, 3u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups, 2u));
+    for (u32 groups : {1u, 2u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups));
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
