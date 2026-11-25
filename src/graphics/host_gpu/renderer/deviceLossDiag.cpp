@@ -23,6 +23,7 @@ constexpr uint32_t ContextEntries    = 24;
 constexpr uint32_t ArgsSlots         = 4096;
 constexpr uint32_t ArgsSlotWords     = 8;
 constexpr uint32_t ArgsReportedEarly = 8;
+constexpr uint32_t SameShaderArgs    = 24;
 constexpr uint32_t WriteRingSize     = 1u << 18u;
 constexpr uint32_t WritersReported   = 24;
 constexpr uint32_t ListingsReported  = 4;
@@ -35,6 +36,7 @@ struct Entry {
 	uint64_t              tick  = 0;
 	const char*           site  = nullptr;
 	IndirectArgs          args;
+	uint32_t              args_slot = 0;
 };
 
 struct WriteEntry {
@@ -51,6 +53,7 @@ std::vector<WriteEntry>     g_writes(WriteRingSize);
 std::atomic<uint64_t>       g_next_write {0};
 std::array<Entry, RingSize> g_ring;
 std::atomic<uint32_t>       g_next_id {0};
+std::atomic<uint32_t>       g_next_args_slot {0};
 std::atomic<bool>           g_reported {false};
 vk::Buffer                  g_marker_buffer = nullptr;
 vk::DeviceMemory            g_marker_memory = nullptr;
@@ -148,8 +151,9 @@ volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize siz
 	return static_cast<volatile uint32_t*>(mapped);
 }
 
-void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, const IndirectArgs& args) {
-	const vk::DeviceSize slot = vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords * sizeof(uint32_t);
+void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, uint32_t args_slot,
+                 const IndirectArgs& args) {
+	const vk::DeviceSize    slot = vk::DeviceSize {args_slot} * ArgsSlotWords * sizeof(uint32_t);
 	const vk::MemoryBarrier before {.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
 	                                                 vk::AccessFlagBits::eTransferWrite,
 	                                .dstAccessMask = vk::AccessFlagBits::eTransferRead};
@@ -183,7 +187,7 @@ std::string DescribeArgs(uint32_t id) {
 	if (g_args == nullptr) {
 		return text + "not captured";
 	}
-	const auto*    slot   = g_args + vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords;
+	const auto*    slot   = g_args + vk::DeviceSize {e.args_slot} * ArgsSlotWords;
 	const uint32_t holder = slot[0];
 	if (holder != id) {
 		return text + fmt::format("not copied (slot holds #{})", holder);
@@ -221,6 +225,27 @@ void ReportIndirectArgs(uint32_t focus) {
 			Write(fmt::format("[DEVLOST]   {}\n", DescribeArgs(id)));
 			shown++;
 		}
+	}
+	if (!HasArgs(focus)) {
+		return;
+	}
+	const uint64_t hash = g_ring[focus % RingSize].hash0;
+	Write(fmt::format("[DEVLOST] earlier dispatch-indirects of shader 0x{:016x} (newest first):\n",
+	                  hash));
+	shown = 0;
+	for (uint32_t id = focus - 1; id != 0 && shown < SameShaderArgs && focus - id < RingSize;
+	     id--) {
+		const auto& e = g_ring[id % RingSize];
+		if (e.id.load(std::memory_order_acquire) != id) {
+			break;
+		}
+		if (e.hash0 == hash && HasArgs(id)) {
+			Write(fmt::format("[DEVLOST]   tick={} {}\n", e.tick, DescribeArgs(id)));
+			shown++;
+		}
+	}
+	if (shown == 0) {
+		Write("[DEVLOST]   none in the recorded commands\n");
 	}
 }
 
@@ -366,9 +391,12 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	e.tick  = tick;
 	e.site  = site;
 	e.args  = args;
+	if (args.buffer) {
+		e.args_slot = g_next_args_slot.fetch_add(1, std::memory_order_relaxed) % ArgsSlots;
+	}
 	e.id.store(id, std::memory_order_release);
 	if (g_args != nullptr && args.buffer) {
-		CaptureArgs(buffer, id, args);
+		CaptureArgs(buffer, id, e.args_slot, args);
 	}
 	if (g_graphics->nv_checkpoints_enabled) {
 		buffer.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(id) << 1u));
