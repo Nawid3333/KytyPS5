@@ -2392,8 +2392,8 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-  void CheckImageAllocationPressure() {
-    constexpr const char *name = "ImageAllocationPressure";
+  void CheckAllocationPressure(bool buffer) {
+    const char *name = buffer ? "BufferAllocationPressure" : "ImageAllocationPressure";
     constexpr uintptr_t base = 0x0000000230000000ull;
     constexpr uint32_t width = 1024;
     constexpr uint32_t height = 2048;
@@ -2470,11 +2470,18 @@ public:
       fill(allocation.size / 2);
       TextureCacheTestAccess::SkipFrames(cache, 1);
       desc.info.data.address += image_size;
-      const auto created = cache.FindImage(desc);
+      bool allocated = false;
+      if (buffer) {
+        const auto [created, offset] =
+            context.GetBufferCache().ObtainBuffer(desc.info.data.address, image_size, false);
+        allocated = created != nullptr && created->Handle() != nullptr;
+      } else {
+        const auto created = cache.FindImage(desc);
+        allocated = created && cache.GetImage(created).backing.image != nullptr;
+      }
       Require(name, "retired idle image",
-              created && cache.GetImage(created).backing.image != nullptr &&
-                  !TextureCacheTestAccess::Contains(cache, idle),
-              "the new image did not take the memory of the idle one");
+              allocated && !TextureCacheTestAccess::Contains(cache, idle),
+              "the new allocation did not take the memory of the idle image");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       uint32_t published = 0;
@@ -58934,7 +58941,12 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-allocation-pressure-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckImageAllocationPressure();
+    vulkan.CheckAllocationPressure(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-allocation-pressure-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckAllocationPressure(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
@@ -59561,7 +59573,8 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckStreamCopyWindow();
   vulkan.CheckResolveCache();
-  vulkan.CheckImageAllocationPressure();
+  vulkan.CheckAllocationPressure(false);
+  vulkan.CheckAllocationPressure(true);
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

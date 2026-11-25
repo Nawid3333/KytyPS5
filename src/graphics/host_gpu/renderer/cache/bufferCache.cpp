@@ -395,10 +395,21 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
-
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const GuestRange range {overlap.begin, overlap.end - overlap.begin};
+	BufferId         id;
+	while (true) {
+		id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, range.address,
+		                           AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		                           range.size);
+		if (m_slot_buffers[id].Handle() != nullptr) {
+			break;
+		}
+		m_slot_buffers.erase(id);
+		if (!m_texture_cache.ReleaseIdleImages(range)) {
+			EXIT("failed to create buffer: guest=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+			     range.address, range.size);
+		}
+	}
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
