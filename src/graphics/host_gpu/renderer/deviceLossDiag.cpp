@@ -21,7 +21,9 @@ namespace {
 constexpr uint32_t RingSize          = 1u << 16u;
 constexpr uint32_t ContextEntries    = 24;
 constexpr uint32_t ArgsSlots         = 4096;
-constexpr uint32_t ArgsSlotWords     = 8;
+constexpr uint32_t ArgsSlotWords     = 80;
+constexpr uint32_t ArgsWindowBefore  = 0x120;
+constexpr uint32_t WindowLineWords   = 8;
 constexpr uint32_t ArgsReportedEarly = 8;
 constexpr uint32_t SameShaderArgs    = 24;
 constexpr uint32_t WriteRingSize     = 1u << 18u;
@@ -151,6 +153,10 @@ volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize siz
 	return static_cast<volatile uint32_t*>(mapped);
 }
 
+vk::DeviceSize WindowBefore(const IndirectArgs& args) {
+	return std::min<vk::DeviceSize>(args.offset, ArgsWindowBefore);
+}
+
 void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, uint32_t args_slot,
                  const IndirectArgs& args) {
 	const vk::DeviceSize    slot = vk::DeviceSize {args_slot} * ArgsSlotWords * sizeof(uint32_t);
@@ -162,9 +168,10 @@ void CaptureArgs(vk::CommandBuffer buffer, uint32_t id, uint32_t args_slot,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1, &before,
 	                       0, nullptr, 0, nullptr);
 	buffer.fillBuffer(g_args_buffer, slot, sizeof(uint32_t), id);
+	const vk::DeviceSize window = WindowBefore(args);
 	const vk::BufferCopy copy {
-	    args.offset, slot + sizeof(uint32_t),
-	    std::min<vk::DeviceSize>(args.size, (ArgsSlotWords - 1) * sizeof(uint32_t))};
+	    args.offset - window, slot + sizeof(uint32_t),
+	    std::min<vk::DeviceSize>(window + args.size, (ArgsSlotWords - 1) * sizeof(uint32_t))};
 	buffer.copyBuffer(args.buffer, g_args_buffer, 1, &copy);
 	buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eDrawIndirect, vk::DependencyFlags {}, 0,
@@ -192,9 +199,10 @@ std::string DescribeArgs(uint32_t id) {
 	if (holder != id) {
 		return text + fmt::format("not copied (slot holds #{})", holder);
 	}
-	const uint32_t words = std::min<uint32_t>(a.size / sizeof(uint32_t), ArgsSlotWords - 1);
+	const auto     first = static_cast<uint32_t>(WindowBefore(a) / sizeof(uint32_t));
+	const uint32_t words = std::min<uint32_t>(a.size / sizeof(uint32_t), ArgsSlotWords - 1 - first);
 	for (uint32_t i = 0; i < words; i++) {
-		const uint32_t word = slot[1 + i];
+		const uint32_t word = slot[1 + first + i];
 		text += fmt::format("{}0x{:08x}", i == 0 ? "" : " ", word);
 	}
 	text += a.cpu_read ? fmt::format(" | guest memory at record 0x{:08x} 0x{:08x} 0x{:08x}",
@@ -205,12 +213,34 @@ std::string DescribeArgs(uint32_t id) {
 	return text;
 }
 
+void ReportArgsWindow(uint32_t id) {
+	const auto& e    = g_ring[id % RingSize];
+	const auto* slot = g_args + vk::DeviceSize {e.args_slot} * ArgsSlotWords;
+	if (slot[0] != id) {
+		return;
+	}
+	const vk::DeviceSize before = WindowBefore(e.args);
+	const auto           words  = static_cast<uint32_t>(
+	    std::min<vk::DeviceSize>((before + e.args.size) / sizeof(uint32_t), ArgsSlotWords - 1));
+	Write(fmt::format("[DEVLOST]     GPU words of #{} from guest 0x{:016x} ({} bytes before the "
+	                  "arguments):\n",
+	                  id, e.args.guest_address - before, before));
+	for (uint32_t i = 0; i < words; i += WindowLineWords) {
+		auto line = fmt::format("[DEVLOST]     +0x{:03x}:", i * sizeof(uint32_t));
+		for (uint32_t j = i; j < std::min(words, i + WindowLineWords); j++) {
+			line += fmt::format(" {:08x}", slot[1 + j]);
+		}
+		Write(line + "\n");
+	}
+}
+
 void ReportIndirectArgs(uint32_t focus) {
 	Write(fmt::format("[DEVLOST] dispatch-indirect arguments copied on the GPU before each "
 	                  "dispatch-indirect ({} slots):\n",
 	                  ArgsSlots));
 	if (HasArgs(focus)) {
 		Write(fmt::format("[DEVLOST]   {}   <== first unfinished\n", DescribeArgs(focus)));
+		ReportArgsWindow(focus);
 	} else {
 		Write(fmt::format("[DEVLOST]   #{} has no indirect arguments   <== first unfinished\n",
 		                  focus));
@@ -229,10 +259,12 @@ void ReportIndirectArgs(uint32_t focus) {
 	if (!HasArgs(focus)) {
 		return;
 	}
-	const uint64_t hash = g_ring[focus % RingSize].hash0;
+	const uint64_t hash    = g_ring[focus % RingSize].hash0;
+	const uint64_t address = g_ring[focus % RingSize].args.guest_address;
 	Write(fmt::format("[DEVLOST] earlier dispatch-indirects of shader 0x{:016x} (newest first):\n",
 	                  hash));
-	shown = 0;
+	shown             = 0;
+	bool window_shown = false;
 	for (uint32_t id = focus - 1; id != 0 && shown < SameShaderArgs && focus - id < RingSize;
 	     id--) {
 		const auto& e = g_ring[id % RingSize];
@@ -241,6 +273,10 @@ void ReportIndirectArgs(uint32_t focus) {
 		}
 		if (e.hash0 == hash && HasArgs(id)) {
 			Write(fmt::format("[DEVLOST]   tick={} {}\n", e.tick, DescribeArgs(id)));
+			if (!window_shown && e.args.guest_address == address) {
+				ReportArgsWindow(id);
+				window_shown = true;
+			}
 			shown++;
 		}
 	}
