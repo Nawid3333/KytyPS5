@@ -444,6 +444,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			break;
 		}
 		m_slot_buffers.erase(id);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[lab-vram] buffer allocation failed: 0x{:x} bytes at 0x{:016x}, releasing idle images\n",
+		    range.size, range.address));
 		if (!m_texture_cache.ReleaseIdleImages(range)) {
 			EXIT("failed to create buffer: guest=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
 			     range.address, range.size);
