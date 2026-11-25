@@ -39,7 +39,47 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fmt/format.h>
+
 namespace Libs::Graphics {
+static void LogIndirectArgsWriter(const HW::ComputeShaderInfo& cs, uint64_t hash, uint64_t tick,
+                                  uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+                                  bool indirect) {
+	constexpr uint64_t WRITER_HASH  = 0xc9edae4a111f2db2ull;
+	constexpr uint32_t LINES_MAX    = 512;
+	constexpr uint64_t COUNT_EVERY  = 4096;
+	constexpr uint64_t ADDRESS_MASK = 0xffffffffffffull;
+	if (hash != WRITER_HASH) {
+		return;
+	}
+	static std::mutex               mutex;
+	static uint32_t                 lines = 0;
+	static uint64_t                 calls = 0;
+	static std::array<uint32_t, 12> last {};
+	const auto&                     sgpr = cs.cs_user_sgpr.value;
+	std::array<uint32_t, 12> now {sgpr[0], sgpr[1], sgpr[2], sgpr[3], sgpr[4], sgpr[5]};
+	const uint64_t           srt     = (sgpr[0] | (uint64_t {sgpr[1]} << 32u)) & ADDRESS_MASK;
+	const bool               read80  = LibKernel::Memory::TryReadBacking(srt + 80, &now[6], 8);
+	const bool               read192 = LibKernel::Memory::TryReadBacking(srt + 192, &now[8], 16);
+	std::scoped_lock         lock(mutex);
+	++calls;
+	const bool changed = now != last;
+	if (!(changed && lines < LINES_MAX) && calls % COUNT_EVERY != 0) {
+		return;
+	}
+	last = now;
+	if (changed) {
+		++lines;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[1215-r8] writer cs=0x{:016x} call={} tick={} indirect={} groups={}x{}x{} changed={} "
+	    "s0..s5={:08x} {:08x} {:08x} {:08x} {:08x} {:08x} srt=0x{:x} read80={} srt80=0x{:08x}{:08x} "
+	    "read192={} srt192={:08x} {:08x} {:08x} {:08x}\n",
+	    hash, calls, tick, indirect ? 1 : 0, groups_x, groups_y, groups_z, changed ? 1 : 0, now[0],
+	    now[1], now[2], now[3], now[4], now[5], srt, read80 ? 1 : 0, now[7], now[6],
+	    read192 ? 1 : 0, now[8], now[9], now[10], now[11]));
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -467,6 +507,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
+	LogIndirectArgsWriter(sh_ctx.GetCs(), program.shader_hash,
+	                      m_context.GetCommandScheduler().CurrentTick(), thread_group_x,
+	                      thread_group_y, thread_group_z, false);
 	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::Dispatch,
 	                                           program.shader_hash, sh_ctx.GetCs().cs_regs.data_addr,
 	                                           m_context.GetCommandScheduler().CurrentTick());
@@ -557,6 +600,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	    m_context.GetBufferCache().IsRegionCpuModified(args_addr, diag_args.size);
 	diag_args.image = static_cast<bool>(
 	    m_context.GetTextureCache().FindImageFromRange(args_addr, diag_args.size, false));
+	LogIndirectArgsWriter(cs_regs, program.shader_hash, m_context.GetCommandScheduler().CurrentTick(),
+	                      0, 0, 0, true);
 	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::DispatchIndirect,
 	                                           program.shader_hash, cs_regs.cs_regs.data_addr,
 	                                           m_context.GetCommandScheduler().CurrentTick(),
