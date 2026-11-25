@@ -5,6 +5,7 @@
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -419,6 +421,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "[lab-pipeline] createGraphicsPipelines failed: {} stage_ids {:016x} {:016x} {:016x} {:016x}\n",
 		    vk::to_string(result), key.stage_ids[0], key.stage_ids[1], key.stage_ids[2], key.stage_ids[3]));
+		if (result == vk::Result::eErrorDeviceLost) {
+			DeviceLossDiag::Report("createGraphicsPipelines", result, std::numeric_limits<uint64_t>::max());
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -459,6 +464,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (result != vk::Result::eSuccess) {
 		Log::WriteToConsoleAndLog(fmt::format("[lab-pipeline] createComputePipelines failed: {} module {:016x}\n",
 		                                      vk::to_string(result), module.id));
+		if (result == vk::Result::eErrorDeviceLost) {
+			DeviceLossDiag::Report("createComputePipelines", result, std::numeric_limits<uint64_t>::max());
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
