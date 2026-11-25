@@ -386,9 +386,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 			// Reserve space in the incoming stream's direction of growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
-				end += std::min(STREAM_LEAP_SIZE, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
-				                                       : LibKernel::Memory::kExtendedMemoryBase +
-				                                             LibKernel::Memory::kExtendedMemorySize) - end);
+				end +=
+				    std::min(STREAM_LEAP_SIZE, (vaddr < LOWER_ADDRESS_SIZE
+				                                    ? LOWER_ADDRESS_SIZE
+				                                    : LibKernel::Memory::kExtendedMemoryBase +
+				                                          LibKernel::Memory::kExtendedMemorySize) -
+				                                   end);
 			}
 			if (expands_right) {
 				const auto minimum = vaddr < LOWER_ADDRESS_SIZE
@@ -422,14 +425,15 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 	if (overlap.end - overlap.begin > MaxRequestSize()) {
-		LOGF("BufferCache: buffer above the device limit: request addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " union 0x%016" PRIx64 "..0x%016" PRIx64 " size=0x%016" PRIx64 " limit=0x%016" PRIx64
-		     " stream_leap=%d\n",
+		LOGF("BufferCache: buffer above the device limit: request addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " union 0x%016" PRIx64 "..0x%016" PRIx64 " size=0x%016" PRIx64
+		     " limit=0x%016" PRIx64 " stream_leap=%d\n",
 		     vaddr, size, overlap.begin, overlap.end, overlap.end - overlap.begin, MaxRequestSize(),
 		     overlap.has_stream_leap ? 1 : 0);
 		for (auto it = overlap.first; it != overlap.last; ++it) {
 			const auto& merged = m_slot_buffers[it->second];
-			LOGF("BufferCache:   merges cached buffer addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			LOGF("BufferCache:   merges cached buffer addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     "\n",
 			     merged.CpuAddress(), merged.Size());
 		}
 	}
@@ -444,9 +448,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			break;
 		}
 		m_slot_buffers.erase(id);
-		Log::WriteToConsoleAndLog(fmt::format(
-		    "[lab-vram] buffer allocation failed: 0x{:x} bytes at 0x{:016x}, releasing idle images\n",
-		    range.size, range.address));
+		Log::WriteToConsoleAndLog(fmt::format("[lab-vram] buffer allocation failed: 0x{:x} bytes "
+		                                      "at 0x{:016x}, releasing idle images\n",
+		                                      range.size, range.address));
 		if (!m_texture_cache.ReleaseIdleImages(range)) {
 			EXIT("failed to create buffer: guest=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
 			     range.address, range.size);

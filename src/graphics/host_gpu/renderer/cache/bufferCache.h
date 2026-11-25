@@ -60,8 +60,8 @@ public:
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint64_t MaxRequestSize() const noexcept;
-	[[nodiscard]] uint64_t FitWindow(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t                     MaxRequestSize() const noexcept;
+	[[nodiscard]] uint64_t                     FitWindow(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

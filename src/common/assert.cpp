@@ -38,11 +38,11 @@ void SetDbgReportGame(std::string_view game) {
 [[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
                                    int line) {
 	const auto game_size = g_game_size.load(std::memory_order_acquire);
-	const auto game = game_size != 0
-	                      ? fmt::format("Game: {}\n", std::string_view(g_game.data(), game_size))
-	                      : std::string();
-	const auto report = fmt::format("--- Build ---\n{}\n{}{}\n{} in {}:{}\n", KYTY_BUILD_LABEL, game,
-	                                title, text, file, line);
+	const auto game   = game_size != 0
+	                        ? fmt::format("Game: {}\n", std::string_view(g_game.data(), game_size))
+	                        : std::string();
+	const auto report = fmt::format("--- Build ---\n{}\n{}{}\n{} in {}:{}\n", KYTY_BUILD_LABEL,
+	                                game, title, text, file, line);
 	if (g_pending_report != nullptr) {
 		if (*g_pending_report != report) {
 			Log::WriteToConsoleAndLog(*g_pending_report);
