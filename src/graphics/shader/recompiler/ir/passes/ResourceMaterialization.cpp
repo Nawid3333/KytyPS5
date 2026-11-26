@@ -30,7 +30,16 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+thread_local std::string g_lab_failure;
+thread_local int         g_lab_fail_line = 0;
+
+bool LabFail(int line) {
+	g_lab_fail_line = line;
+	return false;
+}
+
 bool SpecializationFail(std::string_view message) {
+	g_lab_failure.assign(message.data(), message.size());
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -586,6 +595,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
                                    Normalize&& normalize, bool* validate_buffer_keys = nullptr) {
+	g_lab_fail_line = 0;
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -649,7 +659,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if ((selector != nullptr && (byte_keys || !selector_keys->resolved) &&
 		     !WalkedDescriptor(program, selector->source, material_value)) ||
 		    !WalkedDescriptor(program, indirect.table_source, table_value)) {
-			return false;
+			return LabFail(__LINE__);
 		}
 		if (table_value.dword_count == 2u) {
 			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
@@ -662,13 +672,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			table_base = table.Base48();
 			table_size = table.GetSize();
 		} else {
-			return false;
+			return LabFail(__LINE__);
 		}
 		if (byte_keys && table_size > UINT32_MAX) return failed("table geometry");
 		bool use_selector = selector != nullptr;
 		if (absolute_offsets && selector != nullptr) {
 			ShaderBufferResource material;
-			if (!DecodeBufferDescriptor(material_value, material)) return false;
+			if (!DecodeBufferDescriptor(material_value, material)) return LabFail(__LINE__);
 			use_selector = CanReadIndexedSelector(material, selector->offset);
 			if (use_selector && material.Format() != Prospero::BufferFormat::kInvalid &&
 			    material.NumRecords() != 0u && selector->offset < material.Stride()) {
@@ -705,7 +715,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                                       : uint64_t {1} << 32u;
 			if (!indirect.key_count.IsEmpty()) {
 				uint32_t key_count = 0u;
-				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
+				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return LabFail(__LINE__);
 				domain = std::min(domain, uint64_t {key_count});
 			}
 			if (indexed_pointer &&
@@ -788,7 +798,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
-						                     std::span(candidate.dwords).first(read_dwords))) return false;
+						                     std::span(candidate.dwords).first(read_dwords))) return LabFail(__LINE__);
 					} else {
 						const auto table_word = table_offset / 4u;
 						std::copy_n(heap_words.begin() + table_word,
@@ -821,15 +831,15 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
-			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
+			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return LabFail(__LINE__);
 			if (!indirect.selector_first.IsEmpty() && !WalkedValue(program, indirect.selector_first, first_key))
-				return false;
+				return LabFail(__LINE__);
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
 			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
 			         uint64_t {indirect.table_offset} + indirect.table_immediate +
 			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
-				return false;
+				return LabFail(__LINE__);
 			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), first_key);
@@ -842,9 +852,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 			}
 		} else {
-			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
+			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return LabFail(__LINE__);
 			if (!selector_keys->resolved) {
-				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys)) return false;
+				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys)) return LabFail(__LINE__);
 				selector_keys->resolved = true;
 			}
 		}
@@ -884,7 +894,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
 			}
 		} else if (!WalkedDescriptor(program, sources[entry], candidate)) {
-			return false;
+			return LabFail(__LINE__);
 		}
 		if (!normalize(candidate))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
@@ -1692,8 +1702,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	};
 	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
 	                                 size_t candidates) {
-		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
-		    kind, resource, source, candidates));
+		std::string lab = fmt::format("indirect {} resource={} source={} candidates={} silent_fail_line={} "
+		    "last_failure=[{}]", kind, resource, source, candidates, g_lab_fail_line, g_lab_failure);
+		if (kind == "image") {
+			for (size_t c = 0; c < snapshot.images.size(); ++c) {
+				lab += fmt::format(" c{}=", c);
+				for (uint32_t d = 0; d < snapshot.images[c].dword_count && d < 8u; ++d)
+					lab += fmt::format("{:08x}", snapshot.images[c].dwords[d]);
+			}
+		}
+		return SpecializationFail(lab);
 	};
 	bool validate_buffer_keys = false;
 	snapshot.buffers.resize(program.info.buffers.size());
@@ -2210,6 +2228,10 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	Reader reader {bytes};
 	IoPlan(reader, plan);
 	return reader.ok && reader.bytes.empty() && DerivePlanState(plan);
+}
+
+std::string LabLastMaterializationFailure() {
+	return g_lab_failure;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

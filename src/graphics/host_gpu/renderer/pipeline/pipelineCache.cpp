@@ -40,6 +40,19 @@
 
 namespace Libs::Graphics {
 
+namespace ShaderRecompiler::IR {
+std::string LabLastMaterializationFailure();
+} // namespace ShaderRecompiler::IR
+
+namespace {
+thread_local uint64_t g_lab_shader_hash = 0;
+
+void LabMaterializeExit() {
+	EXIT("[lab-2385] shader resource materialization failed: shader=0x%016" PRIx64 " %s\n", g_lab_shader_hash,
+	     ShaderRecompiler::IR::LabLastMaterializationFailure().c_str());
+}
+} // namespace
+
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
@@ -213,8 +226,10 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  ShaderRecompiler::IR::PushData::Window push_data) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                    specialization)) {
+		LabMaterializeExit();
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
@@ -319,6 +334,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
+	g_lab_shader_hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
@@ -381,8 +397,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		if (!ShaderRecompiler::IR::MaterializeResources(
+		    program.resource_plan, runtime, program.resources, program.specialization)) {
+		LabMaterializeExit();
+	}
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data)) {
