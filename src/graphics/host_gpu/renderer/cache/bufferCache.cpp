@@ -606,6 +606,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		DeviceLossDiag::NoteWrite(DeviceLossDiag::WriteSource::Bound, vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+	} else {
+		DeviceLossDiag::NoteWrite(DeviceLossDiag::WriteSource::BoundRead, vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

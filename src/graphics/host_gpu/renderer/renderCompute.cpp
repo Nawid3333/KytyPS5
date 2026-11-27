@@ -339,6 +339,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			     thread_group_x, thread_group_y, thread_group_z, mode,
 			     sh_ctx.GetCs().cs_regs.data_addr);
 		}
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, sh_ctx.GetCs().cs_regs.data_addr,
+		                       static_cast<uint64_t>(DeviceLossDiag::DropReason::ZeroGroups),
+		                       (uint64_t {thread_group_x} << 32u) | (thread_group_y << 16u) | thread_group_z);
 		return;
 	}
 
@@ -347,6 +350,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
 		     thread_group_x, thread_group_y, thread_group_z, mode);
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, 0, static_cast<uint64_t>(DeviceLossDiag::DropReason::NullShader));
 		return;
 	}
 
@@ -387,7 +391,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, cs_regs.cs_regs.data_addr,
+		                       static_cast<uint64_t>(DeviceLossDiag::DropReason::NoProgram));
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -400,6 +408,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, cs_regs.cs_regs.data_addr,
+		                       static_cast<uint64_t>(DeviceLossDiag::DropReason::ConsumedAsClearOrFill),
+		                       program.shader_hash);
 		ResetBindings();
 		return;
 	}
@@ -512,7 +523,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	                      thread_group_y, thread_group_z, false);
 	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::Dispatch,
 	                                           program.shader_hash, sh_ctx.GetCs().cs_regs.data_addr,
-	                                           m_context.GetCommandScheduler().CurrentTick());
+	                                           m_context.GetCommandScheduler().CurrentTick(), {},
+	                                           {thread_group_x, thread_group_y, thread_group_z});
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -548,17 +560,25 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, buffer.GetShaders().GetCs().cs_regs.data_addr,
+		                       static_cast<uint64_t>(DeviceLossDiag::DropReason::IndirectZeroArgs),
+		                       args_addr);
 		return;
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, 0, static_cast<uint64_t>(DeviceLossDiag::DropReason::NullShader), args_addr);
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::DispatchDropped, cs_regs.cs_regs.data_addr,
+		                       static_cast<uint64_t>(DeviceLossDiag::DropReason::NoProgram), args_addr);
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;

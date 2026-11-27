@@ -612,6 +612,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
+			DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::PredicatedSkip, opcode, packet_header, packet_dw);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
@@ -736,6 +737,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 	}
+	DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::Predicate, reinterpret_cast<uint64_t>(address), value,
+	                       (uint64_t {op} << 8u) | (uint64_t {condition} << 4u) | (m_predicate_skip ? 1u : 0u));
 }
 
 // Submits the recorded work every N draws so the host GPU starts before a long buffer ends.

@@ -26,8 +26,12 @@ constexpr uint32_t ArgsWindowBefore  = 0x120;
 constexpr uint32_t WindowLineWords   = 8;
 constexpr uint32_t ArgsReportedEarly = 8;
 constexpr uint32_t SameShaderArgs    = 24;
-constexpr uint32_t WriteRingSize     = 1u << 18u;
-constexpr uint32_t WritersReported   = 24;
+constexpr uint32_t WriteRingSize     = 1u << 20u;
+constexpr uint32_t WritersReported   = 64;
+constexpr uint32_t WindowCommands    = 4096;
+constexpr uint32_t CpRingSize        = 1u << 16u;
+constexpr uint32_t BindingsReported  = 32;
+constexpr uint32_t BindingWriters    = 4;
 constexpr uint32_t ListingsReported  = 4;
 
 struct Entry {
@@ -39,6 +43,7 @@ struct Entry {
 	const char*           site  = nullptr;
 	IndirectArgs          args;
 	uint32_t              args_slot = 0;
+	std::array<uint32_t, 3> groups {};
 };
 
 struct WriteEntry {
@@ -50,7 +55,18 @@ struct WriteEntry {
 	uint64_t              value        = 0;
 };
 
+struct CpEntry {
+	std::atomic<uint64_t> serial {0};
+	uint32_t              next_command = 0;
+	CpEvent               event        = CpEvent::CondExecRun;
+	uint64_t              address      = 0;
+	uint64_t              value        = 0;
+	uint64_t              count        = 0;
+};
+
 GraphicContext*             g_graphics = nullptr;
+std::vector<CpEntry>        g_cp(CpRingSize);
+std::atomic<uint64_t>       g_next_cp {0};
 std::vector<WriteEntry>     g_writes(WriteRingSize);
 std::atomic<uint64_t>       g_next_write {0};
 std::array<Entry, RingSize> g_ring;
@@ -88,6 +104,21 @@ const char* SourceName(WriteSource source) {
 		case WriteSource::CpuCopy: return "copy-cpu";
 		case WriteSource::WriteData: return "write-data";
 		case WriteSource::Label: return "eop-label";
+		case WriteSource::BoundRead: return "bound-read";
+	}
+	return "?";
+}
+
+const char* CpEventName(CpEvent event) {
+	switch (event) {
+		case CpEvent::CondExecRun: return "COND_EXEC run";
+		case CpEvent::CondExecSkip: return "COND_EXEC skip";
+		case CpEvent::BranchThen: return "BRANCH then";
+		case CpEvent::BranchElse: return "BRANCH else";
+		case CpEvent::BranchNone: return "BRANCH none";
+		case CpEvent::Predicate: return "SET_PREDICATION";
+		case CpEvent::PredicatedSkip: return "predicated packet skipped";
+		case CpEvent::DispatchDropped: return "dispatch dropped";
 	}
 	return "?";
 }
@@ -108,8 +139,12 @@ std::string Describe(uint32_t id) {
 		return fmt::format("#{} {} site={}", id, KindName(e.kind),
 		                   e.site != nullptr ? e.site : "?");
 	}
-	return fmt::format("#{} {} tick={} hash0=0x{:016x} hash1=0x{:016x}", id, KindName(e.kind),
-	                   e.tick, e.hash0, e.hash1);
+	auto text = fmt::format("#{} {} tick={} hash0=0x{:016x} hash1=0x{:016x}", id, KindName(e.kind),
+	                        e.tick, e.hash0, e.hash1);
+	if (e.groups[0] != 0 || e.groups[1] != 0 || e.groups[2] != 0) {
+		text += fmt::format(" groups={}x{}x{}", e.groups[0], e.groups[1], e.groups[2]);
+	}
+	return text;
 }
 
 volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize size,
@@ -314,8 +349,10 @@ void ReportWriters(uint32_t focus) {
 		return;
 	}
 	const auto& entry = g_ring[focus % RingSize];
-	const auto  begin = entry.args.guest_address;
-	const auto  end   = begin + entry.args.size;
+	const auto  begin = entry.args.guest_mapped && entry.args.guest_address >= ArgsWindowBefore
+	                        ? entry.args.guest_address - ArgsWindowBefore
+	                        : entry.args.guest_address;
+	const auto  end   = entry.args.guest_address + entry.args.size;
 	Write(fmt::format("[DEVLOST] writes recorded over 0x{:016x}..0x{:016x} (newest first, ring of "
 	                  "{}):\n",
 	                  begin, end, WriteRingSize));
@@ -325,8 +362,8 @@ void ReportWriters(uint32_t focus) {
 	uint32_t              shown = 0;
 	for (uint64_t serial = last; serial > first && shown < WritersReported; serial--) {
 		const auto& w = g_writes[serial % WriteRingSize];
-		if (w.serial.load(std::memory_order_acquire) != serial || w.vaddr >= end ||
-		    w.vaddr + w.size <= begin) {
+		if (w.serial.load(std::memory_order_acquire) != serial || w.source == WriteSource::BoundRead ||
+		    w.vaddr >= end || w.vaddr + w.size <= begin) {
 			continue;
 		}
 		const auto command = w.next_command;
@@ -350,6 +387,96 @@ void ReportWriters(uint32_t focus) {
 		if (hash != entry.hash0) {
 			ReportListing(hash, "writer");
 		}
+	}
+}
+
+void ReportWindow(uint32_t focus) {
+	const auto& entry = g_ring[focus % RingSize];
+	if (entry.id.load(std::memory_order_acquire) != focus || entry.kind == Kind::Internal) {
+		return;
+	}
+	uint32_t previous  = 0;
+	uint32_t bind_from = 0;
+	for (uint32_t id = focus - 1; id != 0 && focus - id < std::min(RingSize, WindowCommands); id--) {
+		const auto& e = g_ring[id % RingSize];
+		if (e.id.load(std::memory_order_acquire) != id) {
+			break;
+		}
+		if (bind_from == 0 && e.kind != Kind::Internal) {
+			bind_from = id + 1;
+		}
+		if (e.kind == entry.kind && e.hash0 == entry.hash0) {
+			previous = id;
+			break;
+		}
+	}
+	if (bind_from == 0) {
+		bind_from = focus;
+	}
+	const uint32_t from =
+	    previous != 0 ? previous : (focus > WindowCommands ? focus - WindowCommands : 1);
+	Write(fmt::format("[DEVLOST] commands #{}..#{} ({}):\n", from, focus,
+	                  previous != 0 ? "since the previous run of this shader"
+	                                : "no earlier run of this shader in the window"));
+	for (uint32_t id = from; id <= focus && id != 0; id++) {
+		Write(fmt::format("[DEVLOST]   {}\n", Describe(id)));
+	}
+	Write(fmt::format("[DEVLOST] command processor decisions before commands #{}..#{}:\n", from + 1,
+	                  focus));
+	const uint64_t last_cp  = g_next_cp.load(std::memory_order_acquire);
+	const uint64_t first_cp = last_cp > CpRingSize ? last_cp - CpRingSize : 0;
+	uint32_t       shown    = 0;
+	for (uint64_t serial = first_cp + 1; serial <= last_cp; serial++) {
+		const auto& c = g_cp[serial % CpRingSize];
+		if (c.serial.load(std::memory_order_acquire) != serial || c.next_command <= from ||
+		    c.next_command > focus) {
+			continue;
+		}
+		Write(fmt::format("[DEVLOST]   cp {} address=0x{:016x} value=0x{:x} count={} before command "
+		                  "#{}\n",
+		                  CpEventName(c.event), c.address, c.value, c.count, c.next_command));
+		shown++;
+	}
+	if (shown == 0) {
+		Write("[DEVLOST]   none\n");
+	}
+	Write(fmt::format("[DEVLOST] buffers bound by #{} and their newest writers:\n", focus));
+	const uint64_t last     = g_next_write.load(std::memory_order_acquire);
+	const uint64_t first    = last > WriteRingSize ? last - WriteRingSize : 0;
+	uint32_t       bindings = 0;
+	for (uint64_t serial = last; serial > first && bindings < BindingsReported; serial--) {
+		const auto& b = g_writes[serial % WriteRingSize];
+		if (b.serial.load(std::memory_order_acquire) != serial || b.next_command < bind_from ||
+		    b.next_command > focus ||
+		    (b.source != WriteSource::Bound && b.source != WriteSource::BoundRead)) {
+			continue;
+		}
+		Write(fmt::format("[DEVLOST]   {} 0x{:016x}+0x{:x}\n", SourceName(b.source), b.vaddr,
+		                  b.size));
+		bindings++;
+		uint32_t writers = 0;
+		for (uint64_t s = serial - 1; s > first && writers < BindingWriters; s--) {
+			const auto& w = g_writes[s % WriteRingSize];
+			if (w.serial.load(std::memory_order_acquire) != s ||
+			    w.source == WriteSource::BoundRead || w.next_command >= bind_from ||
+			    w.vaddr >= b.vaddr + b.size || w.vaddr + w.size <= b.vaddr) {
+				continue;
+			}
+			Write(fmt::format("[DEVLOST]     {} 0x{:016x}+0x{:x} value=0x{:x} before command #{} | "
+			                  "{}\n",
+			                  SourceName(w.source), w.vaddr, w.size, w.value, w.next_command,
+			                  Describe(w.next_command)));
+			writers++;
+		}
+		if (writers == 0) {
+			Write("[DEVLOST]     no write in the ring\n");
+		}
+	}
+	if (bindings == 0) {
+		Write("[DEVLOST]   none recorded\n");
+	}
+	if (!HasArgs(focus)) {
+		ReportListing(entry.hash0, KindName(entry.kind));
 	}
 }
 
@@ -421,7 +548,8 @@ void Init(GraphicContext& graphics) {
 }
 
 static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1,
-                       uint64_t tick, const char* site, const IndirectArgs& args) {
+                       uint64_t tick, const char* site, const IndirectArgs& args,
+                       const std::array<uint32_t, 3>& groups) {
 	if (g_graphics == nullptr) {
 		return 0;
 	}
@@ -437,6 +565,7 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	e.tick  = tick;
 	e.site  = site;
 	e.args  = args;
+	e.groups = groups;
 	if (args.buffer) {
 		e.args_slot = g_next_args_slot.fetch_add(1, std::memory_order_relaxed) % ArgsSlots;
 	}
@@ -469,13 +598,28 @@ void NoteWrite(WriteSource source, uint64_t vaddr, uint64_t size, uint64_t value
 	w.serial.store(serial, std::memory_order_release);
 }
 
+void NoteCp(CpEvent event, uint64_t address, uint64_t value, uint64_t count) {
+	if (g_graphics == nullptr) {
+		return;
+	}
+	const uint64_t serial = g_next_cp.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&          c      = g_cp[serial % CpRingSize];
+	c.serial.store(0, std::memory_order_relaxed);
+	c.next_command = g_next_id.load(std::memory_order_relaxed) + 1;
+	c.event        = event;
+	c.address      = address;
+	c.value        = value;
+	c.count        = count;
+	c.serial.store(serial, std::memory_order_release);
+}
+
 uint32_t Begin(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1, uint64_t tick,
-               const IndirectArgs& args) {
-	return Record(buffer, kind, hash0, hash1, tick, nullptr, args);
+               const IndirectArgs& args, const std::array<uint32_t, 3>& groups) {
+	return Record(buffer, kind, hash0, hash1, tick, nullptr, args, groups);
 }
 
 uint32_t BeginInternal(vk::CommandBuffer buffer, const char* site) {
-	return Record(buffer, Kind::Internal, 0, 0, 0, site, {});
+	return Record(buffer, Kind::Internal, 0, 0, 0, site, {}, {});
 }
 
 void End(vk::CommandBuffer buffer, uint32_t id) {
@@ -524,6 +668,7 @@ void Report(const char* where, vk::Result result, uint64_t known_gpu_tick) {
 	}
 	ReportIndirectArgs(focus);
 	ReportWriters(focus);
+	ReportWindow(focus);
 	Write("[DEVLOST] ===== end =====\n");
 }
 

@@ -3,6 +3,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/host_gpu/renderer/deviceLossDiag.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/agc.h"
@@ -571,7 +572,11 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	const uint32_t cond_value = *reinterpret_cast<const volatile uint32_t*>(addr);
+	DeviceLossDiag::NoteCp(cond_value == 0 ? DeviceLossDiag::CpEvent::CondExecSkip
+	                                       : DeviceLossDiag::CpEvent::CondExecRun,
+	                       addr, cond_value, exec_count);
+	if (cond_value == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -601,11 +606,16 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
+	const uint64_t branch_value = *compare_addr;
+	if (TestWaitRegMemValue(branch_value, reference, mask, function)) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::BranchThen, reinterpret_cast<uint64_t>(compare_addr), branch_value, then_num_dw);
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::BranchElse, reinterpret_cast<uint64_t>(compare_addr), branch_value, else_num_dw);
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
 		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
+	} else {
+		DeviceLossDiag::NoteCp(DeviceLossDiag::CpEvent::BranchNone, reinterpret_cast<uint64_t>(compare_addr), branch_value, 0);
 	}
 
 	return payload_dw;
