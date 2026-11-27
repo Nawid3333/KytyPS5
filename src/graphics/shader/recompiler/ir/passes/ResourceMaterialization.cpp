@@ -1194,9 +1194,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			     !unfiltered_coordinates && !prefix_coordinates) ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				std::string lab = fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates: failing=c{} exemplar=c{} "
+				    "base_dim={} unfiltered={} storage_swizzle={} leading={} same={} prefix={} unfiltered_ok={}",
+				    program.info.images[root_index].first_use_pc, candidate, exemplar,
+				    static_cast<int>(base.dimension), base.unfiltered_access_only, storage_swizzle,
+				    leading_coordinates, same_coordinates, prefix_coordinates, unfiltered_coordinates);
+				for (uint32_t c = 0; c < specialization.images.size(); c++) {
+					const auto& entry = specialization.images[c];
+					if (entry.indirect_root != root_index) {
+						continue;
+					}
+					lab += fmt::format(" c{}:d{}{}/f{}/s{:x}/n{}/m{}=", c, static_cast<int>(entry.dimension),
+					                   entry.cube ? "cube" : "", static_cast<int>(entry.conversion_format),
+					                   entry.shader_swizzle, static_cast<int>(entry.numeric_class),
+					                   entry.mip_count);
+					for (uint32_t d = 0; d < snapshot.images[c].dword_count && d < 8u; ++d) {
+						lab += fmt::format("{:08x}", snapshot.images[c].dwords[d]);
+					}
+				}
+				return SpecializationFail(lab);
 			}
 		}
 	}
