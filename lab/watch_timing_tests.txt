@@ -1,0 +1,4 @@
+# Tests whose result depends on wall-clock timing on a software Vulkan driver (lavapipe): reported, never alerted.
+# One name per line, as in results.json. Evidence: lab-watch tries 2026-11-28 (--flip-rate-only failed, passed, failed on one build).
+mode:--flip-rate-only
+ctest:video_out_flip_rate

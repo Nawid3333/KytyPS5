@@ -1,0 +1,181 @@
+# Fork-only lab watch (KytyLab roadmap W2/A1): after every upstream sync, build what ctest runs plus the GPU test
+# harness, run every ctest entry and every harness mode on Mesa lavapipe (software Vulkan, no GPU), compare with the
+# previous run and comment on the inbox issue when a test that passed before fails now. Upstream CI builds the
+# harness but never runs it. Test results only: no game data ever enters this workflow.
+name: Lab watch
+
+on:
+  push:
+    branches: [main, "lab/watch-*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "commit to test (default: the head of the branch this runs on)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: lab-watch-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.2.6/mesa3d-26.2.6-release-msvc.7z
+  MESA_SHA256: b2e00615feaba45942343c265cc8c5f576142ca682c1ac6661922d4b72492877
+  LOADER_TAG: v1.4.304
+  LOADER_SHA: 804a7a4efd865532646e54ad98807c0f318da413
+  INBOX_ISSUE: "46"
+
+jobs:
+  watch:
+    if: github.repository == 'Nawid3333/KytyPS5'
+    runs-on: windows-2025
+    timeout-minutes: 240
+    steps:
+      - name: Checkout the code under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: recursive
+
+      - name: Take lab files from the workflow's own commit
+        shell: bash
+        run: |
+          git fetch --depth 1 origin "${{ github.sha }}"
+          git checkout FETCH_HEAD -- lab
+          echo "CODE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Apply the lab harness patch
+        shell: bash
+        run: |
+          sed -i 's/\r$//' lab/harness-skips.patch
+          if git apply --cached --check lab/harness-skips.patch; then
+            git apply --cached lab/harness-skips.patch && git checkout -- tests && echo "PATCH=applied" >> "$GITHUB_ENV"
+          elif git apply --cached -R --check lab/harness-skips.patch; then
+            echo "PATCH=already-upstream" >> "$GITHUB_ENV"
+          else
+            echo "PATCH=FAILED" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Use the Clang that ships with Visual Studio
+        shell: pwsh
+        run: |
+          Join-Path $env:VCINSTALLDIR "Tools\Llvm\x64\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "port_hash=$($portHash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache glslang
+        id: glslang_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
+          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
+          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
+            vcpkg install glslang[tools,opt]:x64-windows
+          }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DBUILD_TESTING=ON -DKYTY_BUILD_LAUNCHER=OFF
+
+      - name: Build what ctest runs plus the harness
+        shell: bash
+        run: |
+          targets="$(python lab/test_targets.py CMakeLists.txt)"
+          echo "targets: $targets"
+          cmake --build _Build/windows --parallel --target $targets
+
+      - name: Vulkan loader
+        shell: bash
+        run: |
+          if [ -f /c/Windows/System32/vulkan-1.dll ]; then echo "runner already has the loader"; exit 0; fi
+          git clone --depth 1 --branch "$LOADER_TAG" https://github.com/KhronosGroup/Vulkan-Loader.git "$RUNNER_TEMP/vulkan-loader"
+          actual=$(git -C "$RUNNER_TEMP/vulkan-loader" rev-parse HEAD)
+          if [ "$actual" != "$LOADER_SHA" ]; then echo "::error::Vulkan-Loader $LOADER_TAG is $actual, expected $LOADER_SHA"; exit 1; fi
+          cmake -S "$RUNNER_TEMP/vulkan-loader" -B "$RUNNER_TEMP/vulkan-loader/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF -DUPDATE_DEPS=ON
+          cmake --build "$RUNNER_TEMP/vulkan-loader/build" --parallel
+          cp "$(find "$RUNNER_TEMP/vulkan-loader/build" -name vulkan-1.dll | head -1)" _Build/windows/
+
+      - name: Unpack lavapipe
+        shell: bash
+        run: |
+          curl -sSfL --max-time 300 --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/mesa.7z" "$MESA_URL"
+          echo "$MESA_SHA256  $RUNNER_TEMP/mesa.7z" | sha256sum -c -
+          7z x "$RUNNER_TEMP/mesa.7z" -o"$RUNNER_TEMP/mesa" 'x64/*' > /dev/null
+          json=$(find "$RUNNER_TEMP/mesa" -iname 'lvp_icd*.json' | head -1)
+          if [ -z "$json" ]; then echo "::error::no lavapipe ICD json"; exit 1; fi
+          echo "VK_DRIVER_FILES=$(cygpath -w "$json")" >> "$GITHUB_ENV"
+
+      - name: Previous results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow lab-watch.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n lab-watch-results -D prev || true
+          fi
+          ls prev 2>/dev/null || echo "no previous results"
+
+      - name: Run every ctest entry and every harness mode on lavapipe
+        shell: bash
+        env:
+          LP_NUM_THREADS: "4"
+          LP_NATIVE_VECTOR_WIDTH: "256"
+        run: |
+          python lab/watch_run.py --build _Build/windows --out results.json --previous prev/results.json \
+            --summary summary.md --sha "$CODE_SHA" --patch "$PATCH"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-watch-results
+          path: |
+            results.json
+            summary.md
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Tell the inbox about new failures
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          new=$(python -c "import json; d=json.load(open('results.json')); print(len(d['diff']['new_fail']))")
+          if [ "$new" != "0" ] || [ "$PATCH" = "FAILED" ]; then
+            gh issue comment "$INBOX_ISSUE" -R "$GITHUB_REPOSITORY" --body-file summary.md
+          fi

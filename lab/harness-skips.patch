@@ -1,0 +1,291 @@
+diff --git a/tests/ShaderRecompilerComputeTests.cpp b/tests/ShaderRecompilerComputeTests.cpp
+index 583a4941e..4097d7049 100644
+--- a/tests/ShaderRecompilerComputeTests.cpp
++++ b/tests/ShaderRecompilerComputeTests.cpp
+@@ -2087,6 +2087,24 @@ std::string StorageUint2DImageBindingName(bool atomic) {
+   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
+ }
+ 
++constexpr int kSkippedRunExitCode = 77;
++
++bool SpirvDeclaresCapability(const std::vector<u32> &spirv, u32 capability) {
++  constexpr size_t kFirstInstruction = 5;
++  for (size_t i = kFirstInstruction; i < spirv.size();) {
++    const u32 word_count = spirv[i] >> 16u;
++    if (word_count == 0) {
++      break;
++    }
++    if ((spirv[i] & 0xffffu) == spv::OpCapability && word_count >= 2 && i + 1 < spirv.size() &&
++        spirv[i + 1] == capability) {
++      return true;
++    }
++    i += word_count;
++  }
++  return false;
++}
++
+ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+   const auto user_data =
+       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
+@@ -2315,7 +2333,12 @@ public:
+     return m_rasterization_supported;
+   }
+   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
++  void SkipComputeCase() { ++m_skipped_compute_cases; }
++  [[nodiscard]] bool RobustPipelinesSupported() const { return m_robust_pipelines; }
++  [[nodiscard]] bool DerivativeQuadsSupported() const { return m_derivative_quads; }
++  [[nodiscard]] bool FragmentBarycentricsSupported() const { return m_fragment_barycentrics; }
+   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
++  [[nodiscard]] u32 SkippedComputeCaseCount() const { return m_skipped_compute_cases; }
+   [[nodiscard]] GraphicContext &RuntimeContext() {
+     EnsureRuntimeContext();
+     return m_runtime_context;
+@@ -24671,7 +24694,11 @@ public:
+ 
+ private:
+   bool m_rasterization_supported = true;
++  bool m_robust_pipelines = true;
++  bool m_derivative_quads = true;
++  bool m_fragment_barycentrics = true;
+   u32   m_skipped_cases          = 0;
++  u32   m_skipped_compute_cases  = 0;
+ 
+   RenderContext &Renderer() {
+     EXIT_IF(m_renderer == nullptr);
+@@ -24772,6 +24799,7 @@ private:
+                                                   physical_devices.data()),
+               "vkEnumeratePhysicalDevices");
+ 
++    for (const bool need_barycentrics : {true, false}) {
+     for (auto physical : physical_devices) {
+       u32 queue_count = 0;
+       physical.getQueueFamilyProperties(&queue_count, nullptr);
+@@ -24796,7 +24824,7 @@ private:
+           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
+           features.pNext = &barycentric;
+           physical.getFeatures2(&features);
+-          if (barycentric.fragmentShaderBarycentric != true ||
++          if ((need_barycentrics && barycentric.fragmentShaderBarycentric != true) ||
+               features.features.shaderInt64 != true ||
+               features11.storageBuffer16BitAccess != true ||
+               features12.storageBuffer8BitAccess != true ||
+@@ -24820,9 +24848,13 @@ private:
+       if (m_physical_device != nullptr) {
+         break;
+       }
++    }
++      if (m_physical_device != nullptr) {
++        break;
++      }
+     }
+     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
+-            "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
++            "no Vulkan graphics+compute device with 64-bit LDS/image atomics");
+     m_physical_device.getMemoryProperties(&m_memory_properties);
+ 
+     vk::PhysicalDeviceFeatures available_features{};
+@@ -24874,19 +24906,65 @@ private:
+     m_physical_device.getProperties2(&properties2);
+     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
+             "null descriptors are not supported");
+-    Require("VulkanHarness", "dispatch",
+-            available_robustness2.robustBufferAccess2 == true &&
+-                available_pipeline_robustness.pipelineRobustness == true &&
+-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
++    uint32_t extension_count = 0;
++    RequireVk("VulkanHarness", "dispatch",
++              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
++                                                                   nullptr),
++              "vkEnumerateDeviceExtensionProperties");
++    std::vector<vk::ExtensionProperties> extensions(extension_count);
++    RequireVk("VulkanHarness", "dispatch",
++              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
++                                                                   extensions.data()),
++              "vkEnumerateDeviceExtensionProperties");
++    m_robust_pipelines =
++        std::ranges::any_of(extensions,
++                            [](const vk::ExtensionProperties &extension) {
++                              return std::strcmp(extension.extensionName.data(),
++                                                 VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
++                            }) &&
++        available_robustness2.robustBufferAccess2 == true &&
++        available_pipeline_robustness.pipelineRobustness == true &&
++        robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
++    if (!m_robust_pipelines) {
++      std::printf(
++          "[host]    RobustBufferPipelines     unavailable, robust buffer cases "
++          "will be skipped\n");
++    }
+     Require("VulkanHarness", "dispatch",
+             available_features.shaderStorageImageWriteWithoutFormat == true,
+             "shaderStorageImageWriteWithoutFormat is not supported");
+     Require("VulkanHarness", "dispatch",
+             available_features.shaderImageGatherExtended == true &&
+-                available_features.shaderResourceMinLod == true &&
+-                available_derivatives.computeDerivativeGroupQuads == true,
+-            "image gather, MinLod or compute derivative quads are not supported");
++                available_features.shaderResourceMinLod == true,
++            "image gather or MinLod are not supported");
++    m_derivative_quads =
++        std::ranges::any_of(extensions,
++                            [](const vk::ExtensionProperties &extension) {
++                              return std::strcmp(extension.extensionName.data(),
++                                                 VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0;
++                            }) &&
++        available_derivatives.computeDerivativeGroupQuads == true;
++    if (!m_derivative_quads) {
++      std::printf(
++          "[host]    ComputeDerivativeQuads    unavailable, compute derivative cases "
++          "will be skipped\n");
++    }
++    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
++    vk::PhysicalDeviceFeatures2 barycentric_query{};
++    barycentric_query.pNext = &available_barycentric;
++    m_physical_device.getFeatures2(&barycentric_query);
++    m_fragment_barycentrics =
++        std::ranges::any_of(extensions,
++                            [](const vk::ExtensionProperties &extension) {
++                              return std::strcmp(extension.extensionName.data(),
++                                                 VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
++                            }) &&
++        available_barycentric.fragmentShaderBarycentric == true;
++    if (!m_fragment_barycentrics) {
++      std::printf(
++          "[host]    FragmentBarycentrics      unavailable, barycentric graphics cases "
++          "will be skipped\n");
++    }
+     Require("VulkanHarness", "dispatch",
+             available_features11.storageBuffer16BitAccess == true &&
+                 available_features12.storageBuffer8BitAccess == true,
+@@ -24978,12 +25056,15 @@ private:
+     vk::PhysicalDeviceVulkan13Features device_features13{};
+     device_features13.sType =
+         vk::StructureType::ePhysicalDeviceVulkan13Features;
+-    device_features13.pNext = &barycentric;
++    device_features13.pNext = m_fragment_barycentrics ? static_cast<void *>(&barycentric)
++                                                       : static_cast<void *>(&device_features12);
+     device_features13.dynamicRendering = true;
+     device_features13.synchronization2 = true;
+     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
+     derivatives.pNext = &device_features13;
+     derivatives.computeDerivativeGroupQuads = true;
++    void *derivative_chain = m_derivative_quads ? static_cast<void *>(&derivatives)
++                                                : static_cast<void *>(&device_features13);
+     // Requesting a feature the device does not support fails device creation, so the
+     // rasterization feature chain is only chained in when every part is available.
+     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
+@@ -24992,7 +25073,7 @@ private:
+     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
+     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
+     if (m_rasterization_supported) {
+-      depth_clip.pNext = &derivatives;
++      depth_clip.pNext = derivative_chain;
+       depth_clip.depthClipEnable = true;
+       clip_control.pNext = &depth_clip;
+       clip_control.depthClipControl = true;
+@@ -25007,7 +25088,7 @@ private:
+     min_lod.minLod = true;
+     min_lod.pNext = m_rasterization_supported
+                         ? static_cast<void *>(&provoking_vertex)
+-                        : static_cast<void *>(&derivatives);
++                        : derivative_chain;
+     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
+     maintenance8.maintenance8 = true;
+     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
+@@ -25019,7 +25100,8 @@ private:
+     pipeline_robustness.pNext = &maintenance8;
+     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+     robustness2.nullDescriptor = true;
+-    robustness2.pNext = &pipeline_robustness;
++    robustness2.pNext = m_robust_pipelines ? static_cast<void *>(&pipeline_robustness)
++                                           : static_cast<void *>(&maintenance8);
+     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+     conditional_rendering.conditionalRendering = true;
+     conditional_rendering.pNext = &robustness2;
+@@ -25050,12 +25132,9 @@ private:
+     device_info.pEnabledFeatures = &device_features;
+     std::vector<const char *> device_extensions{
+         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
+-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
+         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+@@ -25064,6 +25143,15 @@ private:
+         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+         VK_KHR_RAY_QUERY_EXTENSION_NAME};
++    if (m_robust_pipelines) {
++      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
++    }
++    if (m_derivative_quads) {
++      device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
++    }
++    if (m_fragment_barycentrics) {
++      device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
++    }
+     if (m_rasterization_supported) {
+       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+@@ -25141,6 +25229,13 @@ private:
+   }
+ 
+   vk::ShaderModule CreateShaderModule(const char *shader_name, const std::vector<u32> &spirv) {
++    if (!m_fragment_barycentrics &&
++        SpirvDeclaresCapability(spirv, spv::CapabilityFragmentBarycentricKHR)) {
++      std::printf("[graphics] %-31s skipped, no fragment barycentrics; rest of this run skipped\n",
++                  shader_name);
++      std::fflush(stdout);
++      std::exit(kSkippedRunExitCode);
++    }
+     vk::ShaderModuleCreateInfo info{};
+     info.codeSize = spirv.size() * sizeof(u32);
+     info.pCode = spirv.data();
+@@ -25474,6 +25569,18 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
+     std::printf("[compute] %-32s ok\n", test.name);
+     return;
+   }
++  if (test.profile->robust_buffer_access && vulkan != nullptr &&
++      !vulkan->RobustPipelinesSupported()) {
++    std::printf("[compute] %-32s skipped, no byte-granular robustBufferAccess2\n", test.name);
++    vulkan->SkipComputeCase();
++    return;
++  }
++  if (compiled.program.info.compute_derivatives && vulkan != nullptr &&
++      !vulkan->DerivativeQuadsSupported()) {
++    std::printf("[compute] %-32s skipped, no compute derivative quads\n", test.name);
++    vulkan->SkipComputeCase();
++    return;
++  }
+   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+   auto Has = [&](Kind kind) {
+     return compiled.program.bindings.descriptor_counts[static_cast<size_t>(kind)] != 0;
+@@ -25590,6 +25697,12 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
+     return;
+   }
+   auto compiled = CompileFragmentCase(test);
++  if (!vulkan->FragmentBarycentricsSupported() &&
++      SpirvDeclaresCapability(compiled.spirv, spv::CapabilityFragmentBarycentricKHR)) {
++    std::printf("[graphics] %-31s skipped, no fragment barycentrics\n", test.name);
++    vulkan->SkipRasterizationCases(1);
++    return;
++  }
+   auto actual = vulkan->RenderFragment(test, compiled);
+   CompareGraphicsWords(test, actual);
+   std::printf("[graphics] %-31s ok\n", test.name);
+@@ -59592,6 +59705,10 @@ int main(int argc, char **argv) {
+     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
+                 vulkan.SkippedCaseCount());
+   }
++  if (vulkan.SkippedComputeCaseCount() > 0) {
++    std::printf("ShaderRecompilerComputeTests: %u compute cases skipped\n",
++                vulkan.SkippedComputeCaseCount());
++  }
+   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
+   return 0;
+ }
