@@ -199,7 +199,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Tell the inbox about new failures
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
