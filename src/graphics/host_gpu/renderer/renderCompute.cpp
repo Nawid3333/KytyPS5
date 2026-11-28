@@ -470,6 +470,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const auto diag_id = DeviceLossDiag::Begin(vk_buffer, DeviceLossDiag::Kind::Dispatch,
 	                                           program.shader_hash, sh_ctx.GetCs().cs_regs.data_addr,
 	                                           m_context.GetCommandScheduler().CurrentTick());
+	DeviceLossDiag::SetGroups(diag_id, thread_group_x, thread_group_y, thread_group_z);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide

@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,12 @@ constexpr uint32_t ArgsReportedEarly = 8;
 constexpr uint32_t WriteRingSize     = 1u << 18u;
 constexpr uint32_t WritersReported   = 24;
 constexpr uint32_t ListingsReported  = 4;
+constexpr uint32_t BindRingSize      = 1u << 16u;
+constexpr uint32_t BindsReported     = 48;
+constexpr uint32_t BindWindow        = 16;
+constexpr uint32_t WritersPerBind    = 4;
+constexpr uint32_t GuestWordsShown   = 4;
+constexpr vk::DeviceSize LoopGuardBytes = 256;
 
 struct Entry {
 	std::atomic<uint32_t> id {0};
@@ -35,6 +42,15 @@ struct Entry {
 	uint64_t              tick  = 0;
 	const char*           site  = nullptr;
 	IndirectArgs          args;
+	std::array<uint32_t, 3> groups {};
+};
+
+struct BindEntry {
+	std::atomic<uint64_t> serial {0};
+	uint32_t              next_command = 0;
+	uint64_t              vaddr        = 0;
+	uint64_t              size         = 0;
+	bool                  written      = false;
 };
 
 struct WriteEntry {
@@ -58,6 +74,14 @@ volatile uint32_t*          g_markers       = nullptr;
 vk::Buffer                  g_args_buffer   = nullptr;
 vk::DeviceMemory            g_args_memory   = nullptr;
 volatile uint32_t*          g_args          = nullptr;
+std::vector<BindEntry>      g_binds(BindRingSize);
+std::atomic<uint64_t>       g_next_bind {0};
+vk::Buffer                  g_guard_buffer  = nullptr;
+vk::DeviceMemory            g_guard_memory  = nullptr;
+volatile uint32_t*          g_guard         = nullptr;
+uint64_t                    g_guard_address = 0;
+std::atomic<uint32_t>       g_guard_mask_seen {0};
+std::atomic<uint32_t>       g_guard_hits_logged {0};
 
 constexpr vk::DeviceSize StartedOffset  = 0;
 constexpr vk::DeviceSize FinishedOffset = 4;
@@ -103,15 +127,20 @@ std::string Describe(uint32_t id) {
 		return fmt::format("#{} {} site={}", id, KindName(e.kind),
 		                   e.site != nullptr ? e.site : "?");
 	}
-	return fmt::format("#{} {} tick={} hash0=0x{:016x} hash1=0x{:016x}", id, KindName(e.kind),
-	                   e.tick, e.hash0, e.hash1);
+	const auto groups = e.groups[0] == 0
+	                        ? std::string {}
+	                        : fmt::format(" groups={}x{}x{}", e.groups[0], e.groups[1], e.groups[2]);
+	return fmt::format("#{} {} tick={} hash0=0x{:016x} hash1=0x{:016x}{}", id, KindName(e.kind),
+	                   e.tick, e.hash0, e.hash1, groups);
 }
 
 volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize size,
-                                    vk::Buffer& buffer, vk::DeviceMemory& memory_out) {
+                                    vk::Buffer& buffer, vk::DeviceMemory& memory_out,
+                                    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eTransferDst,
+                                    bool device_address = false) {
 	vk::BufferCreateInfo info {};
 	info.size        = size;
-	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
+	info.usage       = usage;
 	info.sharingMode = vk::SharingMode::eExclusive;
 	if (graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
 		buffer = nullptr;
@@ -131,7 +160,10 @@ volatile uint32_t* CreateHostBuffer(GraphicContext& graphics, vk::DeviceSize siz
 			break;
 		}
 	}
+	vk::MemoryAllocateFlagsInfo address_flags {};
+	address_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
 	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = device_address ? &address_flags : nullptr;
 	allocate.allocationSize  = requirements.size;
 	allocate.memoryTypeIndex = type;
 	void* mapped             = nullptr;
@@ -282,6 +314,57 @@ void ReportWriters(uint32_t focus) {
 	}
 }
 
+void ReportRangeWriters(uint64_t begin, uint64_t end, uint32_t limit) {
+	const uint64_t last  = g_next_write.load(std::memory_order_acquire);
+	const uint64_t first = last > WriteRingSize ? last - WriteRingSize : 0;
+	uint32_t       shown = 0;
+	for (uint64_t serial = last; serial > first && shown < limit; serial--) {
+		const auto& w = g_writes[serial % WriteRingSize];
+		if (w.serial.load(std::memory_order_acquire) != serial || w.vaddr >= end ||
+		    w.vaddr + w.size <= begin) {
+			continue;
+		}
+		Write(fmt::format("[DEVLOST]     writer {} 0x{:016x}+0x{:x} value=0x{:x} before command #{} | "
+		                  "next recorded {}\n",
+		                  SourceName(w.source), w.vaddr, w.size, w.value, w.next_command,
+		                  Describe(w.next_command)));
+		shown++;
+	}
+}
+
+void ReportBinds(uint32_t focus) {
+	const uint32_t from = focus > BindWindow ? focus - BindWindow : 1;
+	Write(fmt::format("[DEVLOST] storage buffers bound before commands #{}..#{} (newest first):\n",
+	                  from, focus));
+	const uint64_t last  = g_next_bind.load(std::memory_order_acquire);
+	const uint64_t first = last > BindRingSize ? last - BindRingSize : 0;
+	uint32_t       shown = 0;
+	for (uint64_t serial = last; serial > first && shown < BindsReported; serial--) {
+		const auto& b = g_binds[serial % BindRingSize];
+		if (b.serial.load(std::memory_order_acquire) != serial || b.next_command > focus) {
+			continue;
+		}
+		if (b.next_command < from) {
+			break;
+		}
+		std::array<uint32_t, GuestWordsShown> words {};
+		const bool have_words = b.vaddr != 0 && b.size >= sizeof(words) &&
+		                  LibKernel::Memory::CopySparseMemory(b.vaddr, words.data(), sizeof(words));
+		Write(fmt::format("[DEVLOST]   bind 0x{:016x}+0x{:x} {} before command #{} guest words now: {}\n",
+		                  b.vaddr, b.size, b.written ? "written" : "read", b.next_command,
+		                  have_words ? fmt::format("{:08x} {:08x} {:08x} {:08x}", words[0], words[1],
+		                                     words[2], words[3])
+		                       : std::string {"-"}));
+		shown++;
+		if (b.vaddr != 0) {
+			ReportRangeWriters(b.vaddr, b.vaddr + b.size, WritersPerBind);
+		}
+	}
+	if (shown == 0) {
+		Write("[DEVLOST]   none\n");
+	}
+}
+
 void ReportFault() {
 	if (!g_graphics->device_fault_enabled) {
 		Write("[DEVLOST] VK_EXT_device_fault: not available on this device/driver\n");
@@ -343,10 +426,62 @@ void Init(GraphicContext& graphics) {
 	g_args =
 	    CreateHostBuffer(graphics, vk::DeviceSize {ArgsSlots} * ArgsSlotWords * sizeof(uint32_t),
 	                     g_args_buffer, g_args_memory);
+	g_guard = CreateHostBuffer(graphics, LoopGuardBytes, g_guard_buffer, g_guard_memory,
+	                           vk::BufferUsageFlagBits::eStorageBuffer |
+	                               vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                           true);
+	if (g_guard != nullptr) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = g_guard_buffer;
+		g_guard_address     = graphics.device.getBufferAddress(address_info);
+	}
 	Write(fmt::format("[DEVLOST] device-loss diagnostics: device_fault={} nv_checkpoints={} "
-	                  "amd_buffer_marker={} indirect_args={}\n",
+	                  "amd_buffer_marker={} indirect_args={} loop_guard={}\n",
 	                  graphics.device_fault_enabled, graphics.nv_checkpoints_enabled,
-	                  g_markers != nullptr, g_args != nullptr));
+	                  g_markers != nullptr, g_args != nullptr, g_guard_address != 0));
+}
+
+uint64_t LoopGuardAddress() {
+	return g_guard_address;
+}
+
+static void PollLoopGuard() {
+	if (g_guard == nullptr) {
+		return;
+	}
+	const uint32_t mask = g_guard[0];
+	const uint32_t hits = g_guard[1];
+	const bool     new_mask = mask != 0 && g_guard_mask_seen.exchange(mask) != mask;
+	uint32_t       logged   = g_guard_hits_logged.load(std::memory_order_relaxed);
+	const bool     doubled  = hits != 0 && hits >= 2u * logged &&
+	                     g_guard_hits_logged.compare_exchange_strong(logged, hits);
+	if (new_mask || doubled) {
+		Write(fmt::format("[lab-2019] loop guard hit: mask=0x{:08x} hits={}\n", mask, hits));
+	}
+}
+
+void NoteBind(uint64_t vaddr, uint64_t size, bool written) {
+	if (g_graphics == nullptr) {
+		return;
+	}
+	const uint64_t serial = g_next_bind.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&          b      = g_binds[serial % BindRingSize];
+	b.serial.store(0, std::memory_order_relaxed);
+	b.next_command = g_next_id.load(std::memory_order_relaxed) + 1;
+	b.vaddr        = vaddr;
+	b.size         = size;
+	b.written      = written;
+	b.serial.store(serial, std::memory_order_release);
+}
+
+void SetGroups(uint32_t id, uint32_t x, uint32_t y, uint32_t z) {
+	if (g_graphics == nullptr || id == 0) {
+		return;
+	}
+	auto& e = g_ring[id % RingSize];
+	if (e.id.load(std::memory_order_acquire) == id) {
+		e.groups = {x, y, z};
+	}
 }
 
 static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint64_t hash1,
@@ -354,6 +489,7 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	if (g_graphics == nullptr) {
 		return 0;
 	}
+	PollLoopGuard();
 	uint32_t id = g_next_id.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (id == 0) {
 		id = g_next_id.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -366,6 +502,7 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	e.tick  = tick;
 	e.site  = site;
 	e.args  = args;
+	e.groups = {};
 	e.id.store(id, std::memory_order_release);
 	if (g_args != nullptr && args.buffer) {
 		CaptureArgs(buffer, id, args);
@@ -450,6 +587,10 @@ void Report(const char* where, vk::Result result, uint64_t known_gpu_tick) {
 	}
 	ReportIndirectArgs(focus);
 	ReportWriters(focus);
+	ReportBinds(focus);
+	if (g_guard != nullptr) {
+		Write(fmt::format("[DEVLOST] loop guard: mask=0x{:08x} hits={}\n", g_guard[0], g_guard[1]));
+	}
 	Write("[DEVLOST] ===== end =====\n");
 }
 
