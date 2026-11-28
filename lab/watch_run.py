@@ -63,12 +63,15 @@ def run_modes(build: Path, source: Path, timeout: int) -> dict:
 
 
 def run_ctest(build: Path, timeout: int) -> dict:
-    junit = build / "lab-watch-ctest.xml"
-    subprocess.run(["ctest", "--test-dir", str(build), "--timeout", str(timeout), "--output-junit", str(junit),
-                    "--parallel", str(max(1, (os.cpu_count() or 2) // 2))], capture_output=True, text=True)
+    junit = (build / "lab-watch-ctest.xml").resolve()
+    proc = subprocess.run(["ctest", "--test-dir", str(build), "--timeout", str(timeout), "--output-junit",
+                           str(junit), "--parallel", str(max(1, (os.cpu_count() or 2) // 2))],
+                          capture_output=True, text=True, errors="replace")
     results = {}
     if not junit.exists():
-        return {"ctest:(no junit)": {"status": "fail", "error": "ctest wrote no JUnit file"}}
+        tail = " | ".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])
+        return {"ctest:(no junit)": {"status": "fail", "exit": proc.returncode,
+                                     "error": f"ctest wrote no JUnit file: {tail}"[:400]}}
     for case in ET.parse(junit).getroot().iter("testcase"):
         name = case.get("name", "?")
         if case.find("failure") is not None or case.find("error") is not None:
@@ -173,12 +176,18 @@ def main() -> int:
             diff["new_fail"].remove(name)
             diff["flaky"].append(name)
     now["diff"] = diff
+    modes = [v for k, v in tests.items() if k.startswith("mode:")]
+    broken = sum("vkCreateInstance" in v.get("error", "") for v in modes)
+    now["environment"] = "broken" if modes and broken * 2 > len(modes) else "ok"
     Path(args.out).write_text(json.dumps(now, indent=1, sort_keys=True), encoding="utf-8")
     text = summary_text(now, diff, before)
+    if now["environment"] == "broken":
+        text = (f"**ENVIRONMENT BROKEN**: {broken} of {len(modes)} harness modes could not create a Vulkan "
+                f"instance; these results are not a test verdict.\n\n" + text)
     if args.summary:
         Path(args.summary).write_text(text, encoding="utf-8")
     print(text)
-    return 0
+    return 2 if now["environment"] == "broken" else 0
 
 
 if __name__ == "__main__":

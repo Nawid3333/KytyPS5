@@ -114,17 +114,30 @@ jobs:
           echo "targets: $targets"
           cmake --build _Build/windows --parallel --target $targets
 
+      - name: Cache the Vulkan loader
+        id: loader-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-loader-bin
+          key: vulkan-loader-${{ env.LOADER_SHA }}
+
       - name: Vulkan loader
+        if: steps.loader-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          if [ -f /c/Windows/System32/vulkan-1.dll ]; then echo "runner already has the loader"; exit 0; fi
           git clone --depth 1 --branch "$LOADER_TAG" https://github.com/KhronosGroup/Vulkan-Loader.git "$RUNNER_TEMP/vulkan-loader"
           actual=$(git -C "$RUNNER_TEMP/vulkan-loader" rev-parse HEAD)
           if [ "$actual" != "$LOADER_SHA" ]; then echo "::error::Vulkan-Loader $LOADER_TAG is $actual, expected $LOADER_SHA"; exit 1; fi
           cmake -S "$RUNNER_TEMP/vulkan-loader" -B "$RUNNER_TEMP/vulkan-loader/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTS=OFF -DUPDATE_DEPS=ON
           cmake --build "$RUNNER_TEMP/vulkan-loader/build" --parallel
-          cp "$(find "$RUNNER_TEMP/vulkan-loader/build" -name vulkan-1.dll | head -1)" _Build/windows/
+          mkdir -p "$RUNNER_TEMP/vulkan-loader-bin"
+          cp "$(find "$RUNNER_TEMP/vulkan-loader/build" -name vulkan-1.dll | head -1)" "$RUNNER_TEMP/vulkan-loader-bin/"
+
+      - name: Put the pinned loader next to the tests
+        shell: bash
+        run: |
+          cp "$RUNNER_TEMP/vulkan-loader-bin/vulkan-1.dll" _Build/windows/
 
       - name: Unpack lavapipe
         shell: bash
@@ -135,6 +148,14 @@ jobs:
           json=$(find "$RUNNER_TEMP/mesa" -iname 'lvp_icd*.json' | head -1)
           if [ -z "$json" ]; then echo "::error::no lavapipe ICD json"; exit 1; fi
           echo "VK_DRIVER_FILES=$(cygpath -w "$json")" >> "$GITHUB_ENV"
+
+      - name: Check that lavapipe loads
+        shell: bash
+        env:
+          VK_LOADER_DEBUG: error,warn,driver
+        run: |
+          cd _Build/windows
+          ./shader_recompiler_compute_tests.exe --centroid-only 2>&1 | tail -40
 
       - name: Previous results
         shell: bash
