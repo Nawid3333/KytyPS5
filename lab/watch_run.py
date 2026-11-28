@@ -24,13 +24,19 @@ from pathlib import Path
 
 RE_MODE = re.compile(r'strcmp\(argv\[1\], "(--[a-z0-9-]+)"\)')
 SKIP_EXIT = 77
+RE_ERROR_HEADER = re.compile(r"^--- (?:Fatal )?Error ---$")
 HARNESS = "shader_recompiler_compute_tests"
 SOURCE = "tests/ShaderRecompilerComputeTests.cpp"
 TIMING_LIST = Path(__file__).with_name("watch_timing_tests.txt")
 
 
 def first_error(output: str) -> str:
-    for line in output.splitlines():
+    lines = output.splitlines()
+    for i, line in enumerate(lines):
+        if RE_ERROR_HEADER.match(line.strip()):
+            after = [rest.strip() for rest in lines[i + 1:i + 4] if rest.strip()]
+            if after:
+                return " ".join(after[:2])[:200]
         if re.search(r"failed at|LLVM ERROR|Error|error:|unknown test selector|Assertion|EXIT", line):
             return line.strip()[:200]
     lines = [line.strip() for line in output.splitlines() if line.strip()]
