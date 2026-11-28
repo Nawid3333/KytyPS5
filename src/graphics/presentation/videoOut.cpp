@@ -535,12 +535,12 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		for (const auto& registered: video_out->buffers) {
 			occupied += registered.Occupied() ? 1 : 0;
 		}
-		std::fprintf(stderr,
-		             "[lab-2385] flip refused: handle=%d index=%d source=%d opened=%d index_occupied=%d "
-		             "occupied_buffers=%d bus=%d\n",
-		             handle, index, static_cast<int>(source), video_out->opened ? 1 : 0,
-		             IsSpecialBufferIndex(index) ? -1 : (video_out->buffers[index].Occupied() ? 1 : 0),
-		             occupied, static_cast<int>(video_out->bus));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[lab-2385] flip refused: handle={} index={} source={} opened={} index_occupied={} "
+		    "occupied_buffers={} bus={}\n",
+		    handle, index, static_cast<int>(source), video_out->opened ? 1 : 0,
+		    IsSpecialBufferIndex(index) ? -1 : (video_out->buffers[index].Occupied() ? 1 : 0), occupied,
+		    static_cast<int>(video_out->bus)));
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
