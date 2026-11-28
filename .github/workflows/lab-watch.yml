@@ -149,10 +149,18 @@ jobs:
           if [ -z "$json" ]; then echo "::error::no lavapipe ICD json"; exit 1; fi
           echo "VK_DRIVER_FILES=$(cygpath -w "$json")" >> "$GITHUB_ENV"
 
+      - name: Register lavapipe (the runner is elevated, so the loader ignores VK_DRIVER_FILES)
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+          if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+          New-ItemProperty -Path $key -Name $env:VK_DRIVER_FILES -PropertyType DWord -Value 0 -Force | Out-Null
+          Get-Item $key | Select-Object -ExpandProperty Property
+
       - name: Check that lavapipe loads
         shell: bash
         env:
-          VK_LOADER_DEBUG: error,warn,driver
+          VK_LOADER_DEBUG: error,warn,info,driver
         run: |
           cd _Build/windows
           ./shader_recompiler_compute_tests.exe --centroid-only 2>&1 | tail -40
