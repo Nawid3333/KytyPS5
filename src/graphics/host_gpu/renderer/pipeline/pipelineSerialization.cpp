@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/labLoopGuard.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -242,7 +243,7 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				m_program_cache.erase(program);
 				return false;
 			}
-			module.module = CompileSPV(spirv, m_graphics.device);
+			module.module = Lab::CompileGuardedSPV(spirv, m_graphics.device, program->first.hash);
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

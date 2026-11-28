@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/labLoopGuard.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -257,7 +258,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
-	    .module         = CompileSPV(result.spirv, m_graphics.device),
+	    .module         = Lab::CompileGuardedSPV(result.spirv, m_graphics.device, key.hash),
 	    .info           = std::move(info),
 	    .specialization = program.specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
