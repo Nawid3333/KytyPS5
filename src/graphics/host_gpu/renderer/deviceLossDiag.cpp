@@ -119,6 +119,8 @@ const char* CpEventName(CpEvent event) {
 		case CpEvent::Predicate: return "SET_PREDICATION";
 		case CpEvent::PredicatedSkip: return "predicated packet skipped";
 		case CpEvent::DispatchDropped: return "dispatch dropped";
+		case CpEvent::MetaClearConsumed: return "metadata clear consumed (address=base value=written)";
+		case CpEvent::MetaClearRefused: return "metadata clear kept, runs natively (address=base value=written)";
 	}
 	return "?";
 }

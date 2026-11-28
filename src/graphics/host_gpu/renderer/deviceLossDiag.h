@@ -36,10 +36,19 @@ enum class CpEvent : uint8_t {
 	BranchNone,
 	Predicate,
 	PredicatedSkip,
-	DispatchDropped
+	DispatchDropped,
+	MetaClearConsumed,
+	MetaClearRefused
 };
 
-enum class DropReason : uint32_t { ZeroGroups = 1, NullShader, NoProgram, ConsumedAsClearOrFill, IndirectZeroArgs };
+enum class DropReason : uint32_t {
+	ZeroGroups = 1,
+	NullShader,
+	NoProgram,
+	ConsumedAsClearOrFill,
+	IndirectZeroArgs,
+	ConsumedAsMetaClear
+};
 
 void     Init(GraphicContext& graphics);
 void     NoteWrite(WriteSource source, uint64_t vaddr, uint64_t size, uint64_t value = 0);

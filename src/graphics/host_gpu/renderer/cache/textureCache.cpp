@@ -2159,6 +2159,28 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
+TextureCache::LabMetaOwner TextureCache::DescribeMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	LabMetaOwner     result;
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return result;
+	}
+	result.found      = true;
+	result.owner      = found->second.owner.index;
+	result.cleared    = found->second.clear_mask.count();
+	const auto* image = m_slot_images.try_get(found->second.owner);
+	if (image != nullptr) {
+		result.alive  = true;
+		result.kind   = image->info.metadata.kind;
+		result.meta   = image->info.metadata.range;
+		result.data   = image->info.data;
+		result.format = image->info.pixel_format;
+		result.extent = image->info.extent;
+	}
+	return result;
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
