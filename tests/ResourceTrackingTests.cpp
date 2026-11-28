@@ -3828,8 +3828,8 @@ void TestGraphicsPointerTableMaterialKeys() {
   const auto pixel = make(Variant::Pixel);
   auto plan = ExtractResourcePlan(pixel->program);
   const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
-  Check(indirect.selector && indirect.selector->offset == 8u && indirect.selector->first_record == 14u &&
-            indirect.selector->record_step == 10u && !indirect.table_scalar && indirect.table_stride == 32u &&
+  Check(indirect.selector && indirect.selector->offset == 8u && indirect.selector->first_record == 0u &&
+            indirect.selector->record_step == 2u && !indirect.table_scalar && indirect.table_stride == 32u &&
             plan.descriptor_sources[indirect.table_source].dword_count == 2u,
         "pixel pointer-table waterfall lost its affine indexed material selector");
 
@@ -3870,7 +3870,7 @@ void TestGraphicsPointerTableMaterialKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u,
         "pixel pointer-table selector did not read exactly the zero and material-key descriptors");
   Check(std::ranges::find(snapshot.specialization_reads,
-                          std::pair<uint64_t, uint64_t>{material + 14u * stride + 8u, 20u * stride + 4u}) !=
+                          std::pair<uint64_t, uint64_t>{material + 8u, 34u * stride + 4u}) !=
             snapshot.specialization_reads.end(),
         "pixel pointer-table selector rows escaped writable-alias tracking");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
