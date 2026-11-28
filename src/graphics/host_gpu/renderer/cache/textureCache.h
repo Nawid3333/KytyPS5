@@ -89,6 +89,19 @@ public:
 	[[nodiscard]] uint64_t MetaRangeSize(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
+	struct LabMetaOwner {
+		bool              found   = false;
+		bool              alive   = false;
+		uint32_t          owner   = 0;
+		size_t            cleared = 0;
+		ImageMetadataKind kind    = ImageMetadataKind::None;
+		GuestRange        meta {};
+		GuestRange        data {};
+		vk::Format        format = vk::Format::eUndefined;
+		vk::Extent3D      extent {};
+	};
+	[[nodiscard]] LabMetaOwner DescribeMeta(uint64_t address);
+
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	// With storage readback, a GL2 writeback makes GPU-written images visible to the CPU; returns
