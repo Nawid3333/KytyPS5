@@ -35,6 +35,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +51,31 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 			return false;
 	}
 	return true;
+}
+
+static void LabLogConsume(const std::string& key, const std::string& line) {
+	constexpr size_t   KEYS_MAX    = 512;
+	constexpr uint64_t COUNT_EVERY = 4096;
+	static std::mutex            mutex;
+	static std::set<std::string> seen;
+	static uint64_t              calls = 0;
+	std::scoped_lock             lock(mutex);
+	++calls;
+	const bool fresh = seen.size() < KEYS_MAX && seen.insert(key).second;
+	if (!fresh && calls % COUNT_EVERY != 0) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("[lab-htile] {} call={}\n", line, calls));
+}
+
+static const char* LabMetaKindName(ImageMetadataKind kind) {
+	switch (kind) {
+		case ImageMetadataKind::None: return "none";
+		case ImageMetadataKind::Htile: return "htile";
+		case ImageMetadataKind::Dcc: return "dcc";
+		case ImageMetadataKind::Cmask: return "cmask";
+	}
+	return "?";
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
@@ -82,7 +108,22 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				// queue that is then never reset hangs the GPU, a larger buffer is never filled).
 				const auto base      = descriptor.Base48();
 				const auto meta_size = cache.MetaRangeSize(base);
-				if (meta_size != 0 && descriptor.GetSize() == meta_size && cache.ClearMeta(base)) {
+				const auto owner     = cache.DescribeMeta(base);
+				const bool consume   = meta_size != 0 && descriptor.GetSize() == meta_size;
+				if (owner.found) {
+					LabLogConsume(
+					    fmt::format("meta {:016x} {:x} {:x} {} {}", program.shader_hash, base, descriptor.GetSize(),
+					                owner.owner, consume),
+					    fmt::format("htile match {}: cs=0x{:016x} tick={} base=0x{:x} written=0x{:x} live_htile=0x{:x} "
+					                "owner=#{} alive={} kind={} meta=0x{:x}+0x{:x} image=0x{:x}+0x{:x} format={} "
+					                "extent={}x{}x{} cleared_slices={}",
+					                consume ? "consumed" : "KEPT (runs natively, #2502)", program.shader_hash,
+					                m_context.GetCommandScheduler().CurrentTick(), base, descriptor.GetSize(), meta_size,
+					                owner.owner, owner.alive ? 1 : 0, LabMetaKindName(owner.kind), owner.meta.address,
+					                owner.meta.size, owner.data.address, owner.data.size, vk::to_string(owner.format),
+					                owner.extent.width, owner.extent.height, owner.extent.depth, owner.cleared));
+				}
+				if (consume && cache.ClearMeta(base)) {
 					return true;
 				}
 			}
@@ -211,6 +252,12 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		// when CPU-owned, so color-clear discovery can read them without a GPU download.
 		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
 	}
+	LabLogConsume(fmt::format("fill {:016x} {:x} {:x} {:x} {}", input.stage.module->info.shader_hash,
+	                          descriptor.Base48(), size, packed_clear, image_clear),
+	              fmt::format("compute {}: cs=0x{:016x} tick={} base=0x{:x} size=0x{:x} value=0x{:08x}",
+	                          image_clear ? "image clear" : "buffer fill", input.stage.module->info.shader_hash,
+	                          m_context.GetCommandScheduler().CurrentTick(), descriptor.Base48(), size,
+	                          packed_clear));
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
