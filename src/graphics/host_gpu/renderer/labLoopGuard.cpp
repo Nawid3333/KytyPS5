@@ -691,7 +691,8 @@ namespace Libs::Graphics::Lab {
 
 namespace {
 
-constexpr std::array<uint64_t, 1> GuardedShaders = {0xb37644325c6f10c6ull};
+constexpr std::array<uint64_t, 4> GuardedShaders = {0xb37644325c6f10c6ull, 0x0dcde952329c979full,
+                                                    0xcb0022ea5c2fc0cdull, 0x3e0139723a1fb10full};
 
 } // namespace
 
@@ -705,7 +706,7 @@ vk::ShaderModule CompileGuardedSPV(std::span<const uint32_t> spirv, vk::Device d
 	const auto               guarded = GuardLoops(spirv, LoopGuardCap, address, &report, &error);
 	if (guarded.empty()) {
 		Log::WriteToConsoleAndLog(
-		    fmt::format("[lab-2019] loop guard not applied to 0x{:016x}: {}\n", hash, error));
+		    fmt::format("[lab-guard] loop guard not applied to 0x{:016x}: {}\n", hash, error));
 		return CompileSPV(spirv, device);
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -714,14 +715,14 @@ vk::ShaderModule CompileGuardedSPV(std::span<const uint32_t> spirv, vk::Device d
 	                                     const char* message) { messages += message; });
 	if (!tools.Validate(guarded.data(), guarded.size())) {
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "[lab-2019] loop guard not applied to 0x{:016x}: validation failed: {}\n", hash, messages));
+		    "[lab-guard] loop guard not applied to 0x{:016x}: validation failed: {}\n", hash, messages));
 		return CompileSPV(spirv, device);
 	}
 	std::string lines;
 	for (const auto& line: report) {
-		lines += fmt::format("[lab-2019]   {}\n", line);
+		lines += fmt::format("[lab-guard]   {}\n", line);
 	}
-	Log::WriteToConsoleAndLog(fmt::format("[lab-2019] loop guard on 0x{:016x} (cap {}, {} -> {} words):\n{}",
+	Log::WriteToConsoleAndLog(fmt::format("[lab-guard] loop guard on 0x{:016x} (cap {}, {} -> {} words):\n{}",
 	                                      hash, LoopGuardCap, spirv.size(), guarded.size(), lines));
 	return CompileSPV(guarded, device);
 }

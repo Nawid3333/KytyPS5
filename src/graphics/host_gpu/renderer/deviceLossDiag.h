@@ -19,10 +19,14 @@ struct IndirectArgs {
 	uint32_t                size          = 0;
 	uint64_t                guest_address = 0;
 	bool                    cpu_read      = false;
-	std::array<uint32_t, 3> cpu_words {};
+	std::array<uint32_t, 5> cpu_words {};
+	uint32_t                cpu_count    = 3;
 	bool                    gpu_modified = false;
 	bool                    cpu_modified = false;
 	bool                    image        = false;
+	bool                    gpu_copy     = true;
+	uint32_t                draw_count   = 0;
+	uint32_t                stride       = 0;
 };
 
 enum class WriteSource : uint8_t { Bound, Fill, CpuFill, Copy, CpuCopy, WriteData, Label };

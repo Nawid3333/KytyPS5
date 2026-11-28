@@ -551,7 +551,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                                        .size          = sizeof(vk::DispatchIndirectCommand),
 	                                        .guest_address = args_addr};
 	diag_args.cpu_read = LibKernel::Memory::TryReadBacking(args_addr, diag_args.cpu_words.data(),
-	                                                       sizeof(diag_args.cpu_words));
+	                                                       diag_args.cpu_count * sizeof(uint32_t));
 	diag_args.gpu_modified =
 	    m_context.GetBufferCache().IsRegionGpuModified(args_addr, diag_args.size);
 	diag_args.cpu_modified =

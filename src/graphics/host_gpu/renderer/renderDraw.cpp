@@ -1214,10 +1214,35 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto    diag_kind         = mesh_active ? DeviceLossDiag::Kind::Mesh
 	                                  : args_buffer.first == nullptr ? DeviceLossDiag::Kind::Draw
 	                                                                 : DeviceLossDiag::Kind::DrawIndirect;
+	DeviceLossDiag::IndirectArgs diag_args {};
+	if (diag_kind == DeviceLossDiag::Kind::DrawIndirect) {
+		diag_args = {.buffer        = args_buffer.first->Handle(),
+		             .offset        = args_buffer.second,
+		             .size          = emit.indirect.stride,
+		             .guest_address = emit.indirect.address,
+		             .cpu_count     = draw.indexed ? 5u : 4u,
+		             .gpu_copy      = false,
+		             .draw_count    = emit.indirect.count,
+		             .stride        = emit.indirect.stride};
+		diag_args.cpu_read = LibKernel::Memory::TryReadBacking(
+		    emit.indirect.address, diag_args.cpu_words.data(), diag_args.cpu_count * sizeof(uint32_t));
+		const uint64_t args_size = uint64_t {diag_args.cpu_count} * sizeof(uint32_t);
+		diag_args.gpu_modified =
+		    m_context.GetBufferCache().IsRegionGpuModified(emit.indirect.address, args_size);
+		diag_args.cpu_modified =
+		    m_context.GetBufferCache().IsRegionCpuModified(emit.indirect.address, args_size);
+	}
 	const auto    diag_id           = DeviceLossDiag::Begin(
         vk_buffer, diag_kind, vertex_stages.back().stage.module->info.shader_hash,
         state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0,
-        m_context.GetCommandScheduler().CurrentTick());
+        m_context.GetCommandScheduler().CurrentTick(), diag_args);
+	if (mesh_task) {
+		DeviceLossDiag::SetGroups(diag_id, emit.indirect.count, 1, 1);
+	} else if (mesh_active) {
+		DeviceLossDiag::SetGroups(diag_id, mesh_groups, draw.instance_count, 1);
+	} else if (args_buffer.first == nullptr) {
+		DeviceLossDiag::SetGroups(diag_id, draw.index_count, draw.instance_count, draw.indexed ? 1u : 0u);
+	}
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {

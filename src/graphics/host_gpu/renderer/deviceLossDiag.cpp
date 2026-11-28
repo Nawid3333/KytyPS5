@@ -127,9 +127,10 @@ std::string Describe(uint32_t id) {
 		return fmt::format("#{} {} site={}", id, KindName(e.kind),
 		                   e.site != nullptr ? e.site : "?");
 	}
-	const auto groups = e.groups[0] == 0
-	                        ? std::string {}
-	                        : fmt::format(" groups={}x{}x{}", e.groups[0], e.groups[1], e.groups[2]);
+	const char* label = e.kind == Kind::Dispatch || e.kind == Kind::Mesh ? "groups" : "counts";
+	const auto  groups = e.groups[0] == 0 && e.groups[1] == 0
+	                         ? std::string {}
+	                         : fmt::format(" {}={}x{}x{}", label, e.groups[0], e.groups[1], e.groups[2]);
 	return fmt::format("#{} {} tick={} hash0=0x{:016x} hash1=0x{:016x}{}", id, KindName(e.kind),
 	                   e.tick, e.hash0, e.hash1, groups);
 }
@@ -213,29 +214,39 @@ std::string DescribeArgs(uint32_t id) {
 	    fmt::format("#{} {} hash0=0x{:016x} guest=0x{:016x} buffer=0x{:016x}+0x{:x} words=", id,
 	                KindName(e.kind), e.hash0, a.guest_address, handle, a.offset);
 	if (g_args == nullptr) {
-		return text + "not captured";
+		text += "not captured";
+	} else if (!a.gpu_copy) {
+		text += fmt::format("not copied on the GPU (draw inside rendering) count={} stride={}",
+		                    a.draw_count, a.stride);
+	} else {
+		const auto*    slot   = g_args + vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords;
+		const uint32_t holder = slot[0];
+		if (holder != id) {
+			text += fmt::format("not copied (slot holds #{})", holder);
+		} else {
+			const uint32_t words = std::min<uint32_t>(a.size / sizeof(uint32_t), ArgsSlotWords - 1);
+			for (uint32_t i = 0; i < words; i++) {
+				const uint32_t word = slot[1 + i];
+				text += fmt::format("{}0x{:08x}", i == 0 ? "" : " ", word);
+			}
+		}
 	}
-	const auto*    slot   = g_args + vk::DeviceSize {id % ArgsSlots} * ArgsSlotWords;
-	const uint32_t holder = slot[0];
-	if (holder != id) {
-		return text + fmt::format("not copied (slot holds #{})", holder);
+	if (a.cpu_read) {
+		text += " | guest memory at record";
+		for (uint32_t i = 0; i < std::min<uint32_t>(a.cpu_count, a.cpu_words.size()); i++) {
+			text += fmt::format(" 0x{:08x}", a.cpu_words[i]);
+		}
+	} else {
+		text += " | guest memory at record unreadable";
 	}
-	const uint32_t words = std::min<uint32_t>(a.size / sizeof(uint32_t), ArgsSlotWords - 1);
-	for (uint32_t i = 0; i < words; i++) {
-		const uint32_t word = slot[1 + i];
-		text += fmt::format("{}0x{:08x}", i == 0 ? "" : " ", word);
-	}
-	text += a.cpu_read ? fmt::format(" | guest memory at record 0x{:08x} 0x{:08x} 0x{:08x}",
-	                                 a.cpu_words[0], a.cpu_words[1], a.cpu_words[2])
-	                   : " | guest memory at record unreadable";
 	text += fmt::format(" gpu_modified={} cpu_modified={} image={}", a.gpu_modified,
 	                    a.cpu_modified, a.image);
 	return text;
 }
 
 void ReportIndirectArgs(uint32_t focus) {
-	Write(fmt::format("[DEVLOST] dispatch-indirect arguments copied on the GPU before each "
-	                  "dispatch-indirect ({} slots):\n",
+	Write(fmt::format("[DEVLOST] indirect arguments (dispatches: copied on the GPU, {} slots; draws: "
+	                  "guest memory at record):\n",
 	                  ArgsSlots));
 	if (HasArgs(focus)) {
 		Write(fmt::format("[DEVLOST]   {}   <== first unfinished\n", DescribeArgs(focus)));
@@ -456,7 +467,7 @@ static void PollLoopGuard() {
 	const bool     doubled  = hits != 0 && hits >= 2u * logged &&
 	                     g_guard_hits_logged.compare_exchange_strong(logged, hits);
 	if (new_mask || doubled) {
-		Write(fmt::format("[lab-2019] loop guard hit: mask=0x{:08x} hits={}\n", mask, hits));
+		Write(fmt::format("[lab-guard] loop guard hit: mask=0x{:08x} hits={}\n", mask, hits));
 	}
 }
 
@@ -504,7 +515,7 @@ static uint32_t Record(vk::CommandBuffer buffer, Kind kind, uint64_t hash0, uint
 	e.args  = args;
 	e.groups = {};
 	e.id.store(id, std::memory_order_release);
-	if (g_args != nullptr && args.buffer) {
+	if (g_args != nullptr && args.buffer && args.gpu_copy) {
 		CaptureArgs(buffer, id, args);
 	}
 	if (g_graphics->nv_checkpoints_enabled) {
